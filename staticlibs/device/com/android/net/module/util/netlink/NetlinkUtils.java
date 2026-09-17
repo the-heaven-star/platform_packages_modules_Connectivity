@@ -46,6 +46,8 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.android.net.module.util.ModuleFlagProvider;
+
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.io.InterruptedIOException;
@@ -83,7 +85,7 @@ public class NetlinkUtils {
     public static final int INET_DIAG_INFO = 2;
     public static final int INET_DIAG_MARK = 15;
 
-    public static final long IO_TIMEOUT_MS = 3000L;
+    public static final long IO_TIMEOUT_MS = 300L;
 
     public static final int DEFAULT_RECV_BUFSIZE = 8 * 1024;
     public static final int SOCKET_RECV_BUFSIZE = 64 * 1024;
@@ -95,6 +97,18 @@ public class NetlinkUtils {
      */
     public static boolean enoughBytesRemainForValidNlMsg(@NonNull final ByteBuffer bytes) {
         return bytes.remaining() >= StructNlMsgHdr.STRUCT_SIZE;
+    }
+
+    /**
+     * Get the IO timeout value in milliseconds for netlink socket operations.
+     *
+     * @return the IO timeout value in milliseconds.
+     */
+    public static long getIoTimeoutMs() {
+        if (ModuleFlagProvider.isFeatureFlagEnabled(ModuleFlagProvider.FLAG_NETLINK_NO_TIMEOUTS)) {
+            return 0L;
+        }
+        return IO_TIMEOUT_MS;
     }
 
     /**
@@ -128,7 +142,7 @@ public class NetlinkUtils {
      */
     public static void receiveNetlinkAck(final FileDescriptor fd)
             throws InterruptedIOException, ErrnoException {
-        final ByteBuffer bytes = recvMessage(fd, DEFAULT_RECV_BUFSIZE, IO_TIMEOUT_MS);
+        final ByteBuffer bytes = recvMessage(fd, DEFAULT_RECV_BUFSIZE, getIoTimeoutMs());
         // recvMessage() guaranteed to not return null if it did not throw.
         final NetlinkErrorMessage response = parseNetlinkErrorMessage(bytes);
         if (response != null && response.getNlMsgError() != null) {
@@ -161,12 +175,28 @@ public class NetlinkUtils {
      * @param msg the raw bytes of netlink message to be sent.
      */
     public static void sendOneShotKernelMessage(int nlProto, byte[] msg) throws ErrnoException {
+        sendOneShotKernelMessage(nlProto, msg, getIoTimeoutMs());
+    }
+
+    /**
+     * Send one netlink message to kernel via netlink socket.
+     *
+     * @param nlProto netlink protocol type.
+     * @param msg the raw bytes of netlink message to be sent.
+     * @param timeoutMs the timeout in milliseconds for send and receive operations.
+     *
+     * @deprecated The method will be removed after all netlink timeout usage are removed in all
+     * modules.
+     */
+    @Deprecated
+    public static void sendOneShotKernelMessage(int nlProto, byte[] msg, long timeoutMs)
+            throws ErrnoException {
         final String errPrefix = "Error in NetlinkSocket.sendOneShotKernelMessage";
         final FileDescriptor fd = netlinkSocketForProto(nlProto, SOCKET_RECV_BUFSIZE);
 
         try {
             connectToKernel(fd);
-            sendMessage(fd, msg, 0, msg.length, IO_TIMEOUT_MS);
+            sendMessage(fd, msg, 0, msg.length, timeoutMs);
             receiveNetlinkAck(fd);
         } catch (InterruptedIOException e) {
             Log.e(TAG, errPrefix, e);
@@ -287,22 +317,36 @@ public class NetlinkUtils {
      * netlink message of at most |bufsize| size.
      *
      * Multi-threaded calls with different timeouts will cause unexpected results.
+     * @deprecated Use {@link #recvMessage(FileDescriptor, ByteBuffer, long)} instead, the method
+     * will be removed after all netlink timeout usages are moved in all modules.
      */
+    @Deprecated
     public static ByteBuffer recvMessage(FileDescriptor fd, int bufsize, long timeoutMs)
             throws ErrnoException, IllegalArgumentException, InterruptedIOException {
-        checkTimeout(timeoutMs);
-
-        Os.setsockoptTimeval(fd, SOL_SOCKET, SO_RCVTIMEO, StructTimeval.fromMillis(timeoutMs));
-
         final ByteBuffer byteBuffer = ByteBuffer.allocate(bufsize);
-        final int length = Os.read(fd, byteBuffer);
-        if (length == bufsize) {
+        return recvMessage(fd, byteBuffer, timeoutMs);
+    }
+
+    /**
+     * Wait up to |timeoutMs| (or until underlying socket error) for a netlink message.
+     * The message will be stored in |buffer| within its capacity.
+     *
+     * Multi-threaded calls with different timeouts will cause unexpected results.
+     * @deprecated  the method will be removed after all netlink timeout usages are moved in all
+     * modules.
+     */
+    @Deprecated
+    public static ByteBuffer recvMessage(FileDescriptor fd, ByteBuffer buffer, long timeoutMs)
+            throws ErrnoException, IllegalArgumentException, InterruptedIOException {
+        checkTimeout(timeoutMs);
+        Os.setsockoptTimeval(fd, SOL_SOCKET, SO_RCVTIMEO, StructTimeval.fromMillis(timeoutMs));
+        Os.read(fd, buffer);
+        if (!buffer.hasRemaining()) {
             Log.w(TAG, "maximum read");
         }
-        byteBuffer.position(0);
-        byteBuffer.limit(length);
-        byteBuffer.order(ByteOrder.nativeOrder());
-        return byteBuffer;
+        buffer.flip();
+        buffer.order(ByteOrder.nativeOrder());
+        return buffer;
     }
 
     /**
@@ -345,13 +389,17 @@ public class NetlinkUtils {
 
         // sendMessage throws InterruptedIOException and ErrnoException,
         // should be handled by caller
-        sendMessage(fd, dumpRequestMessage, 0, dumpRequestMessage.length, IO_TIMEOUT_MS);
+        sendMessage(fd, dumpRequestMessage, 0, dumpRequestMessage.length, getIoTimeoutMs());
 
+        final ByteBuffer buf = ByteBuffer.allocate(NetlinkUtils.DEFAULT_RECV_BUFSIZE);
         while (true) {
+            // reset buf and set default endian before calling recvMessage
+            buf.clear();
+            buf.order(ByteOrder.BIG_ENDIAN);
+
             // recvMessage throws ErrnoException, InterruptedIOException
             // should be handled by caller
-            final ByteBuffer buf = recvMessage(
-                    fd, NetlinkUtils.DEFAULT_RECV_BUFSIZE, IO_TIMEOUT_MS);
+            recvMessage(fd, buf, getIoTimeoutMs());
 
             while (buf.remaining() > 0) {
                 final int position = buf.position();
@@ -523,6 +571,48 @@ public class NetlinkUtils {
             return true;
         } catch (ErrnoException e) {
             Log.e(TAG, "Failed to set MTU to " + mtu + " for interface with index: " + ifIndex, e);
+            return false;
+        }
+    }
+
+    /**
+     * Send an RTM_NEWQDISC message to kernel to add qdisc
+     *
+     * @param ifIndex interface index.
+     * @param qdisc qdisc class.
+     */
+    public static boolean sendRtmNewQdiscRequest(int ifIndex, @NonNull String qdisc) {
+        Objects.requireNonNull(qdisc, "Qdisc to be added should not be null.");
+        final byte[] msg = RtNetlinkQdiscMessage.newRtmNewQdiscMessage(ifIndex, qdisc);
+        try {
+            NetlinkUtils.sendOneShotKernelMessage(NETLINK_ROUTE, msg);
+            return true;
+        } catch (ErrnoException e) {
+            Log.e(TAG, String.format(
+                        "Fail to send RTM_NEWQDISC to add %s for interface with index: %d",
+                        qdisc, ifIndex), e);
+            return false;
+        }
+    }
+
+    /**
+     * Send an RTM_DELQDISC message to kernel to delete qdisc.
+     *
+     * @param ifIndex interface index.
+     * @param qdisc qdisc class.
+     */
+    public static boolean sendRtmDelQdiscRequest(int ifIndex, @NonNull String qdisc) {
+        Objects.requireNonNull(qdisc, "Qdisc to be deleted should not be null.");
+        final byte[] msg = RtNetlinkQdiscMessage.newRtmDelQdiscMessage(ifIndex, qdisc);
+        try {
+            NetlinkUtils.sendOneShotKernelMessage(NETLINK_ROUTE, msg);
+            return true;
+        } catch (ErrnoException e) {
+            if (e.errno != OsConstants.ENOENT) {
+                Log.e(TAG, String.format(
+                        "Fail to send RTM_DELQDISC to delete %s for interface with index: %d",
+                        qdisc, ifIndex), e);
+            }
             return false;
         }
     }

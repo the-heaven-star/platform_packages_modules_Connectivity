@@ -45,6 +45,7 @@ import android.os.ConditionVariable
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemConfigManager
 import android.os.UserHandle
 import android.os.VintfRuntimeInfo
@@ -55,19 +56,20 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.android.compatibility.common.util.SystemUtil
 import com.android.connectivity.resources.R
 import com.android.net.module.util.BpfUtils
-import com.android.networkstack.apishim.TelephonyManagerShimImpl
 import com.android.server.BpfNetMaps
 import com.android.server.ConnectivityService
 import com.android.server.NetworkAgentWrapper
 import com.android.server.TestNetIdManager
+import com.android.server.connectivity.AppOptInDefaultNetworkController
+import com.android.server.connectivity.AppOptInDefaultNetworkPolicy
 import com.android.server.connectivity.CarrierPrivilegeAuthenticator
 import com.android.server.connectivity.ConnectivityResources
 import com.android.server.connectivity.InterfaceTracker
+import com.android.server.connectivity.LocalNetEventListener
 import com.android.server.connectivity.MockableSystemProperties
 import com.android.server.connectivity.MultinetworkPolicyTracker
 import com.android.server.connectivity.PermissionMonitor
 import com.android.server.connectivity.ProxyTracker
-import com.android.server.connectivity.SatelliteAccessController
 import com.android.testutils.DevSdkIgnoreRunner
 import com.android.testutils.DeviceInfoUtils
 import com.android.testutils.TestableNetworkCallback
@@ -75,6 +77,7 @@ import com.android.testutils.TestableNetworkCallback.Event.LinkPropertiesChanged
 import com.android.testutils.runAsShell
 import com.android.testutils.tryTest
 import java.util.function.BiConsumer
+import java.util.function.Consumer
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -249,8 +252,14 @@ class ConnectivityServiceIntegrationTest {
 
     private inner class TestDependencies : ConnectivityService.Dependencies() {
         override fun getNetworkStack() = networkStackClient
-        override fun makeProxyTracker(context: Context, connServiceHandler: Handler) =
-            mock(ProxyTracker::class.java)
+        override fun makeProxyTracker(
+            context: Context,
+            connServiceHandler: Handler,
+        ) = mock(ProxyTracker::class.java)
+        override fun makeMultiProxyTracker(
+            context: Context,
+            connServiceHandler: Handler,
+        ) = mock(ProxyTracker::class.java)
         override fun getSystemProperties() = mock(MockableSystemProperties::class.java)
         override fun makeNetIdManager() = TestNetIdManager()
         override fun getBpfNetMaps(
@@ -261,6 +270,12 @@ class ConnectivityServiceIntegrationTest {
                 .also {
                     doReturn(PERMISSION_INTERNET).`when`(it).getNetPermForUid(anyInt())
                 }
+        override fun getLocalNetEventListener(
+            context: Context?,
+            looper: Looper?,
+            metricsEnabled: Boolean,
+            noteOpsEnabled: Boolean
+        ) = mock(LocalNetEventListener::class.java)
         override fun isChangeEnabled(changeId: Long, uid: Int) = true
 
         override fun makeMultinetworkPolicyTracker(
@@ -296,26 +311,25 @@ class ConnectivityServiceIntegrationTest {
                                 super.makeHandlerThread().also { handlerThreads.add(it) }
                     },
                     tm,
-                TelephonyManagerShimImpl.newInstance(tm),
                     requestRestrictedWifiEnabled,
                 listener,
                 handler
             )
         }
 
-        override fun makeSatelliteAccessController(
-            context: Context,
-            updateSatellitePreferredUid: BiConsumer<Set<Int>, Set<Int>>,
-            connectivityServiceInternalHandler: Handler
-        ): SatelliteAccessController? = mock(
-            SatelliteAccessController::class.java
+        override fun makeAppOptInDefaultNetworkController(
+                context: Context,
+                updateAppOptInDefaultNetworkPolicies: Consumer<List<AppOptInDefaultNetworkPolicy>>,
+                connectivityServiceInternalHandler: Handler
+        ): AppOptInDefaultNetworkController? = mock(
+            AppOptInDefaultNetworkController::class.java
         )
 
         override fun makeL2capNetworkProvider(context: Context) = null
     }
 
     private inner class PermissionMonitorDependencies : PermissionMonitor.Dependencies() {
-        override fun shouldEnforceLocalNetRestrictions(uid: Int) = false
+        override fun isOptedInToLocalNetworkRestrictions(uid: Int) = false
     }
 
     @After
@@ -453,10 +467,6 @@ class ConnectivityServiceIntegrationTest {
             assertNotNull(capportData)
             assertTrue(capportData.isCaptive)
             assertEquals(Uri.parse("https://login.capport.android.com"), capportData.userPortalUrl)
-            assertEquals(
-                Uri.parse("https://venueinfo.capport.android.com"),
-                capportData.venueInfoUrl
-            )
             assertEquals(
                 if (expectedOptIn == OPT_IN) {
                     CAPTIVE_PORTAL_DATA_SOURCE_CAPPORT_WITH_CUSTOM_TABS_OPTIN

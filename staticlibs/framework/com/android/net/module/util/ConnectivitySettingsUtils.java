@@ -20,6 +20,7 @@ import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.content.ContentResolver;
 import android.content.Context;
+import android.net.ConnectivitySettingsManager;
 import android.provider.Settings;
 import android.text.TextUtils;
 
@@ -44,6 +45,7 @@ public class ConnectivitySettingsUtils {
     public static final String NETWORK_AVOID_BAD_WIFI = "network_avoid_bad_wifi";
     public static final String NETWORK_CARRIER_AWARE_AVOID_BAD_WIFI =
             "network_carrier_aware_avoid_bad_wifi";
+    public static final String L4S_DEVELOPER_OPTION = "l4s_developer_option";
 
     /**
      * Get private DNS mode as string.
@@ -210,5 +212,93 @@ public class ConnectivitySettingsUtils {
     public static String getNetworkAvoidBadWifiSetting(@NonNull Context context, int subId) {
         return Settings.Global.getString(
             context.getContentResolver(), getAvoidBadWifiSettingKey(subId));
+    }
+
+    /**
+     * Retrieves the carrier-aware avoid bad wifi string from {@link Settings} and
+     * converts it to the corresponding integer constant defined in
+     * {@link ConnectivitySettingsManager}.
+     *
+     * The raw setting is a string, which is mapped to an integer constant as follows:
+     * If the setting string is {@code null},
+     *     it defaults to {@link ConnectivitySettingsManager#NETWORK_AVOID_BAD_WIFI_PROMPT}.
+     * If the setting string equals {@code "1"},
+     *     it maps to {@link ConnectivitySettingsManager#NETWORK_AVOID_BAD_WIFI_AVOID}.
+     * Any other non-null string
+     *     maps to {@link ConnectivitySettingsManager#NETWORK_AVOID_BAD_WIFI_IGNORE}.
+     *
+     * @param context The application {@link Context}.
+     * @param subId The subscription ID for which to fetch the setting.
+     * @return An integer constant from {@link ConnectivitySettingsManager} representing the
+     *         effective "Avoid Bad Wifi" mode (PROMPT, AVOID, or IGNORE).
+     */
+    public static int getNetworkAvoidBadWifiIntegerSetting(@NonNull Context context, int subId) {
+        final String setting = getNetworkAvoidBadWifiSetting(context, subId);
+        if (setting == null) return ConnectivitySettingsManager.NETWORK_AVOID_BAD_WIFI_PROMPT;
+
+        if ("1".equals(setting)) {
+            return ConnectivitySettingsManager.NETWORK_AVOID_BAD_WIFI_AVOID;
+        } else {
+            return ConnectivitySettingsManager.NETWORK_AVOID_BAD_WIFI_IGNORE;
+        }
+    }
+
+    /**
+     * Get L4S global developer option from {@link Settings}.
+     *
+     * @param context The Context to query the L4S develop option from settings.
+     * @return An integer constant from {@link ConnectivitySettingsManager} representing the
+     * L4S develop option setting
+     * - DISABLED: Disable L4S developer option.
+     * - ENABLED: Enable L4S developer option.
+     * - AUTOMATIC: Determined by the default.
+     */
+    public static int getL4sDeveloperOptionSetting(@NonNull Context context) {
+        String setting = Settings.Global.getString(
+                context.getContentResolver(),
+                L4S_DEVELOPER_OPTION);
+        if (setting == null) {
+            return ConnectivitySettingsManager.L4S_DEVELOPER_OPTION_AUTOMATIC;
+        }
+
+        if ("1".equals(setting)) {
+            return ConnectivitySettingsManager.L4S_DEVELOPER_OPTION_ENABLED;
+        } else {
+            return ConnectivitySettingsManager.L4S_DEVELOPER_OPTION_DISABLED;
+        }
+    }
+
+    /**
+     * Set L4S developer option to {@link Settings}.
+     *
+     * @param context The Context to set the L4S developer option from settings.
+     * @param setting The desired setting string.
+     * - "0": Disable L4S developer option.
+     * - "1": Enable L4S developer option.
+     * - {@code null}: Determined by the default.
+     */
+    public static void setL4sDeveloperOptionSetting(@NonNull Context context, int setting) {
+        final String config;
+        switch (setting) {
+            case ConnectivitySettingsManager.L4S_DEVELOPER_OPTION_ENABLED:
+                config = "1";
+                break;
+            case ConnectivitySettingsManager.L4S_DEVELOPER_OPTION_DISABLED:
+                config = "0";
+                break;
+            case ConnectivitySettingsManager.L4S_DEVELOPER_OPTION_AUTOMATIC:
+                config = null;
+                break;
+            default:
+                throw new IllegalArgumentException("Invalid L4S status: " + setting);
+        }
+
+        // TODO: Enable key-value pair removal by implementing the delete()
+        // method in MockContentProvider.
+        // Afterwards, refactor this section to use resolver.delete().
+        Settings.Global.putString(
+                context.getContentResolver(),
+                L4S_DEVELOPER_OPTION,
+                config);
     }
 }

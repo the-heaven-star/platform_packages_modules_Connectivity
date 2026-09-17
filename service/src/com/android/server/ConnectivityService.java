@@ -16,6 +16,9 @@
 
 package com.android.server;
 
+import static android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_BANDWIDTH;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_LATENCY;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS;
 import static android.Manifest.permission.RECEIVE_DATA_ACTIVITY_CHANGE;
 import static android.app.ActivityManager.UidFrozenStateChangedCallback.UID_FROZEN_STATE_FROZEN;
 import static android.content.pm.PackageManager.FEATURE_BLUETOOTH;
@@ -80,6 +83,8 @@ import static android.net.ConnectivityManager.TYPE_WIFI;
 import static android.net.ConnectivityManager.TYPE_WIFI_P2P;
 import static android.net.ConnectivityManager.getNetworkTypeName;
 import static android.net.ConnectivityManager.isNetworkTypeValid;
+import static android.net.ConnectivitySettingsManager.L4S_DEVELOPER_OPTION;
+import static android.net.ConnectivitySettingsManager.L4S_DEVELOPER_OPTION_ENABLED;
 import static android.net.ConnectivitySettingsManager.PRIVATE_DNS_MODE_OPPORTUNISTIC;
 import static android.net.INetd.LOCAL_NET_ID;
 import static android.net.INetd.PERMISSION_INTERNET;
@@ -160,7 +165,11 @@ import static com.android.net.module.util.PermissionUtils.enforceAnyPermissionOf
 import static com.android.net.module.util.PermissionUtils.enforceNetworkStackPermission;
 import static com.android.net.module.util.PermissionUtils.enforceNetworkStackPermissionOr;
 import static com.android.net.module.util.PermissionUtils.hasAnyPermissionOf;
+import static com.android.net.module.util.netlink.RtNetlinkQdiscMessage.CLSACT;
 import static com.android.server.ConnectivityStatsLog.CONNECTIVITY_STATE_SAMPLE;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_COUNTS_EVENT_OCCURRED;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_COUNTS_EVENT_OCCURRED__EVENT_TYPE__CRITICAL_COUNTS_EVENT_TYPE_REQUESTROUTETOHOST_FAIL;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_COUNTS_EVENT_OCCURRED__EVENT_TYPE__CRITICAL_COUNTS_EVENT_TYPE_REQUESTROUTETOHOST_OK;
 import static com.android.server.ConnectivityStatsLog.DEFAULT_NETWORK_REMATCH__REMATCH_REASON__RMR_NETWORK_DISCONNECTED;
 import static com.android.server.NetIdManager.MAX_NET_ID;
 import static com.android.server.NetIdManager.MIN_NET_ID;
@@ -172,7 +181,6 @@ import static com.android.server.connectivity.ConnectivityFlags.INGRESS_TO_VPN_A
 import static com.android.server.connectivity.ConnectivityFlags.NAMESPACE_TETHERING_BOOT;
 import static com.android.server.connectivity.ConnectivityFlags.QUEUE_CALLBACKS_FOR_FROZEN_APPS;
 import static com.android.server.connectivity.ConnectivityFlags.QUEUE_NETWORK_AGENT_EVENTS_AFTER_B;
-import static com.android.server.connectivity.ConnectivityFlags.REQUEST_RESTRICTED_WIFI;
 import static com.android.server.connectivity.ConnectivityFlags.SATISFIED_BY_LOCAL_NETWORK_METRICS;
 import static com.android.server.connectivity.ConnectivityFlags.USE_SATELLITE_REPORTED_SUSPENDED_AND_ROAMING;
 import static com.android.server.connectivity.ConnectivityFlags.WIFI_DATA_INACTIVITY_TIMEOUT;
@@ -212,7 +220,6 @@ import android.net.ConnectivityManager;
 import android.net.ConnectivityManager.BlockedReason;
 import android.net.ConnectivityManager.NetworkCallback;
 import android.net.ConnectivityManager.RestrictBackgroundStatus;
-import android.net.NetworkCapabilities.RedactionHelper;
 import android.net.ConnectivitySettingsManager;
 import android.net.DataStallReportParcelable;
 import android.net.DnsResolverServiceManager;
@@ -248,6 +255,7 @@ import android.net.NetworkAgent;
 import android.net.NetworkAgentConfig;
 import android.net.NetworkAndAgentRegistryParcelable;
 import android.net.NetworkCapabilities;
+import android.net.NetworkCapabilities.RedactionHelper;
 import android.net.NetworkInfo;
 import android.net.NetworkInfo.DetailedState;
 import android.net.NetworkMonitorManager;
@@ -300,6 +308,7 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ConditionVariable;
+import android.os.ConfigUpdate;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
@@ -322,6 +331,7 @@ import android.provider.Settings;
 import android.stats.connectivity.RequestType;
 import android.sysprop.NetworkProperties;
 import android.system.ErrnoException;
+import android.system.Os;
 import android.system.OsConstants;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
@@ -335,6 +345,8 @@ import android.util.Range;
 import android.util.SparseArray;
 import android.util.SparseIntArray;
 import android.util.StatsEvent;
+
+import androidx.annotation.ChecksSdkIntAtLeast;
 
 import com.android.connectivity.resources.R;
 import com.android.internal.annotations.GuardedBy;
@@ -361,6 +373,8 @@ import com.android.net.module.util.BinderUtils;
 import com.android.net.module.util.BitUtils;
 import com.android.net.module.util.BpfUtils;
 import com.android.net.module.util.CollectionUtils;
+import com.android.net.module.util.ConnectivitySettingsUtils;
+import com.android.net.module.util.ConnectivityUtils;
 import com.android.net.module.util.DeviceConfigUtils;
 import com.android.net.module.util.HandlerUtils;
 import com.android.net.module.util.InterfaceParams;
@@ -378,16 +392,16 @@ import com.android.net.module.util.ip.NetlinkMonitor;
 import com.android.net.module.util.netlink.InetDiagMessage;
 import com.android.net.module.util.netlink.NetlinkConstants;
 import com.android.net.module.util.netlink.NetlinkMessage;
+import com.android.net.module.util.netlink.NetlinkUtils;
 import com.android.net.module.util.netlink.RtNetlinkAddressMessage;
 import com.android.net.module.util.netlink.StructIfaddrMsg;
-import com.android.networkstack.apishim.BroadcastOptionsShimImpl;
-import com.android.networkstack.apishim.ConstantsShim;
-import com.android.networkstack.apishim.common.BroadcastOptionsShim;
-import com.android.networkstack.apishim.common.UnsupportedApiLevelException;
+import com.android.server.connectivity.AppOptInDefaultNetworkController;
+import com.android.server.connectivity.AppOptInDefaultNetworkPolicy;
 import com.android.server.connectivity.ApplicationSelfCertifiedNetworkCapabilities;
 import com.android.server.connectivity.AutodestructReference;
 import com.android.server.connectivity.AutomaticOnOffKeepaliveTracker;
 import com.android.server.connectivity.AutomaticOnOffKeepaliveTracker.AutomaticOnOffKeepalive;
+import com.android.server.connectivity.BpfEventPoller;
 import com.android.server.connectivity.BroadcastReceiveHelper;
 import com.android.server.connectivity.CarrierPrivilegeAuthenticator;
 import com.android.server.connectivity.ClatCoordinator;
@@ -397,12 +411,14 @@ import com.android.server.connectivity.DnsManager;
 import com.android.server.connectivity.DnsManager.PrivateDnsValidationUpdate;
 import com.android.server.connectivity.DscpPolicyTracker;
 import com.android.server.connectivity.FullScore;
+import com.android.server.connectivity.IProxyTracker;
 import com.android.server.connectivity.IntegerRangeUtils;
 import com.android.server.connectivity.InterfaceTracker;
 import com.android.server.connectivity.InvalidTagException;
 import com.android.server.connectivity.KeepaliveResourceUtil;
 import com.android.server.connectivity.KeepaliveTracker;
 import com.android.server.connectivity.LingerMonitor;
+import com.android.server.connectivity.LocalNetEventListener;
 import com.android.server.connectivity.MockableSystemProperties;
 import com.android.server.connectivity.MulticastRoutingCoordinatorService;
 import com.android.server.connectivity.MultinetworkPolicyTracker;
@@ -419,9 +435,9 @@ import com.android.server.connectivity.ProfileNetworkPreferenceInfo;
 import com.android.server.connectivity.ProxyTracker;
 import com.android.server.connectivity.QosCallbackTracker;
 import com.android.server.connectivity.QuicConnectionCloser;
-import com.android.server.connectivity.SatelliteAccessController;
 import com.android.server.connectivity.UidRangeUtils;
 import com.android.server.connectivity.VpnNetworkPreferenceInfo;
+import com.android.server.connectivity.proxy.MultiProxyTracker;
 import com.android.server.connectivity.wear.CompanionDeviceManagerProxyService;
 
 import libcore.io.IoUtils;
@@ -433,12 +449,11 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.PrintWriter;
 import java.io.Writer;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
@@ -447,6 +462,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.ConcurrentModificationException;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -531,9 +547,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
     // CONNECTIVITY_ACTION broadcast.
     private static final char DELIVERY_GROUP_KEY_DELIMITER = ';';
 
-    // TODO: Use android.Manifest.permission.CREATE_APP_SPECIFIC_NETWORK once it's available.
-    private static final String PERMISSION_CREATE_APP_SPECIFIC_NETWORK =
-            "android.permission.CREATE_APP_SPECIFIC_NETWORK";
+    // After Dscp priority, see DscpPolicyTracker.PRIO_DSCP
+    @VisibleForTesting
+    static final short PRIO_L4S = 6;
+    private static final String BPF_NETD_PATH = "/sys/fs/bpf/netd_shared/";
+    @VisibleForTesting
+    static final String BPF_L4S_EGRESS_ETH_PROG =
+            BPF_NETD_PATH + "prog_netd_schedcls_egress_accecn_eth";
+    @VisibleForTesting
+    static final String BPF_L4S_EGRESS_RAWIP_PROG =
+            BPF_NETD_PATH + "prog_netd_schedcls_egress_accecn_rawip";
 
     // The maximum value for the blocking validation result, in milliseconds.
     public static final int MAX_VALIDATION_IGNORE_AFTER_ROAM_TIME_MS = 10000;
@@ -588,6 +611,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private final boolean mSupportEarlyLinkPropertiesUpdateForVPN;
     private final boolean mConstrainedDataSatelliteMetrics;
     private final boolean mUseSatelliteReportedSuspendedAndRoaming;
+    // Flag for ott network slicing enable status
+    private final boolean mIsOttNetworkSlicingEnabled;
 
     /**
      * Uids ConnectivityService tracks blocked status of to send blocked status callbacks.
@@ -634,6 +659,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
     @VisibleForTesting
     protected INetd mNetd;
     private DscpPolicyTracker mDscpPolicyTracker = null;
+    private final LocalNetEventListener mLocalNetEventListener;
     private final NetworkStatsManager mStatsManager;
     private final NetworkPolicyManager mPolicyManager;
     private final BpfNetMaps mBpfNetMaps;
@@ -714,9 +740,19 @@ public class ConnectivityService extends IConnectivityManager.Stub
     // See {@link ConnectivitySettingsManager#setMobileDataPreferredUids}
     @VisibleForTesting
     static final int PREFERENCE_ORDER_MOBILE_DATA_PREFERERRED = 30;
-    // Order of setting satellite network preference fallback when default message application
-    // with role_sms role and android.permission.SATELLITE_COMMUNICATION permission detected
-    public static final int PREFERENCE_ORDER_SATELLITE_FALLBACK = 40;
+    /**
+     * Defines the preference order for all network requests managed by the
+     * {@code AppOptInDefaultNetworkController}. This single preference level is used
+     * for various application-specific policies, including high-priority requests
+     * for premium OTT call slicing, as well as lower-priority satellite fallbacks
+     * for SMS role holders and opt-in UIDs.
+     *
+     * <p>The priority between different network requirements, such as an active OTT call versus
+     * default satellite access, is determined by the order of layers within the multi-layer
+     * NetworkRequest. The {@code AppOptInDefaultNetworkController} determines the policy
+     * for each UID, and {@code ConnectivityService} constructs the request accordingly.
+     */
+    public static final int PREFERENCE_ORDER_APP_OPT_IN = 40;
     // Preference order that signifies the network shouldn't be set as a default network for
     // the UIDs, only give them access to it. TODO : replace this with a boolean
     // in NativeUidRangeConfig
@@ -1004,6 +1040,18 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private static final int EVENT_TIMEOUT_NETWORK_SUSPENDED = 64;
 
     /**
+     * Event to update L4S developer option setting changes.
+     */
+    private static final int EVENT_L4S_DEVELOPER_OPTION_CHANGED = 65;
+
+    /**
+     * Event used internally to recompute Local Network Protection rules when global proxy is set
+     * or removed.
+     * obj = ProxyInfo
+     */
+    private static final int EVENT_GLOBAL_PROXY_CHANGED = 66;
+
+    /**
      * Argument for {@link #EVENT_PROVISIONING_NOTIFICATION} to indicate that the notification
      * should be shown.
      */
@@ -1071,7 +1119,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
     // A helper object to track the current default HTTP proxy. ConnectivityService needs to tell
     // the world when it changes.
-    private final ProxyTracker mProxyTracker;
+    private final IProxyTracker mProxyTracker;
 
     final private SettingsObserver mSettingsObserver;
 
@@ -1092,7 +1140,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private final QosCallbackTracker mQosCallbackTracker;
     private final NetworkNotificationManager mNotifier;
     private final LingerMonitor mLingerMonitor;
-    private final SatelliteAccessController mSatelliteAccessController;
+    private final AppOptInDefaultNetworkController mAppOptInDefaultNetworkController;
     private final SatelliteCoarseUsageMetricsCollector mSatelliteCoarseUsageMetricsCollector;
 
     private final L2capNetworkProvider mL2capNetworkProvider;
@@ -1180,6 +1228,11 @@ public class ConnectivityService extends IConnectivityManager.Stub
     @Nullable @VisibleForTesting final Map<InetAddress, Set<NetworkAgentInfo>> mIpToNetworksMap;
     // NetlinkMonitor for ConnectivityService
     @Nullable private final AddressUpdateMonitor mAddressUpdateMonitor;
+
+    // Flag to determine if the device is an automotive device, rather than calling the
+    // PackageManager on every check.
+    @VisibleForTesting
+    private final boolean mIsAutomotiveDevice;
 
     /**
      * Implements support for the legacy "one network per network type" model.
@@ -1557,6 +1610,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
             return Binder.getCallingUid();
         }
 
+        public int getCallingPid() {
+            return Binder.getCallingPid();
+        }
+
         public boolean isAtLeastS() {
             return SdkLevel.isAtLeastS();
         }
@@ -1579,6 +1636,18 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
         public boolean isAtLeast25Q4() {
             return SdkUtil.isAtLeast25Q4();
+        }
+
+        @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.CINNAMON_BUN)
+        public boolean isAtLeast26Q2() {
+            return SdkUtil.isAtLeast26Q2();
+        }
+
+        /**
+         * Whether the multi-network proxy system is enabled.
+         */
+        public boolean isMultiProxyEnabled() {
+            return com.android.tethering.flags.Flags.enableMultiProxySystem();
         }
 
         /** Get SystemClock.elapsedRealtime() */
@@ -1625,15 +1694,24 @@ public class ConnectivityService extends IConnectivityManager.Stub
          * Get a reference to the ModuleNetworkStackClient.
          */
         public NetworkStackClientBase getNetworkStack() {
-            return ModuleNetworkStackClient.getInstance(null);
+            return ModuleNetworkStackClient.getInstance();
         }
 
         /**
-         * @see ProxyTracker
+         * @return a legacy ProxyTracker.
          */
-        public ProxyTracker makeProxyTracker(@NonNull Context context,
+        public IProxyTracker makeProxyTracker(@NonNull Context context,
                 @NonNull Handler connServiceHandler) {
+            // This is the legacy proxytracker
             return new ProxyTracker(context, connServiceHandler, EVENT_PAC_PROXY_HAS_CHANGED);
+        }
+
+        /**
+         * @return a MultiProxyTracker.
+         */
+        public IProxyTracker makeMultiProxyTracker(@NonNull Context context,
+                @NonNull Handler connServiceHandler) {
+            return new MultiProxyTracker(context, connServiceHandler);
         }
 
         /**
@@ -1749,14 +1827,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
 
         /**
-         * @see SatelliteAccessController
+         * @see AppOptInDefaultNetworkController
          */
         @Nullable
-        public SatelliteAccessController makeSatelliteAccessController(
+        public AppOptInDefaultNetworkController makeAppOptInDefaultNetworkController(
                 @NonNull final Context context,
-                BiConsumer<Set<Integer>, Set<Integer>> updateSatelliteNetworkFallbackUidCallback,
+                Consumer<List<AppOptInDefaultNetworkPolicy>>
+                        handleUpdateAppOptInDefaultNetworkPoliciesCallback,
                 @NonNull final Handler connectivityServiceInternalHandler) {
-            return new SatelliteAccessController(context, updateSatelliteNetworkFallbackUidCallback,
+            return new AppOptInDefaultNetworkController(context,
+                    handleUpdateAppOptInDefaultNetworkPoliciesCallback,
                     connectivityServiceInternalHandler);
         }
 
@@ -1865,6 +1945,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
 
         /**
+         * Creates a LocalNetEventListener.
+         */
+        @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+        public LocalNetEventListener getLocalNetEventListener(
+                Context context, Looper looper, boolean metricsEnabled, boolean noteOpsEnabled) {
+            return new LocalNetEventListener(
+                    context, looper, metricsEnabled, noteOpsEnabled);
+        }
+
+        /**
          * Wraps {@link TcUtils#tcFilterAddDevIngressPolice}
          */
         public void enableIngressRateLimit(String iface, long rateInBytesPerSecond) {
@@ -1919,13 +2009,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
 
         /**
-         * Wraps {@link BroadcastOptionsShimImpl#newInstance(BroadcastOptions)}
+         * Returns the BroadcastOptions object.
          */
-        // TODO: when available in all active branches:
-        //  @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-        @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
-        public BroadcastOptionsShim makeBroadcastOptionsShim(BroadcastOptions options) {
-            return BroadcastOptionsShimImpl.newInstance(options);
+        public BroadcastOptions getBroadcastOptions(BroadcastOptions options) {
+            return options;
         }
 
         /**
@@ -2041,6 +2128,59 @@ public class ConnectivityService extends IConnectivityManager.Stub
             return Flags.connectivityServiceDestroySocket();
         }
 
+        /** Whether the flag for connectivity service modify qdisc clsact is enabled or not. */
+        public boolean flagConnectivityServiceModifyQdiscClsact() {
+            return Flags.connectivityServiceModifyQdiscClsact();
+        }
+
+        /**
+         * Retrieves the network interface index for a given interface name.
+         */
+        public int if_nametoindex(@NonNull String iface) {
+            return Os.if_nametoindex(iface);
+        }
+
+        /**
+         * Sends a Netlink request to add a `clsact` qdisc for a given network interface.
+         */
+        public boolean sendNewRtmQdiscClsactRequest(int ifIndex) {
+            return NetlinkUtils.sendRtmNewQdiscRequest(ifIndex, CLSACT);
+        }
+
+        /**
+         * Sends a Netlink request to remove a `clsact` qdisc for a given network interface.
+         */
+        public boolean sendDelRtmQdiscClsactRequest(int ifIndex) {
+            return NetlinkUtils.sendRtmDelQdiscRequest(ifIndex, CLSACT);
+        }
+
+        /**
+         * Wraps {@link TcUtils#tcFilerAddDevBpf}
+         */
+        public void attachBpfProgram(
+                int ifIndex, boolean ingress, short prio, short protocol, String bpfProgPath) {
+            try {
+                TcUtils.tcFilterAddDevBpf(ifIndex, ingress, prio, protocol, bpfProgPath);
+            } catch (IOException e) {
+                Log.e(TAG, "tc filter add dev " + ifIndex + " failure: " + e);
+            }
+        }
+
+        /**
+         * Wraps {@link TcUtils#isEthernet}
+         */
+        public boolean isEthernet(String iface) throws IOException {
+            return TcUtils.isEthernet(iface);
+        }
+
+        /**
+         * Retrieves all the network interfaces on the local machine.
+         */
+        public @Nullable Enumeration<NetworkInterface> getNetworkInterfaces()
+                throws SocketException {
+            return NetworkInterface.getNetworkInterfaces();
+        }
+
         /**
          * Create a AddressUpdateMonitor instance.
          */
@@ -2057,8 +2197,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
          * The flag value can change at runtime via a server push.
          */
         public boolean shouldBluetoothTetheringUseRandomAddress() {
-            return SdkLevel.isAtLeastT() &&
-                    com.android.tethering.mainline.beta.Flags.bluetoothTetheringRandomizedAddress();
+            return SdkLevel.isAtLeastT();
         }
 
         /**
@@ -2067,6 +2206,13 @@ public class ConnectivityService extends IConnectivityManager.Stub
         public boolean shouldQueueNetworkAgentEventsInSystemServer() {
             return com.android.tethering.mainline.beta.Flags
                     .queueNetworkAgentEventsInSystemServer();
+        }
+
+        /**
+         * @see com.android.tethering.mainline.beta.Flags#lnpDeveloperOptIn()
+         */
+        public boolean isLnpDeveloperOptInEnabled() {
+            return com.android.tethering.mainline.beta.Flags.lnpDeveloperOptIn();
         }
     }
 
@@ -2169,13 +2315,28 @@ public class ConnectivityService extends IConnectivityManager.Stub
         mStatsManager = mContext.getSystemService(NetworkStatsManager.class);
         mPolicyManager = mContext.getSystemService(NetworkPolicyManager.class);
         mDnsResolver = Objects.requireNonNull(dnsresolver, "missing IDnsResolver");
-        mProxyTracker = mDeps.makeProxyTracker(mContext, mHandler);
+
+        boolean multiProxyEnabled =
+                mDeps.isMultiProxyEnabled()
+                        && mResources.get().getBoolean(R.bool.config_enable_multi_proxy_system);
+        mProxyTracker = multiProxyEnabled
+                ? mDeps.makeMultiProxyTracker(mContext, mHandler)
+                : mDeps.makeProxyTracker(mContext, mHandler);
+
+        if (mDeps.isAtLeastB()) {
+            mLocalNetEventListener = mDeps.getLocalNetEventListener(
+                    mContext,
+                    mHandler.getLooper(),
+                    mBpfNetMaps.isLocalNetMetricsEnabled(),
+                    mBpfNetMaps.isAccessLocalNetworkPermissionEnabled());
+        } else {
+            mLocalNetEventListener = null;
+        }
 
         mTelephonyManager = (TelephonyManager) mContext.getSystemService(Context.TELEPHONY_SERVICE);
         mAppOpsManager = (AppOpsManager) mContext.getSystemService(Context.APP_OPS_SERVICE);
         mLocationPermissionChecker = mDeps.makeLocationPermissionChecker(mContext);
-        mRequestRestrictedWifiEnabled = mDeps.isAtLeastU()
-                && mDeps.isFeatureNotChickenedOut(context, REQUEST_RESTRICTED_WIFI);
+        mRequestRestrictedWifiEnabled = mDeps.isAtLeastU();
         mBackgroundFirewallChainEnabled = mDeps.isAtLeastV() && mDeps.isFeatureNotChickenedOut(
                 context, ConnectivityFlags.BACKGROUND_FIREWALL_CHAIN);
         mUseDeclaredMethodsForCallbacksEnabled =
@@ -2195,14 +2356,15 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 this::handleUidCarrierPrivilegesLost, mHandler);
 
         if (mDeps.isAtLeastU()
-                && mDeps
-                .isFeatureNotChickenedOut(mContext, ALLOW_SATALLITE_NETWORK_FALLBACK)) {
-            mSatelliteAccessController = mDeps.makeSatelliteAccessController(
-                    mContext, this::updateSatelliteNetworkPreferenceUids, mHandler);
+                && mDeps.isFeatureNotChickenedOut(mContext, ALLOW_SATALLITE_NETWORK_FALLBACK)) {
+            mAppOptInDefaultNetworkController = mDeps.makeAppOptInDefaultNetworkController(
+                    mContext, this::handleUpdateAppOptInDefaultNetworkPolicies, mHandler);
         } else {
-            mSatelliteAccessController = null;
+            mAppOptInDefaultNetworkController = null;
         }
-        mConstrainedDataSatelliteMetrics = (mSatelliteAccessController != null)
+        mIsOttNetworkSlicingEnabled = (mAppOptInDefaultNetworkController != null)
+                && mDeps.isFeatureNotChickenedOut(context, ConnectivityFlags.OTT_NETWORK_SLICING);
+        mConstrainedDataSatelliteMetrics = (mAppOptInDefaultNetworkController != null)
                 && mDeps.isFeatureNotChickenedOut(mContext, CONSTRAINED_DATA_SATELLITE_METRICS);
         if (mConstrainedDataSatelliteMetrics) {
             mSatelliteCoarseUsageMetricsCollector =
@@ -2404,6 +2566,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
         mUseSatelliteReportedSuspendedAndRoaming = mDeps.isFeatureNotChickenedOut(
                 context, USE_SATELLITE_REPORTED_SUSPENDED_AND_ROAMING);
+        mIsAutomotiveDevice = mContext.getPackageManager().hasSystemFeature(
+                PackageManager.FEATURE_AUTOMOTIVE);
     }
 
     /**
@@ -2479,24 +2643,6 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 new Pair<>(network, proxyInfo)).sendToTarget();
     }
 
-    /**
-     * Called when satellite network fallback uids from the {@link SatelliteAccessController}
-     * cache was updated based on {@link
-     * android.app.role.OnRoleHoldersChangedListener#onRoleHoldersChanged(String, UserHandle)}
-     * and self-certified applications, to create multilayer request with preference order
-     * {@link #PREFERENCE_ORDER_SATELLITE_FALLBACK}.
-     */
-    private void updateSatelliteNetworkPreferenceUids(
-            @NonNull final Set<Integer> messagingRoleUids,
-            @NonNull final Set<Integer> optinUids
-    ) {
-        if (CollectionUtils.containsAny(messagingRoleUids, optinUids)) {
-            throw new IllegalArgumentException("There can be no overlap between the "
-                    + "messagingRoleUids and the optinUids for satellite");
-        }
-        handleSetSatelliteNetworkPreference(messagingRoleUids, optinUids);
-    }
-
     private void handleAlwaysOnNetworkRequest(
             NetworkRequest networkRequest, String settingName, boolean defaultValue) {
         final boolean enable = toBool(Settings.Global.getInt(
@@ -2557,6 +2703,12 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 Settings.Global.getUriFor(
                         ConnectivitySettingsManager.INGRESS_RATE_LIMIT_BYTES_PER_SECOND),
                 EVENT_INGRESS_RATE_LIMIT_CHANGED);
+        if (BpfNetMaps.isL4sSupported()) {
+            // Watch for L4S changes.
+            mSettingsObserver.observe(
+                    Settings.Global.getUriFor(L4S_DEVELOPER_OPTION),
+                    EVENT_L4S_DEVELOPER_OPTION_CHANGED);
+        }
     }
 
     private void registerPrivateDnsSettingsCallbacks() {
@@ -2973,7 +3125,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
         builder.setNetworkRequestCount(sampleNetworkRequestCount(mNetworkRequests.values()));
         builder.setNetworks(sampleNetworks(mNetworkAgentInfos));
         if (mConstrainedDataSatelliteMetrics) {
-            builder.setSatelliteAccessInfo(sampleSatelliteAccessInfo(mSatelliteAccessController));
+            builder.setSatelliteAccessInfo(sampleSatelliteAccessInfo(
+                    mAppOptInDefaultNetworkController));
         }
         return builder.build();
     }
@@ -3050,7 +3203,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
     @NonNull
     private static SatelliteAccessInfo sampleSatelliteAccessInfo(
-            @NonNull final SatelliteAccessController controller) {
+            @NonNull final AppOptInDefaultNetworkController controller) {
         final int optInUidCount = controller.getCachedOptInUidsCount();
         return SatelliteAccessInfo.newBuilder().setOptinUidCount(optInUidCount).build();
     }
@@ -3626,6 +3779,11 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 netId = nai.network.getNetId();
             }
             boolean ok = addLegacyRouteToHost(lp, addr, netId, uid);
+            final int eventType = ok
+                    ? CORE_NETWORKING_CRITICAL_COUNTS_EVENT_OCCURRED__EVENT_TYPE__CRITICAL_COUNTS_EVENT_TYPE_REQUESTROUTETOHOST_OK
+                    : CORE_NETWORKING_CRITICAL_COUNTS_EVENT_OCCURRED__EVENT_TYPE__CRITICAL_COUNTS_EVENT_TYPE_REQUESTROUTETOHOST_FAIL;
+            ConnectivityStatsLog.write_non_chained(CORE_NETWORKING_CRITICAL_COUNTS_EVENT_OCCURRED,
+                    uid, null, eventType, 1);
             if (DBG) {
                 log("requestRouteToHostAddress " + addr + nai.toShortString() + " ok=" + ok);
             }
@@ -3832,6 +3990,13 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private void handleNetwokSuspendedTimeout(NetworkAgentInfo nai) {
         // Tear down the network if it has stayed in SUSPENDED state for longer than intended.
         disconnectAndDestroyNetwork(nai);
+    }
+
+    private void handleNetworkL4sChanged() {
+        if (!BpfNetMaps.isL4sSupported()) return;
+        ensureRunningOnConnectivityServiceThread();
+        final int setValue = ConnectivitySettingsUtils.getL4sDeveloperOptionSetting(mContext);
+        mBpfNetMaps.setL4sEnabled((setValue == L4S_DEVELOPER_OPTION_ENABLED));
     }
 
     private void handleFreezeNetworkCallbacks(int[] uids, int[] frozenStates) {
@@ -4147,8 +4312,14 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private boolean hasCreateAppSpecificNetworkPermission() {
         // The CREATE_APP_SPECIFIC_NETWORK permission was introduced in 25Q4.
         // It must not be granted on earlier platform versions, even if an app declares it.
-        return mDeps.isAtLeast25Q4() && hasAnyPermissionOf(mContext,
-                PERMISSION_CREATE_APP_SPECIFIC_NETWORK);
+        if (mDeps.isAtLeast25Q4()) {
+            return hasAnyPermissionOf(mContext,
+                android.Manifest.permission.CREATE_APP_SPECIFIC_NETWORK);
+        }
+        if (mDeps.isAtLeastB()) {
+            return hasConnectivityRestrictedNetworksPermission(Binder.getCallingUid(), false);
+        }
+        return false;
     }
 
     private boolean hasNetworkFactoryPermission() {
@@ -4297,7 +4468,13 @@ public class ConnectivityService extends IConnectivityManager.Stub
     }
 
     private void enforceKeepalivePermission() {
-        mContext.enforceCallingOrSelfPermission(KeepaliveTracker.PERMISSION, "ConnectivityService");
+        if (SdkUtil.isAtLeast26Q2()) {
+            mContext.enforceCallingOrSelfPermission(KeepaliveTracker.PERMISSION,
+                    "ConnectivityService");
+        } else {
+            PermissionUtils.enforceAnyPermissionOf(mContext, KeepaliveTracker.PERMISSION,
+                    Manifest.permission.SCHEDULE_PRIORITIZED_ALARM);
+        }
     }
 
     @CheckResult
@@ -4386,16 +4563,32 @@ public class ConnectivityService extends IConnectivityManager.Stub
         // Delivery group policy APIs are only available on U+.
         if (!mDeps.isAtLeastU()) return;
 
-        final BroadcastOptionsShim optsShim = mDeps.makeBroadcastOptionsShim(options);
+        final BroadcastOptions opts = mDeps.getBroadcastOptions(options);
+        // This allows us to discard older broadcasts still waiting to be delivered
+        // which have the same namespace and key.
+        opts.setDeliveryGroupPolicy(BroadcastOptions.DELIVERY_GROUP_POLICY_MOST_RECENT);
+        opts.setDeliveryGroupMatchingKey(ConnectivityManager.CONNECTIVITY_ACTION,
+                createDeliveryGroupKeyForConnectivityAction(info));
+        opts.setDeferralPolicy(BroadcastOptions.DEFERRAL_POLICY_UNTIL_ACTIVE);
+    }
+
+    private void maybeClearTcQdiscClsact() {
+        if (!mDeps.flagConnectivityServiceModifyQdiscClsact()) return;
+
+        final Enumeration<NetworkInterface> networkInterfaces;
         try {
-            // This allows us to discard older broadcasts still waiting to be delivered
-            // which have the same namespace and key.
-            optsShim.setDeliveryGroupPolicy(ConstantsShim.DELIVERY_GROUP_POLICY_MOST_RECENT);
-            optsShim.setDeliveryGroupMatchingKey(ConnectivityManager.CONNECTIVITY_ACTION,
-                    createDeliveryGroupKeyForConnectivityAction(info));
-            optsShim.setDeferralPolicy(ConstantsShim.DEFERRAL_POLICY_UNTIL_ACTIVE);
-        } catch (UnsupportedApiLevelException e) {
-            Log.wtf(TAG, "Using unsupported API" + e);
+            networkInterfaces = mDeps.getNetworkInterfaces();
+            if (networkInterfaces == null) return;
+        } catch (SocketException e) {
+            Log.e(TAG, "Failed to get network interfaces", e);
+            return;
+        }
+
+        while (networkInterfaces.hasMoreElements()) {
+            final int ifIndex = networkInterfaces.nextElement().getIndex();
+            if (ifIndex <= 0) continue;
+
+            mDeps.sendDelRtmQdiscClsactRequest(ifIndex);
         }
     }
 
@@ -4424,6 +4617,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
      */
     @VisibleForTesting
     public void systemReadyInternal() {
+        final long startTimeMs = SystemClock.elapsedRealtime();
         // Load flags after PackageManager is ready to query module version
         mFlags.loadFlags(mDeps, mContext);
 
@@ -4455,7 +4649,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mAddressUpdateMonitor != null) {
             mHandler.post(() -> mAddressUpdateMonitor.start());
         }
-        mProxyTracker.loadGlobalProxy();
+        synchronized (mProxyTracker) {
+            mProxyTracker.loadGlobalProxy();
+
+            if (mDeps.isAtLeastB()) {
+                mHandler.sendMessage(
+                        mHandler.obtainMessage(
+                                EVENT_GLOBAL_PROXY_CHANGED,
+                                isProxySet(mProxyTracker.getGlobalProxy())));
+            }
+        }
         registerDnsResolverUnsolicitedEventListener();
 
         synchronized (this) {
@@ -4477,11 +4680,11 @@ public class ConnectivityService extends IConnectivityManager.Stub
             mHandler.sendEmptyMessage(EVENT_MOBILE_DATA_PREFERRED_UIDS_CHANGED);
         }
 
-        if (mSatelliteAccessController != null) {
-            mSatelliteAccessController.start();
+        if (mAppOptInDefaultNetworkController != null) {
+            mAppOptInDefaultNetworkController.start();
         }
 
-        if (mCarrierPrivilegeAuthenticator != null) {
+        if (mCarrierPrivilegeAuthenticator != null && SdkLevel.isAtLeastT()) {
             mCarrierPrivilegeAuthenticator.start();
         }
 
@@ -4498,15 +4701,45 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mSatisfiedByLocalNetworkMetrics != null) {
             mSatisfiedByLocalNetworkMetrics.start();
         }
+
+        if (mBpfNetMaps.isLoopbackAccessMetricsEnabled()) {
+            BpfEventPoller.nativeInitLoopbackEventConsumer();
+        }
+
+        if (mLocalNetEventListener != null) {
+            mLocalNetEventListener.start();
+        }
+
+        // Clear all clsact stubs on all interfaces.
+        mHandler.post(() -> maybeClearTcQdiscClsact());
+
         // Wait PermissionMonitor to finish the permission update. Then MultipathPolicyTracker won't
         // have permission problem. While CV#block() is unbounded in time and can in principle block
         // forever, this replaces a synchronous call to PermissionMonitor#initialize, which
         // could have blocked forever too.
+        final long blockStartTimeMs = SystemClock.elapsedRealtime();
         permissionMonitorInitializeDone.block();
+        ConnectivityStatsLog.write_non_chained(
+                ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_DURATION_EVENT_OCCURRED,
+                Process.SYSTEM_UID,
+                null,
+                ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_DURATION_EVENT_OCCURRED__EVENT_TYPE__CRITICAL_DURATION_EVENT_TYPE_CONNECTIVITY_SYSTEM_READY_BLOCKED_MS,
+                SystemClock.elapsedRealtime() - blockStartTimeMs);
 
         if (mConstrainedDataSatelliteMetrics) {
             mSatelliteCoarseUsageMetricsCollector.startMonitoring();
         }
+
+        if (mBpfNetMaps.isL4sSupported()) {
+            mHandler.sendMessage(mHandler.obtainMessage(EVENT_L4S_DEVELOPER_OPTION_CHANGED));
+        }
+
+        ConnectivityStatsLog.write_non_chained(
+                ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_DURATION_EVENT_OCCURRED,
+                Process.SYSTEM_UID,
+                null,
+                ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_DURATION_EVENT_OCCURRED__EVENT_TYPE__CRITICAL_DURATION_EVENT_TYPE_CONNECTIVITY_SYSTEM_READY_TOTAL_MS,
+                SystemClock.elapsedRealtime() - startTimeMs);
     }
 
     /**
@@ -4769,7 +5002,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
             dumpBpfProgramStatus(pw);
         }
 
-        if (null != mCarrierPrivilegeAuthenticator) {
+        if (null != mCarrierPrivilegeAuthenticator && SdkLevel.isAtLeastT()) {
             pw.println();
             mCarrierPrivilegeAuthenticator.dump(pw);
         }
@@ -4830,8 +5063,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
         pw.decreaseIndent();
 
         pw.println();
-        if (mSatelliteAccessController != null) {
-            mSatelliteAccessController.dump(pw);
+        if (mAppOptInDefaultNetworkController != null) {
+            mAppOptInDefaultNetworkController.dump(pw);
         }
         if (mConstrainedDataSatelliteMetrics) {
             mSatelliteCoarseUsageMetricsCollector.dump(pw);
@@ -4857,6 +5090,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 (mMulticastRoutingCoordinatorService != null));
         pw.println("Background firewall chain enabled: " + mBackgroundFirewallChainEnabled);
         pw.println("IngressToVpnAddressFiltering: " + mIngressToVpnAddressFiltering);
+        pw.println("mIsOttNetworkSlicingEnabled: " + mIsOttNetworkSlicingEnabled);
 
         if (mIpToNetworksMap != null) {
             pw.println();
@@ -4973,7 +5207,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private void dumpTrafficController(IndentingPrintWriter pw, final FileDescriptor fd,
             boolean verbose) {
         try {
-            mBpfNetMaps.dump(pw, fd, verbose);
+            if (SdkLevel.isAtLeastT()) {
+                mBpfNetMaps.dump(pw, fd, verbose);
+            }
         } catch (ServiceSpecificException e) {
             pw.println(e.getMessage());
         } catch (IOException e) {
@@ -6022,7 +6258,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
             // that there is no longer a default proxy.
             // Strictly speaking this is not essential because having a proxy setting when
             // there is no network is harmless, but it's still counter-intuitive so reset to null.
-            mProxyTracker.setDefaultProxy(null);
+            mProxyTracker.updateDefaultNetworkState(null, null);
         }
 
         // Immediate teardown.
@@ -6163,12 +6399,19 @@ public class ConnectivityService extends IConnectivityManager.Stub
         // destroyed pending replacement they will be sent when it is disconnected.
         maybeDisableForwardRulesForDisconnectingNai(nai, false /* sendCallbacks */);
         updateIngressToVpnAddressFiltering(null, nai.linkProperties, nai);
-        updateLocalNetworkAddresses(null, nai.linkProperties);
+        updateLocalNetworkAddresses(null, nai.linkProperties, mHasGlobalProxy, mHasGlobalProxy,
+                nai);
         try {
             mNetd.networkDestroy(nai.network.getNetId());
         } catch (RemoteException | ServiceSpecificException e) {
             loge("Exception destroying network(networkDestroy): " + e);
         }
+
+        for (final String iface: nai.linkProperties.getAllInterfaceNames()) {
+            // attached programs are cleared by removing qdisc clsact
+            maybeModifyQdiscClsact(iface, nai, false /* add */);
+        }
+
         updateIpAddressesAndDestroySockets(nai, nai.linkProperties, null);
         try {
             mDnsResolver.destroyNetworkCache(nai.network.getNetId());
@@ -6187,7 +6430,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
         // Removes the interfaces associated with the network being destroyed from the tracker.
         for (String interfaceName : nai.linkProperties.getAllInterfaceNames()) {
-            mInterfaceTracker.removeInterface(interfaceName);
+            final int ifIndex = mInterfaceTracker.removeInterface(interfaceName);
+            if (ifIndex != 0 && mDeps.isAtLeastB()) {
+                mBpfNetMaps.removeLocalNetHostAllowlistForInterface(ifIndex);
+            }
         }
         nai.setDestroyed();
         nai.onNetworkDestroyed();
@@ -6223,7 +6469,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
     private boolean hasCarrierPrivilegeForNetworkCaps(final int callingUid,
             @NonNull final NetworkCapabilities caps) {
-        if (mCarrierPrivilegeAuthenticator != null) {
+        if (mCarrierPrivilegeAuthenticator != null && SdkLevel.isAtLeastT()) {
             return mCarrierPrivilegeAuthenticator.isCarrierServiceUidForNetworkCapabilities(
                     callingUid, caps);
         }
@@ -6231,7 +6477,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
     }
 
     private int getSubscriptionIdFromNetworkCaps(@NonNull final NetworkCapabilities caps) {
-        if (mCarrierPrivilegeAuthenticator != null) {
+        if (mCarrierPrivilegeAuthenticator != null && SdkLevel.isAtLeastT()) {
             return mCarrierPrivilegeAuthenticator.getSubIdFromNetworkCapabilities(caps);
         }
         return SubscriptionManager.INVALID_SUBSCRIPTION_ID;
@@ -6361,14 +6607,14 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 continue;
             }
 
-            if (isNetworkPotentialSatisfier(nai, nri)) {
+            if (isNetworkPotentialBest(nai, nri)) {
                 return false;
             }
         }
         return true;
     }
 
-    private boolean isNetworkPotentialSatisfier(
+    private boolean isNetworkPotentialBest(
             @NonNull final NetworkAgentInfo candidate, @NonNull final NetworkRequestInfo nri) {
         // While destroyed network sometimes satisfy requests (including occasionally newly
         // satisfying requests), *potential* satisfiers are networks that might beat a current
@@ -6388,6 +6634,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
             // if they are not currently active (e.g., they might currently be satisfied by another
             // network with a higher score than this one).
             if (!req.isRequest() && nri.getActiveRequest() == req) {
+                return false;
+            }
+            // If the network does not satisfy the active request, then it can never become the
+            // satisfier for this multilayer request.
+            // - The network cannot have satisfied an earlier request in the list, because
+            //   otherwise that request would be the active request: the first request in
+            //   a multilayer request to be satisfied is always the active request.
+            // - Even if the network satisfies later requests in the list, they cannot become the
+            //   active request, and therefore, cannot cause this network to be kept up.
+            if (!candidate.satisfies(req) && nri.getActiveRequest() == req) {
                 return false;
             }
 
@@ -6887,6 +7143,23 @@ public class ConnectivityService extends IConnectivityManager.Stub
         });
     }
 
+    private void updateLocalNetUidAllowlist(@NonNull NetworkAgentInfo nai,
+            @NonNull Set<Integer> oldUids, @NonNull Set<Integer> newUids) {
+        if (!mDeps.isAtLeastB()) return;
+        // Stacked interfaces are not supported, as they are only for clat at the moment and there
+        // are no local prefixes on clat.
+        final String ifName = nai.linkProperties.getInterfaceName();
+        if (ifName == null) return;
+
+        final CompareResult<Integer> compareResult = new CompareResult<>(oldUids, newUids);
+        for (int uid : compareResult.removed) {
+            mBpfNetMaps.removeLocalNetUidAccess(uid, ifName);
+        }
+        for (int uid : compareResult.added) {
+            mBpfNetMaps.addLocalNetUidAccess(uid, ifName);
+        }
+    }
+
     private int updateGlobalAllowBypassVpn(@NonNull Set<Integer> oldDelegateBypassUids,
             @NonNull Set<Integer> newDelegateBypassUids) {
         // this method is for U- and V+ must use per network VPN bypass.
@@ -6991,11 +7264,13 @@ public class ConnectivityService extends IConnectivityManager.Stub
             if (nai == null) return ENOENT; // network does not exist anymore.
             if (nai.isDestroyed()) return ENOENT; // network has already been destroyed.
 
+            final Set<Integer> oldUids = nai.getCaptivePortalDelegateUids();
             final Set<Integer> oldDelegateBypassUids = getAllCaptivePortalDelegateUids();
             int ret = updateDelegateUid(nai, uid);
             // updateDelegateUid() updates mCaptivePortalDelegateUids even if it returns non-zero
             // value. Therefore, we need to call updateAllVpnForDelegateUid regardless of the
             // returned value.
+            final Set<Integer> newUids = nai.getCaptivePortalDelegateUids();
             final Set<Integer> newDelegateBypassUids = getAllCaptivePortalDelegateUids();
             if (!mDeps.isAtLeastV()) {
                 // Before V, we need to update protect VPN rules globally instead of per network.
@@ -7003,6 +7278,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 ret = updateGlobalAllowBypassVpn(oldDelegateBypassUids, newDelegateBypassUids);
             }
             updateAllVpnForDelegateUid(oldDelegateBypassUids, newDelegateBypassUids);
+            updateLocalNetUidAllowlist(nai, oldUids, newUids);
             return ret;
         }
 
@@ -7302,6 +7578,14 @@ public class ConnectivityService extends IConnectivityManager.Stub
         return mDefaultRequest.mRequests.get(0);
     }
 
+    private static boolean isProxySet(@Nullable ProxyInfo proxy) {
+        if (proxy == null) {
+            return false;
+        }
+        boolean hasHost = !TextUtils.isEmpty(proxy.getHost());
+        boolean hasPacUrl = !Uri.EMPTY.equals(proxy.getPacFileUrl());
+        return hasHost || hasPacUrl;
+    }
     private class InternalHandler extends Handler {
         public InternalHandler(Looper looper) {
             super(looper);
@@ -7316,7 +7600,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
                     break;
                 }
                 case EVENT_APPLY_GLOBAL_HTTP_PROXY: {
-                    mProxyTracker.loadDeprecatedGlobalHttpProxy();
+                    synchronized (mProxyTracker) {
+                        mProxyTracker.loadDeprecatedGlobalHttpProxy();
+                        // After loading, the global proxy state might have changed.
+                        if (mDeps.isAtLeastB()) {
+                            mHandler.sendMessage(
+                                    mHandler.obtainMessage(
+                                            EVENT_GLOBAL_PROXY_CHANGED,
+                                            isProxySet(mProxyTracker.getGlobalProxy())));
+                        }
+                    }
                     break;
                 }
                 case EVENT_PAC_PROXY_HAS_CHANGED: {
@@ -7514,6 +7807,12 @@ public class ConnectivityService extends IConnectivityManager.Stub
                     break;
                 case EVENT_TIMEOUT_NETWORK_SUSPENDED:
                     handleNetwokSuspendedTimeout((NetworkAgentInfo) msg.obj);
+                    break;
+                case EVENT_L4S_DEVELOPER_OPTION_CHANGED:
+                    handleNetworkL4sChanged();
+                    break;
+                case EVENT_GLOBAL_PROXY_CHANGED:
+                    handleGlobalProxyChanged((boolean) msg.obj);
                     break;
             }
         }
@@ -7777,7 +8076,33 @@ public class ConnectivityService extends IConnectivityManager.Stub
     @Override
     public void setGlobalProxy(@Nullable final ProxyInfo proxyProperties) {
         enforceNetworkStackPermission(mContext);
-        mProxyTracker.setGlobalProxy(proxyProperties);
+        synchronized (mProxyTracker) {
+            mProxyTracker.setGlobalProxy(proxyProperties);
+
+            if (mDeps.isAtLeastB()) {
+                mHandler.sendMessage(
+                        mHandler.obtainMessage(
+                                EVENT_GLOBAL_PROXY_CHANGED,
+                                isProxySet(mProxyTracker.getGlobalProxy())));
+            }
+        }
+    }
+
+    /* Stale copy of whether the device has global proxy.
+     * This is used to control LNP.
+     * This is only used on the handler thread, so it does not require a lock.
+     */
+    private boolean mHasGlobalProxy = false;
+
+    private void handleGlobalProxyChanged(boolean hasGlobalProxy) {
+        ensureRunningOnConnectivityServiceThread();
+        if (mHasGlobalProxy == hasGlobalProxy) return;
+
+        forEachNetworkAgentInfo(nai -> {
+            updateLocalNetworkAddresses(nai.linkProperties, nai.linkProperties,
+                    hasGlobalProxy, mHasGlobalProxy, nai);
+        });
+        mHasGlobalProxy = hasGlobalProxy;
     }
 
     @Override
@@ -7787,7 +8112,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
     }
 
     private void handlePacProxyServiceStarted(@Nullable Network net, @Nullable ProxyInfo proxy) {
-        mProxyTracker.setDefaultProxy(proxy);
+        mProxyTracker.updateDefaultNetworkState(net, proxy);
         final NetworkAgentInfo nai = getDefaultNetwork();
         // TODO : this method should check that net == nai.network, unfortunately at this point
         // 'net' is always null in practice (see PacProxyService#sendPacBroadcast). PAC proxy
@@ -7805,12 +8130,13 @@ public class ConnectivityService extends IConnectivityManager.Stub
     // when any network changes proxy.
     // TODO: Remove usage of broadcast extras as they are deprecated and not applicable in a
     // multi-network world where an app might be bound to a non-default network.
-    private void updateProxy(@NonNull LinkProperties newLp, @Nullable LinkProperties oldLp) {
+    private void updateProxy(@NonNull Network network, @NonNull LinkProperties newLp,
+            @Nullable LinkProperties oldLp) {
         ProxyInfo newProxyInfo = newLp.getHttpProxy();
         ProxyInfo oldProxyInfo = oldLp == null ? null : oldLp.getHttpProxy();
 
         if (!ProxyTracker.proxyInfoEqual(newProxyInfo, oldProxyInfo)) {
-            mProxyTracker.sendProxyBroadcast();
+            mProxyTracker.updateNetworkProxy(network, newProxyInfo, oldProxyInfo);
         }
     }
 
@@ -8201,8 +8527,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mPermissionMonitor.useBroadcastReceiveHelper()) {
             mPermissionMonitor.onUserAddedWithInstalledPackageList(user, apps);
         }
-        if (mSatelliteAccessController != null) {
-            mSatelliteAccessController.onUserAddedWithInstalledPackageList(user, apps);
+        if (mAppOptInDefaultNetworkController != null) {
+            mAppOptInDefaultNetworkController.onUserAddedWithInstalledPackageList(user, apps);
         }
         mSettingsObserver.onUsersChanged();
     }
@@ -8220,8 +8546,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mPermissionMonitor.useBroadcastReceiveHelper()) {
             mPermissionMonitor.onUserRemoved(user);
         }
-        if (mSatelliteAccessController != null) {
-            mSatelliteAccessController.onUserRemoved(user);
+        if (mAppOptInDefaultNetworkController != null) {
+            mAppOptInDefaultNetworkController.onUserRemoved(user);
         }
         mSettingsObserver.onUsersChanged();
     }
@@ -8232,8 +8558,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mPermissionMonitor.useBroadcastReceiveHelper()) {
             mPermissionMonitor.onPackageAdded(packageName, uid);
         }
-        if (mSatelliteAccessController != null) {
-            mSatelliteAccessController.onPackageAdded(packageName, uid);
+        if (mAppOptInDefaultNetworkController != null) {
+            mAppOptInDefaultNetworkController.onPackageAdded(packageName, uid);
         }
     }
 
@@ -8243,8 +8569,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mPermissionMonitor.useBroadcastReceiveHelper()) {
             mPermissionMonitor.onPackageRemoved(packageName, uid);
         }
-        if (mSatelliteAccessController != null) {
-            mSatelliteAccessController.onPackageRemoved(packageName, uid);
+        if (mAppOptInDefaultNetworkController != null) {
+            mAppOptInDefaultNetworkController.onPackageRemoved(packageName, uid);
         }
     }
 
@@ -8258,8 +8584,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mPermissionMonitor.useBroadcastReceiveHelper()) {
             mPermissionMonitor.onExternalApplicationsAvailable(pkgList);
         }
-        if (mSatelliteAccessController != null) {
-            mSatelliteAccessController.onExternalApplicationsAvailable((pkgList));
+        if (mAppOptInDefaultNetworkController != null) {
+            mAppOptInDefaultNetworkController.onExternalApplicationsAvailable((pkgList));
         }
     }
 
@@ -9256,7 +9582,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
         return networkCapabilities.hasCapability(
                 NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_BANDWIDTH)
                 || networkCapabilities.hasCapability(
-                NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_LATENCY);
+                NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_LATENCY)
+                || networkCapabilities.hasCapability(
+                NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS);
     }
 
     private void enforceRequestCapabilitiesDeclaration(@NonNull final String callerPackageName,
@@ -9278,7 +9606,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
                             mContext.createContextAsUser(UserHandle.getUserHandleForUid(
                                     callingUid), 0 /* flags */).getPackageManager();
                     final PackageManager.Property networkSliceProperty = packageManager.getProperty(
-                            ConstantsShim.PROPERTY_SELF_CERTIFIED_NETWORK_CAPABILITIES,
+                            PackageManager.PROPERTY_SELF_CERTIFIED_NETWORK_CAPABILITIES,
                             callerPackageName
                     );
                     final XmlResourceParser parser = packageManager
@@ -9293,7 +9621,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
             }
         } catch (PackageManager.NameNotFoundException ne) {
             throw new SecurityException(
-                    "Cannot find " + ConstantsShim.PROPERTY_SELF_CERTIFIED_NETWORK_CAPABILITIES
+                    "Cannot find " + PackageManager.PROPERTY_SELF_CERTIFIED_NETWORK_CAPABILITIES
                             + " property");
         } catch (XmlPullParserException | IOException | InvalidTagException e) {
             throw new SecurityException(e.getMessage());
@@ -9810,6 +10138,19 @@ public class ConnectivityService extends IConnectivityManager.Stub
         return (mDefaultNetworkRequests.contains(nri) && mDefaultRequest != nri);
     }
 
+    /** Whether this network is capable of supporting L4S */
+    public boolean shouldEnableL4s(@NonNull NetworkAgentInfo nai) {
+        if (nai.isVPN()) return false;
+
+        // TODO: add metrics in updateCapabilities to make sure these capabilities are not changed
+        final NetworkCapabilities nc = nai.networkCapabilities;
+        return nc.hasCapability(NET_CAPABILITY_INTERNET)
+                || nc.hasCapability(NET_CAPABILITY_PRIORITIZE_LATENCY)
+                || nc.hasCapability(NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS)
+                || nc.hasCapability(NET_CAPABILITY_PRIORITIZE_BANDWIDTH)
+                || nc.hasTransport(TRANSPORT_TEST);
+    }
+
     /**
      * Return the default network request currently tracking the given uid.
      * @param uid the uid to check.
@@ -10045,7 +10386,11 @@ public class ConnectivityService extends IConnectivityManager.Stub
         } else {
             throw new SecurityException("Requires one of the following permissions: "
                     + "NETWORK_FACTORY, MAINLINE_NETWORK_STACK"
-                    + (mDeps.isAtLeast25Q4() ? ", CREATE_APP_SPECIFIC_NETWORK" : ""));
+                    + (mDeps.isAtLeast25Q4()
+                            ? ", CREATE_APP_SPECIFIC_NETWORK"
+                            : (mDeps.isAtLeastB()
+                                    ? ", CONNECTIVITY_USE_RESTRICTED_NETWORKS"
+                                    : "")));
         }
         final boolean hasLocalCap =
                 networkCapabilities.hasCapability(NET_CAPABILITY_LOCAL_NETWORK);
@@ -10054,18 +10399,20 @@ public class ConnectivityService extends IConnectivityManager.Stub
             throw new IllegalArgumentException("Local agents are not supported in this version");
         }
         final boolean hasLocalNetworkConfig = null != localNetworkConfig;
-        if (hasLocalCap != hasLocalNetworkConfig) {
-            throw new IllegalArgumentException(null != localNetworkConfig
-                    ? "Only local network agents can have a LocalNetworkConfig"
-                    : "Local network agents must have a LocalNetworkConfig"
-            );
+        if (hasLocalNetworkConfig && !hasLocalCap) {
+            throw new IllegalArgumentException(
+                    "Only local network agents can have a LocalNetworkConfig");
         }
+        final boolean needsDefaultLnc = hasLocalCap && !hasLocalNetworkConfig;
+        final LocalNetworkConfig lnc = needsDefaultLnc
+                ? new LocalNetworkConfig.Builder().build()
+                : localNetworkConfig;
 
         final int uid = mDeps.getCallingUid();
         final long token = Binder.clearCallingIdentity();
         try {
             return registerNetworkAgentInternal(na, networkInfo, linkProperties,
-                    networkCapabilities, initialScore, networkAgentConfig, localNetworkConfig,
+                    networkCapabilities, initialScore, networkAgentConfig, lnc,
                     providerId, uid, isAppSpecificNetwork);
         } finally {
             Binder.restoreCallingIdentity(token);
@@ -10085,12 +10432,6 @@ public class ConnectivityService extends IConnectivityManager.Stub
         final NetworkCapabilities ncCopy = new NetworkCapabilities(networkCapabilities);
         final LinkProperties lpCopy = new LinkProperties(linkProperties);
         // No need to copy |localNetworkConfiguration| as it is immutable.
-
-        if (isAppSpecificNetwork) {
-            // For app specific network, set the app's UID and make network restricted.
-            ncCopy.setSingleUid(uid);
-            ncCopy.removeCapability(NET_CAPABILITY_NOT_RESTRICTED);
-        }
 
         // At this point the capabilities/properties are untrusted and unverified, e.g. checks that
         // the capabilities' access UIDs comply with security limitations. They will be sanitized
@@ -10350,9 +10691,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
         mDnsManager.updatePrivateDnsStatus(netId, newLp);
 
         if (isDefaultNetwork(networkAgent)) {
-            mProxyTracker.setDefaultProxy(newLp.getHttpProxy());
+            mProxyTracker.updateDefaultNetworkState(networkAgent.network, newLp.getHttpProxy());
         } else if (networkAgent.everConnected()) {
-            updateProxy(newLp, oldLp);
+            updateProxy(networkAgent.network, newLp, oldLp);
         }
 
         updateWakeOnLan(newLp);
@@ -10482,6 +10823,62 @@ public class ConnectivityService extends IConnectivityManager.Stub
         updateLinkProperties(nai, new LinkProperties(nai.linkProperties), null);
     }
 
+    private void maybeAttachL4sEgressProgram(@NonNull String iface, @NonNull NetworkAgentInfo nai) {
+        if (!mBpfNetMaps.isL4sSupported()) return;
+
+        if (iface.startsWith("v4-")) return;
+        if (!shouldEnableL4s(nai)) return;
+
+        final int ifIndex = mDeps.if_nametoindex(iface);
+        if (ifIndex == 0) {
+            Log.e(TAG, "Failed to get interface index for " + iface);
+            return;
+        }
+
+        try {
+            final String progPath = mDeps.isEthernet(iface)
+                    ? BPF_L4S_EGRESS_ETH_PROG
+                    : BPF_L4S_EGRESS_RAWIP_PROG;
+            // tc filter add dev .. egress prio 6 protocol ip bpf object-pinned /sys/fs/bpf/...
+            // direct-action
+            mDeps.attachBpfProgram(
+                    ifIndex,
+                    false /* ingress */,
+                    PRIO_L4S,
+                    (short) ETH_P_ALL,
+                    progPath);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to attach L4S program to " + iface + ": " + e);
+            return;
+        }
+    }
+
+    private void maybeModifyQdiscClsact(
+            @NonNull String iface, @NonNull NetworkAgentInfo nai, Boolean add) {
+        if (!mDeps.flagConnectivityServiceModifyQdiscClsact()) return;
+        // The clsact attaching of v4- tun interface is triggered by ClatdCoordinator::maybeStartBpf
+        // because the clat is started before the v4- interface is added to the network and the
+        // clat startup needs to add {in, e}gress filters.
+        // TODO: remove this workaround once v4- tun interface clsact attaching is moved out from
+        // ClatdCoordinator::maybeStartBpf.
+        if (iface.startsWith("v4-") && add) return;
+        if (nai.isVPN()) return;
+
+        final int ifIndex = mDeps.if_nametoindex(iface);
+        if (ifIndex == 0) {
+            if (add) {
+                Log.e(TAG, "Failed to get interface index for " + iface);
+            }
+            return;
+        }
+
+        if (add) {
+            mDeps.sendNewRtmQdiscClsactRequest(ifIndex);
+        } else {
+            mDeps.sendDelRtmQdiscClsactRequest(ifIndex);
+        }
+    }
+
     /**
      * @param naData captive portal data from NetworkAgent
      * @param apiData captive portal data from capport API
@@ -10573,6 +10970,14 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+    private void updateLocalNetUidAccessForInterfaceAdded(final @NonNull String ifName,
+            final @NonNull NetworkAgentInfo nai) {
+        for (int uid : nai.getCaptivePortalDelegateUids()) {
+            mBpfNetMaps.addLocalNetUidAccess(uid, ifName);
+        }
+    }
+
     private void updateInterfaces(final @NonNull LinkProperties newLp,
             final @Nullable LinkProperties oldLp, final int netId,
             final @NonNull NetworkAgentInfo nai) {
@@ -10583,52 +10988,94 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 try {
                     if (DBG) log("Adding iface " + iface + " to network " + netId);
                     mRoutingCoordinatorService.addInterfaceToNetwork(netId, iface);
+                    maybeModifyQdiscClsact(iface, nai, true /* add */);
                     wakeupModifyInterface(iface, nai, true);
                     mDeps.reportNetworkInterfaceForTransports(mContext, iface,
                             nai.networkCapabilities.getTransportTypes());
-                    mInterfaceTracker.addInterface(iface);
                 } catch (Exception e) {
                     logw("Exception adding interface: " + e);
+                }
+                mInterfaceTracker.addInterface(iface);
+                maybeAttachL4sEgressProgram(iface, nai);
+                if (mDeps.isAtLeastB()) {
+                    updateLocalNetUidAccessForInterfaceAdded(iface, nai);
                 }
             }
         }
 
         // The local network addresses needs to be updated before interfaces are removed because
         // modifying bpf map local_net_access requires mapping interface name to index.
-        updateLocalNetworkAddresses(newLp, oldLp);
+        updateLocalNetworkAddresses(newLp, oldLp, mHasGlobalProxy, mHasGlobalProxy, nai);
 
         for (final String iface : interfaceDiff.removed) {
             try {
                 if (DBG) log("Removing iface " + iface + " from network " + netId);
                 wakeupModifyInterface(iface, nai, false);
                 mRoutingCoordinatorService.removeInterfaceFromNetwork(netId, iface);
-                mInterfaceTracker.removeInterface(iface);
+                // attached programs are cleared by removing qdisc clsact
+                maybeModifyQdiscClsact(iface, nai, false /* add */);
             } catch (Exception e) {
                 loge("Exception removing interface: " + e);
+            }
+            final int ifIndex = mInterfaceTracker.removeInterface(iface);
+            // Local protection maps are B+ (developer opt-in on B).
+            if (ifIndex != 0 && mDeps.isAtLeastB()) {
+                mBpfNetMaps.removeLocalNetHostAllowlistForInterface(ifIndex);
             }
         }
     }
 
+    private boolean shouldApplyLnp(@Nullable LinkProperties lp, boolean hasGlobalProxy) {
+        // Do not apply LNP if a global proxy is configured.
+        if (hasGlobalProxy) {
+            return false;
+        }
+        // Do not apply LNP if a per-network proxy is configured.
+        if (lp != null && isProxySet(lp.getHttpProxy())) {
+            return false;
+        }
+        return true;
+    }
+
     /**
      * Update Local Network Addresses to LocalNetAccess BPF map.
+     *
      * @param newLp new link properties
      * @param oldLp old link properties
+     * @param newHasGlobalProxy true if a global proxy is set in the new state
+     * @param oldHasGlobalProxy true if a global proxy was set in the old state
      */
-    private void updateLocalNetworkAddresses(@Nullable final LinkProperties newLp,
-            @NonNull final LinkProperties oldLp) {
+    private void updateLocalNetworkAddresses(
+            @Nullable final LinkProperties newLp,
+            @Nullable final LinkProperties oldLp,
+            boolean newHasGlobalProxy,
+            boolean oldHasGlobalProxy,
+            @NonNull final NetworkAgentInfo nai) {
 
         // The maps are available only after 25Q2 release
-        if (!BpfNetMaps.isAtLeast25Q2()) {
+        // Skip this for restricted networks on automotive devices until we have a way to identify
+        // vehicle networks which should be exempt from LNP.
+        if (!mDeps.isAtLeastB() || shouldSkipLnpOnAutomotive(nai)) {
             return;
         }
 
-        final CompareResult<String> interfaceDiff = new CompareResult<>(
-                oldLp != null ? oldLp.getAllInterfaceNames() : null,
-                newLp != null ? newLp.getAllInterfaceNames() : null);
+        final boolean newLnpShouldApply = shouldApplyLnp(newLp, newHasGlobalProxy);
+        final boolean oldLnpShouldApply = shouldApplyLnp(oldLp, oldHasGlobalProxy);
 
+        // Populate interface lists only if LNP should apply
+        final List<String> oldIfacesForLnp =
+                (oldLp != null && oldLnpShouldApply) ? oldLp.getAllInterfaceNames() : null;
+        final List<String> newIfacesForLnp =
+                (newLp != null && newLnpShouldApply) ? newLp.getAllInterfaceNames() : null;
+
+        final CompareResult<String> interfaceDiff =
+                new CompareResult<>(oldIfacesForLnp, newIfacesForLnp);
+
+        // Add rules for interfaces that are new or now have LNP applied
         for (final String iface : interfaceDiff.added) {
             addLocalAddressesToBpfMap(iface, MULTICAST_AND_BROADCAST_PREFIXES, newLp);
         }
+        // Remove rules for interfaces that are gone or no longer have LNP applied
         for (final String iface : interfaceDiff.removed) {
             removeLocalAddressesFromBpfMap(iface, MULTICAST_AND_BROADCAST_PREFIXES, oldLp);
         }
@@ -10637,11 +11084,11 @@ public class ConnectivityService extends IConnectivityManager.Stub
         final List<LinkProperties> newLinkProperties = new ArrayList<>();
         final List<LinkProperties> oldLinkProperties = new ArrayList<>();
 
-        if (newLp != null) {
+        if (newLp != null && newLnpShouldApply) {
             newLinkProperties.add(newLp);
             newLinkProperties.addAll(newLp.getStackedLinks());
         }
-        if (oldLp != null) {
+        if (oldLp != null && oldLnpShouldApply) {
             oldLinkProperties.add(oldLp);
             oldLinkProperties.addAll(oldLp.getStackedLinks());
         }
@@ -10653,68 +11100,179 @@ public class ConnectivityService extends IConnectivityManager.Stub
         final CompareResult<LinkProperties> linkPropertiesDiff = new CompareResult<>(
                 oldLinkProperties, newLinkProperties);
 
-        for (LinkProperties linkProperty : linkPropertiesDiff.added) {
-            final List<IpPrefix> unicastLocalPrefixesToBeAdded = new ArrayList<>();
-            for (LinkAddress linkAddress : linkProperty.getLinkAddresses()) {
-                unicastLocalPrefixesToBeAdded.addAll(getLocalNetworkPrefixesForAddress(
-                        linkAddress.getAddress(), linkAddress.getPrefixLength()));
-            }
-            addLocalAddressesToBpfMap(linkProperty.getInterfaceName(),
-                    unicastLocalPrefixesToBeAdded, linkProperty);
-
+        for (LinkProperties lp : linkPropertiesDiff.added) {
+            final List<IpPrefix> unicastLocalPrefixesToBeAdded =
+                    getEffectiveLocalPrefixes(lp);
+            addLocalAddressesToBpfMap(lp.getInterfaceName(),
+                    unicastLocalPrefixesToBeAdded, lp);
             // populating interface name -> ip prefixes which were added to local_net_access map.
-            if (!prefixesAddedForInterface.containsKey(linkProperty.getInterfaceName())) {
-                prefixesAddedForInterface.put(linkProperty.getInterfaceName(), new ArrayList<>());
+            if (!prefixesAddedForInterface.containsKey(lp.getInterfaceName())) {
+                prefixesAddedForInterface.put(lp.getInterfaceName(), new ArrayList<>());
             }
-            prefixesAddedForInterface.get(linkProperty.getInterfaceName())
+
+            prefixesAddedForInterface.get(lp.getInterfaceName())
                     .addAll(unicastLocalPrefixesToBeAdded);
         }
 
-        for (LinkProperties linkProperty : linkPropertiesDiff.removed) {
-            final List<IpPrefix> unicastLocalPrefixesToBeRemoved = new ArrayList<>();
-            final List<IpPrefix> unicastLocalPrefixesAdded = prefixesAddedForInterface.getOrDefault(
-                    linkProperty.getInterfaceName(), Collections.emptyList());
 
-            for (LinkAddress linkAddress : linkProperty.getLinkAddresses()) {
-                unicastLocalPrefixesToBeRemoved.addAll(getLocalNetworkPrefixesForAddress(
-                        linkAddress.getAddress(), linkAddress.getPrefixLength()));
-            }
+        for (LinkProperties lp : linkPropertiesDiff.removed) {
+            final List<IpPrefix> unicastLocalPrefixesToBeRemoved =
+                    getEffectiveLocalPrefixes(lp);
+            final List<IpPrefix> unicastLocalPrefixesAdded = prefixesAddedForInterface.getOrDefault(
+                    lp.getInterfaceName(), Collections.emptyList());
 
             // This is to ensure if 10.0.10.0/24 was added and 10.0.11.0/24 was removed both will
             // still populate the same prefix of 10.0.0.0/8, which mean 10.0.0.0/8 should not be
             // removed due to removal of 10.0.11.0/24
             unicastLocalPrefixesToBeRemoved.removeAll(unicastLocalPrefixesAdded);
 
-            removeLocalAddressesFromBpfMap(linkProperty.getInterfaceName(),
-                    new ArrayList<>(unicastLocalPrefixesToBeRemoved), linkProperty);
+            removeLocalAddressesFromBpfMap(lp.getInterfaceName(),
+                    new ArrayList<>(unicastLocalPrefixesToBeRemoved), lp);
         }
     }
 
     /**
-     * Filters IpPrefix that are local prefixes and LinkAddress is part of them.
-     * @param prefix address used for filtering
-     * @param prefixLength prefix length of address
-     * @return list of IpPrefix that are local addresses.
+     * Calculates the effective set of local network prefixes for a given link.
+     *
+     * <p>This method determines the complete list of IP prefixes that should be considered local to
+     * the device on a specific network interface. It starts by identifying all on-link prefixes
+     * derived from the link's assigned IP addresses.
+     *
+     * <p>It then checks for the presence of "local-only" routes (e.g. on a Thread mesh network)
+     * using {@link #getLocalNetworkPrefixes(LinkProperties)}. If such routes exist, they are
+     * prioritized. Any on-link prefix that is already encompassed by a local-only route is filtered
+     * out to prevent redundant entries in network control maps.
+     *
+     * <p>The final list consists of the identified local-only routes plus any on-link prefixes that
+     * were not covered by those routes.
+     *
+     * @param lp The {@link LinkProperties} of the network link.
+     * @return A {@code List<IpPrefix>} containing the consolidated set of local prefixes to be
+     * managed (e.g., added to a BPF map).
      */
-    public static List<IpPrefix> getLocalNetworkPrefixesForAddress(InetAddress prefix,
-            int prefixLength) {
-        List<IpPrefix> localPrefixes = new ArrayList<>();
-        if (prefix instanceof Inet6Address) {
-            // For IPv6, if the prefix length is greater than zero then they are part of local
-            // network
-            if (prefixLength != 0) {
-                localPrefixes.add(
-                        new IpPrefix(prefix, prefixLength));
+    private List<IpPrefix> getEffectiveLocalPrefixes(LinkProperties lp) {
+        // Get the on-link prefixes for all addresses on the link.
+        final Set<IpPrefix> prefixes = new ArraySet<>();
+        for (LinkAddress linkAddress : lp.getLinkAddresses()) {
+            final IpPrefix onlinkPrefix = new IpPrefix(linkAddress.getAddress(),
+                    linkAddress.getPrefixLength());
+            if (isPrefixLocal(onlinkPrefix)) {
+                prefixes.add(onlinkPrefix);
             }
-        } else {
-            // For IPv4, if the linkAddress is part of IpPrefix adding prefix to result.
-            for (IpPrefix ipv4LocalPrefix : IPV4_LOCAL_PREFIXES) {
-                if (ipv4LocalPrefix.containsPrefix(new IpPrefix(prefix, prefixLength))) {
-                    localPrefixes.add(ipv4LocalPrefix);
+        }
+
+        // Add the local network routes.
+        prefixes.addAll(getLocalNetworkPrefixes(lp));
+
+        // Filter out any prefixes that are contained within another, more general,
+        // prefix in the set. This avoids redundant entries in network control maps.
+        final List<IpPrefix> effectivePrefixes = new ArrayList<>(prefixes);
+        effectivePrefixes.removeIf(p1 -> {
+            for (IpPrefix p2 : prefixes) {
+                if (!p1.equals(p2) && p2.containsPrefix(p1)) {
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        return effectivePrefixes;
+    }
+
+    private static boolean hasGatewayedRoute(Collection<RouteInfo> routes) {
+        for (RouteInfo route : routes) {
+            if (route.hasGateway()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Identifies and retrieves all prefixes for network links that provide access to a
+     * local network.
+     *
+     * <p>This method's primary purpose is to reliably distinguish a local Thread network.
+     * <p>A destination is defined as "local" based on the two specific rules:
+     * <ul>
+     * <li><b>ULA with a Non-Default Gateway:</b> Any Unique Local Address (ULA) route whose
+     * next-hop is not a default router is considered local. This is the primary rule that correctly
+     * identifies a Thread network connected via a local Border Router.</li>
+     * <li><b>Route Covers Own Address:</b> Any route that covers one of the device's own IP
+     * addresses on the same link is considered local. This rule ensures the network the phone is
+     * directly connected to (e.g., the Wi-Fi network) is correctly identified as part of the
+     * "whole home network".</li>
+     * </ul>
+     *
+     * <p>This method returns a list of <strong>local</strong> prefixes available on the link.
+     *
+     * @param lp The {@link LinkProperties} of the network link to examine.
+     * @return A new {@code List<IpPrefix>} containing local route destinations or an empty list
+     * otherwise.
+     */
+    private List<IpPrefix> getLocalNetworkPrefixes(final LinkProperties lp) {
+        if (lp == null || !mDeps.isLnpDeveloperOptInEnabled()) {
+            return new ArrayList<>();
+        }
+
+        final List<RouteInfo> routes = lp.getRoutes();
+
+        // On point-to-point links such as cellular and VPNs, assume that nothing is local except
+        // the subnets corresponding to local IP addresses. NetworkAgents don't specify whether
+        // their network is point-to-point, and the IFF_POINTOPOINT flag is likely unreliable, so
+        // use a simple heuristic: if there are no gatewayed routes, then the network is
+        // point-to-point. This seems better than excluding specific network types such as VPNs and
+        // cellular. Don't look at clat, which is always gatewayed.
+        if (!hasGatewayedRoute(routes)) return new ArrayList<>();
+
+        // TODO: Add all directly-connected routes.
+
+        final List<IpPrefix> localPrefixes = new ArrayList<>();
+
+        // Rule 1: Check for a ULA route with a nexthop that is not a default router.
+        // First find all default routers (i.e gateways for the ::/0 route).
+        final Set<InetAddress> defaultRouters = new HashSet<>();
+        for (final RouteInfo route : routes) {
+            if (route.isDefaultRoute() && route.getGateway() instanceof Inet6Address) {
+                defaultRouters.add(route.getGateway());
+            }
+        }
+
+        // Now, check for a ULA route going through a non-default router.
+        for (final RouteInfo route : routes) {
+            // isIPv6ULA is a utility method to be implemented as per project standards.
+            if (ConnectivityUtils.isIPv6ULA(route.getDestination().getAddress())) {
+                // A ULA route is local if its gateway exists and is NOT a default router.
+                if (!defaultRouters.contains(route.getGateway())) {
+                    localPrefixes.add(route.getDestination());
                 }
             }
         }
+
+        // Rule 2: Check if any non-default route covers a device's own address.
+        for (final RouteInfo route : routes) {
+            for (LinkAddress linkAddress : lp.getLinkAddresses()) {
+                if (!route.isDefaultRoute() && route.matches(linkAddress.getAddress())) {
+                    localPrefixes.add(route.getDestination());
+                }
+            }
+        }
+
         return localPrefixes;
+    }
+
+    /**
+     * @return whether a prefix is local for the purposes of Local Network Protection.
+     */
+    private static boolean isPrefixLocal(IpPrefix prefix) {
+        if (prefix.getAddress() instanceof Inet6Address) {
+            return prefix.getPrefixLength() != 0;
+        }
+
+        for (IpPrefix ipv4LocalPrefix : IPV4_LOCAL_PREFIXES) {
+            if (ipv4LocalPrefix.containsPrefix(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -10725,7 +11283,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
      */
     private void addLocalAddressesToBpfMap(final String iface, final List<IpPrefix> prefixes,
                                            @Nullable final LinkProperties lp) {
-        if (!BpfNetMaps.isAtLeast25Q2()) return;
+        if (!mDeps.isAtLeastB()) return;
 
         for (IpPrefix prefix : prefixes) {
             // Add local dnses allow rule To BpfMap before adding the block rule for prefix
@@ -10755,7 +11313,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
      */
     private void removeLocalAddressesFromBpfMap(final String iface, final List<IpPrefix> prefixes,
                                                 @Nullable final LinkProperties lp) {
-        if (!BpfNetMaps.isAtLeast25Q2()) return;
+        if (!mDeps.isAtLeastB()) return;
 
         for (IpPrefix prefix : prefixes) {
             // The reasoning for prefix length is explained in addLocalAddressesToBpfMap()
@@ -10777,7 +11335,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
      */
     private void addLocalDnsesToBpfMap(final String iface, IpPrefix prefix,
             @Nullable final LinkProperties lp) {
-        if (!BpfNetMaps.isAtLeast25Q2() || lp == null) return;
+        if (!mDeps.isAtLeastB() || lp == null) return;
 
         for (InetAddress dnsServer : lp.getDnsServers()) {
             // Adds dns allow rule to LocalNetAccessMap for both TCP and UDP protocol at port 53,
@@ -10801,7 +11359,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
      */
     private void removeLocalDnsesFromBpfMap(final String iface, IpPrefix prefix,
             @Nullable final LinkProperties lp) {
-        if (!BpfNetMaps.isAtLeast25Q2() || lp == null) return;
+        if (!mDeps.isAtLeastB() || lp == null) return;
 
         for (InetAddress dnsServer : lp.getDnsServers()) {
             // Removes dns allow rule from LocalNetAccessMap for both TCP and UDP protocol
@@ -10815,6 +11373,46 @@ public class ConnectivityService extends IConnectivityManager.Stub
                         IPPROTO_TCP, 853);  // DNS over TLS
             }
         }
+    }
+
+    @Override
+    public void allowLocalNetAccess(int uid, int ifIndex, List<String> addresses) {
+        // This is only for usage within system_server
+        if (mDeps.getCallingPid() != Process.myPid()) {
+            throw new SecurityException("Not allowed to call allowLocalNetAccess");
+        }
+        if (!mDeps.isAtLeastB()) {
+            throw new UnsupportedOperationException("allowLocalNetAccess is only available on B+");
+        }
+
+        // Optimistically add entries in the allowlist map synchronously (not on the handler thread)
+        // so callers can rely on the allowlist being in place when this returns.
+        // This means entries might be added for interfaces that are not tracked (either because
+        // they never had a Network, such as Wi-Fi P2P interfaces, or they were destroyed already),
+        // so a cleanup is done on the handler thread after that.
+        // It is OK if there are entries in the map referencing a removed or untracked interface for
+        // a short while, as local network is not blocked on such interfaces so it does not matter
+        // if they have entries in the allowlist.
+        // If an entry is added before ConnectivityService hears about an interface, it may be
+        // cleared before a Network is created; ConnectivityService would not be able to handle such
+        // a request anyway, so for networks tracked by ConnectivityService, callers are expected to
+        // only add entries after a Network is created.
+        for (String addrStr : addresses) {
+            final InetAddress addr;
+            try {
+                addr = InetAddresses.parseNumericAddress(addrStr);
+            } catch (IllegalArgumentException e) {
+                loge("Invalid address: " + addrStr);
+                continue;
+            }
+            mBpfNetMaps.addLocalNetUidHostAccess(uid, ifIndex, addr);
+        }
+        mHandler.post(() -> {
+            if (!mInterfaceTracker.hasInterface(ifIndex)) {
+                Log.d(TAG, "Clearing local net access for untracked interface: " + ifIndex);
+                mBpfNetMaps.removeLocalNetHostAllowlistForInterface(ifIndex);
+            }
+        });
     }
 
     /**
@@ -10915,9 +11513,18 @@ public class ConnectivityService extends IConnectivityManager.Stub
         // LOCAL_NETWORK routing table, which has no corresponding local table for
         // local routes to be added to.
         if (netId == LOCAL_NET_ID) return false;
+
+        // TODO: this code assumes that local routes can *only* be directly-connected routes created
+        // by IP addresses being assigned on the interface. This is not the case - for example:
+        // - A ULA routed to a Thread network is a local route.
+        // - On a home network that is assigned a 2001:db8:aaaa::/56, if the router announces an RIO
+        //   for the whole /56 and also announces a PIO for, e.g.,  2001:db8:aaaa:1::/64, then
+        //   getEffectiveLocalPrefixes will include 2001:db8:aaaa::/56 in the list of prefixes, but
+        //   isLocalRoute will return false.
+        // Not clear how to fix tis. This code could call getEffectiveLocalPrefixes, which is more
+        // sophisticated, but that method is not cheap.
         IpPrefix routeDestination = new IpPrefix(route.destination);
-        return !getLocalNetworkPrefixesForAddress(routeDestination.getAddress(),
-                routeDestination.getPrefixLength()).isEmpty();
+        return isPrefixLocal(routeDestination);
     }
 
     private void updateVpnFiltering(@NonNull LinkProperties newLp, @Nullable LinkProperties oldLp,
@@ -11651,7 +12258,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
         final Set<UidRange> newUids = newNc == null ? null : newNc.getUidRanges();
         if (nai.isVPN() && nai.everConnected() && !UidRange.hasSameUids(prevUids, newUids)
                 && (nai.linkProperties.getHttpProxy() != null || isProxySetOnAnyDefaultNetwork())) {
-            mProxyTracker.sendProxyBroadcast();
+            mProxyTracker.updateNetworkProxy(
+                    nai.network,
+                    nai.linkProperties.getHttpProxy(),
+                    nai.linkProperties.getHttpProxy());
         }
     }
 
@@ -12125,8 +12735,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
         mNetworkActivityTracker.updateDefaultNetwork(newDefaultNetwork, oldDefaultNetwork);
         maybeDestroyPendingSockets(newDefaultNetwork, oldDefaultNetwork);
-        mProxyTracker.setDefaultProxy(null != newDefaultNetwork
-                ? newDefaultNetwork.linkProperties.getHttpProxy() : null);
+        mProxyTracker.updateDefaultNetworkState(
+                null != newDefaultNetwork ? newDefaultNetwork.network : null,
+                null != newDefaultNetwork ? newDefaultNetwork.linkProperties.getHttpProxy() : null);
         resetHttpProxyForNonDefaultNetwork(oldDefaultNetwork);
         updateTcpBufferSizes(null != newDefaultNetwork
                 ? newDefaultNetwork.linkProperties.getTcpBufferSizes() : null);
@@ -12961,7 +13572,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 // If something depends on both LinkProperties and connected state, it should be in
                 // this method as well.
                 networkAgent.clatd.update();
-                updateProxy(networkAgent.linkProperties, null);
+                updateProxy(networkAgent.network, networkAgent.linkProperties, null);
             }
 
             // If a rate limit has been configured and is applicable to this network (network
@@ -13063,7 +13674,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 // apps may need to update their proxy data. This is called after disconnecting from
                 // VPN to make sure we do not broadcast the old proxy data.
                 // TODO(b/122649188): send the broadcast only to VPN users.
-                mProxyTracker.sendProxyBroadcast();
+                mProxyTracker.updateNetworkProxy(
+                        networkAgent.network,
+                        null /* newProxyInfo */,
+                        networkAgent.linkProperties.getHttpProxy());
             }
         } else if (networkAgent.isCreated() && (oldInfo.getState() == NetworkInfo.State.SUSPENDED
                 || state == NetworkInfo.State.SUSPENDED)) {
@@ -13627,6 +14241,15 @@ public class ConnectivityService extends IConnectivityManager.Stub
                         }
                         return 0;
                     }
+                    case "log-list-update":
+                        Intent updateIntent =
+                                new Intent(ConfigUpdate.ACTION_UPDATE_CT_LOGS)
+                                        .setPackage(mContext.getPackageName());
+                        if ("delete".equals(getNextArg())) {
+                            updateIntent.putExtra("delete", true);
+                        }
+                        mContext.sendBroadcast(updateIntent);
+                        return 0;
                     case "reevaluate":
                         // Usage : adb shell cmd connectivity reevaluate <netId>
                         // If netId is omitted, then reevaluate the default network
@@ -13709,6 +14332,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
             pw.println("    Set the allow bit in FIREWALL_CHAIN_BACKGROUND for the given uid.");
             pw.println("  get-background-networking-enabled-for-uid [uid]");
             pw.println("    Get the allow bit in FIREWALL_CHAIN_BACKGROUND for the given uid.");
+            pw.println("  log-list-update");
+            pw.println("    Triggers an update of the CT log list.");
             if (Build.isDebuggable()) {
                 pw.println("  set-debug-fallback-network-for-uid [uid] [transport]");
                 pw.println("    Sets [uid] to use [transport] as its default network when there is"
@@ -13981,6 +14606,27 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
     }
 
+    private boolean addConnectivityDiagnosticsCallback(
+            @NonNull ConnectivityDiagnosticsCallbackInfo cbInfo, @NonNull IBinder iCb) {
+        ensureRunningOnConnectivityServiceThread();
+
+        // This means that the client registered the same callback multiple times. Do
+        // not override the previous entry, and exit silently.
+        if (mConnectivityDiagnosticsCallbacks.containsKey(iCb)) {
+            if (VDBG) log("Diagnostics callback is already registered");
+            return false;
+        }
+
+        try {
+            iCb.linkToDeath(cbInfo, 0);
+        } catch (RemoteException e) {
+            return false;
+        }
+
+        mConnectivityDiagnosticsCallbacks.put(iCb, cbInfo);
+        return true;
+    }
+
     private void handleRegisterConnectivityDiagnosticsCallback(
             @NonNull ConnectivityDiagnosticsCallbackInfo cbInfo) {
         ensureRunningOnConnectivityServiceThread();
@@ -13996,24 +14642,13 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 + "network requests.");
         }
 
-        // This means that the client registered the same callback multiple times. Do
-        // not override the previous entry, and exit silently.
-        if (mConnectivityDiagnosticsCallbacks.containsKey(iCb)) {
-            if (VDBG) log("Diagnostics callback is already registered");
+        if (!addConnectivityDiagnosticsCallback(cbInfo, iCb)) {
+            if (VDBG) log("Fail to register the diagnostics callback");
 
             // Decrement the reference count for this NetworkRequestInfo. The reference count is
             // incremented when the NetworkRequestInfo is created as part of
             // enforceRequestCountLimit().
             nri.mPerUidCounter.decrementCount(nri.mUid);
-            return;
-        }
-
-        mConnectivityDiagnosticsCallbacks.put(iCb, cbInfo);
-
-        try {
-            iCb.linkToDeath(cbInfo, 0);
-        } catch (RemoteException e) {
-            cbInfo.binderDied();
             return;
         }
 
@@ -15162,12 +15797,68 @@ public class ConnectivityService extends IConnectivityManager.Stub
         return createNrisForPreferenceOrder(uids, requests, preferenceOrder);
     }
 
-    ArraySet<NetworkRequestInfo> createMultiLayerNrisFromSatelliteNetworkFallbackUids(
-            @NonNull final Set<Integer> messagingRoleUids,
-            @NonNull final Set<Integer> optinUids
-    ) {
-        // The messaging role UIDs should use any Internet-providing satellite network as
-        // a fallback, even if it is restricted.
+    /**
+     * Creates a set of NetworkRequestInfo objects from a list of arbitrated policies.
+     * This is the central, generic method for building requests based on policies from the
+     * AppOptInDefaultNetworkController.
+     *
+     * @param policies The list of arbitrated policies.
+     * @return An ArraySet of NetworkRequestInfo objects to be applied.
+     */
+    @VisibleForTesting
+    ArraySet<NetworkRequestInfo> createNrisFromAppOptInPolicies(
+            @NonNull List<AppOptInDefaultNetworkPolicy> policies) {
+        final ArraySet<NetworkRequestInfo> allNris = new ArraySet<>();
+        for (AppOptInDefaultNetworkPolicy policy : policies) {
+            final List<NetworkRequest> mlRequests = new ArrayList<>();
+
+            // Higher-Priority Networks
+            if (policy.isOtt()) {
+                mlRequests.addAll(getOttSlicingRequests());
+            }
+
+            // System default network
+            mlRequests.add(createDefaultInternetRequestForTransport(
+                    TYPE_NONE, NetworkRequest.Type.TRACK_DEFAULT));
+
+            // Fallback Networks
+            if (policy.isSatelliteRoleSms()) {
+                mlRequests.add(getSatelliteRoleSmsRequest());
+            }
+
+            if (policy.isSatelliteOptIn()) {
+                mlRequests.add(getSatelliteOptInRequest());
+            }
+
+            allNris.addAll(createNrisForPreferenceOrder(policy.uids(), mlRequests,
+                    PREFERENCE_ORDER_APP_OPT_IN));
+        }
+        return allNris;
+    }
+
+    private List<NetworkRequest> getOttSlicingRequests() {
+        final List<NetworkRequest> requests = new ArrayList<>();
+
+        // Layer 1: Unmetered
+        final NetworkCapabilities unmeteredCap = new NetworkCapabilities.Builder()
+                .addCapability(NET_CAPABILITY_INTERNET)
+                .addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
+                .addCapability(NET_CAPABILITY_NOT_METERED)
+                .build();
+        requests.add(createNetworkRequest(NetworkRequest.Type.REQUEST, unmeteredCap));
+
+        // Layer 2: UFC / Premium Slice
+        final NetworkCapabilities sliceCap = new NetworkCapabilities.Builder()
+                .addTransportType(TRANSPORT_CELLULAR)
+                .addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS)
+                .build();
+        requests.add(createNetworkRequest(NetworkRequest.Type.REQUEST, sliceCap));
+
+        return requests;
+    }
+
+    private NetworkRequest getSatelliteRoleSmsRequest() {
         final NetworkCapabilities messagingCap = new NetworkCapabilities.Builder()
                 .addCapability(NET_CAPABILITY_INTERNET)
                 .addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
@@ -15175,20 +15866,17 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 .removeCapability(NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED)
                 .addTransportType(NetworkCapabilities.TRANSPORT_SATELLITE)
                 .build();
-        final ArraySet<NetworkRequestInfo> requests = createNrisForFallbackDefault(
-                messagingRoleUids, messagingCap, PREFERENCE_ORDER_SATELLITE_FALLBACK);
+        return createNetworkRequest(NetworkRequest.Type.REQUEST, messagingCap);
+    }
 
-        // The apps that have opt-in should use any Internet-providing satellite network
-        // as a fallback, but not if it is restricted.
+    private NetworkRequest getSatelliteOptInRequest() {
         final NetworkCapabilities optinCap = new NetworkCapabilities.Builder()
                 .addCapability(NET_CAPABILITY_INTERNET)
                 .addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
                 .removeCapability(NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED)
                 .addTransportType(NetworkCapabilities.TRANSPORT_SATELLITE)
                 .build();
-        requests.addAll(createNrisForFallbackDefault(
-                optinUids, optinCap, PREFERENCE_ORDER_SATELLITE_FALLBACK));
-        return requests;
+        return createNetworkRequest(NetworkRequest.Type.REQUEST, optinCap);
     }
 
     private Set<Integer> getMobileDataPreferredUids() {
@@ -15201,7 +15889,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
     }
 
     private void handleMobileDataPreferredUidsChanged() {
+        final Set<Integer> oldMobileDataPreferredUids = mMobileDataPreferredUids;
         mMobileDataPreferredUids = getMobileDataPreferredUids();
+        if (mMobileDataPreferredUids.equals(oldMobileDataPreferredUids)) return;
         removeDefaultNetworkRequestsForPreference(PREFERENCE_ORDER_MOBILE_DATA_PREFERERRED);
         addPerAppDefaultNetworkRequests(
                 createNrisFromMobileDataPreferredUids(mMobileDataPreferredUids));
@@ -15209,14 +15899,17 @@ public class ConnectivityService extends IConnectivityManager.Stub
         rematchAllNetworksAndRequests();
     }
 
-    private void handleSetSatelliteNetworkPreference(
-            @NonNull final Set<Integer> messagingRoleUids,
-            @NonNull final Set<Integer> optinUids
-    ) {
-        removeDefaultNetworkRequestsForPreference(PREFERENCE_ORDER_SATELLITE_FALLBACK);
-        addPerAppDefaultNetworkRequests(
-                createMultiLayerNrisFromSatelliteNetworkFallbackUids(messagingRoleUids, optinUids)
-        );
+    /**
+     * The callback method that receives the list of arbitrated network policies
+     * from the AppOptInDefaultNetworkController.
+     */
+    private void handleUpdateAppOptInDefaultNetworkPolicies(
+            @NonNull List<AppOptInDefaultNetworkPolicy> policies) {
+        ensureRunningOnConnectivityServiceThread();
+        if (DBG) Log.i(TAG, "handleUpdateAppOptInDefaultNetworkPolicies received: "
+                + policies);
+        removeDefaultNetworkRequestsForPreference(PREFERENCE_ORDER_APP_OPT_IN);
+        addPerAppDefaultNetworkRequests(createNrisFromAppOptInPolicies(policies));
         // Finally, rematch.
         rematchAllNetworksAndRequests();
     }
@@ -15264,6 +15957,13 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private void enforceAutomotiveDevice() {
         PermissionUtils.enforceSystemFeature(mContext, PackageManager.FEATURE_AUTOMOTIVE,
                 "setOemNetworkPreference() is only available on automotive devices.");
+    }
+
+    // Temporary workaround for automotive networks - limit to sdk37(C)
+    private boolean shouldSkipLnpOnAutomotive(@NonNull final NetworkAgentInfo nai) {
+        return mIsAutomotiveDevice
+                && !nai.networkCapabilities.hasCapability(NET_CAPABILITY_NOT_RESTRICTED)
+                &&  Build.VERSION.SDK_INT == Build.VERSION_CODES.CINNAMON_BUN;
     }
 
     /**
@@ -15478,6 +16178,12 @@ public class ConnectivityService extends IConnectivityManager.Stub
         // same nri in the map's values for each of its NetworkRequest objects.
         final ArraySet<NetworkRequestInfo> nris = new ArraySet<>(mNetworkRequests.values());
         for (final NetworkRequestInfo nri : nris) {
+            // This method finds app requests that track the default network in order to update them
+            // and send callbacks for the correct default networks.
+            // The default network requests themselves should not be updated by this logic.
+            if (mDefaultNetworkRequests.contains(nri)) {
+                continue;
+            }
             // Include this nri if it is currently being tracked.
             if (isPerAppTrackedNri(nri)) {
                 defaultCallbackRequests.add(nri);
@@ -15990,6 +16696,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (mQueueNetworkAgentEventsInSystemServer) {
             features |= ConnectivityManager.FEATURE_QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER;
         }
+        if (mIsOttNetworkSlicingEnabled) {
+            features |= ConnectivityManager.FEATURE_OTT_NETWORK_SLICING;
+        }
         return features;
     }
 
@@ -16088,5 +16797,19 @@ public class ConnectivityService extends IConnectivityManager.Stub
                     || oldPermission == INetd.PERMISSION_NETWORK;
             default -> throw new IllegalArgumentException("Invalid permission");
         };
+    }
+
+    @Override
+    public void onOttCallStateChanged(int uid, boolean isAdded) {
+        Log.i(TAG, "received onOttCallStateChanged");
+
+        if (mDeps.getCallingUid() != Process.SYSTEM_UID) {
+            throw new SecurityException("onOttCallStateChanged is called from non system uid.");
+        }
+
+        mHandler.post(() -> {
+            // TODO (b/447631226):  Automatic Ott slicing Opt Out feature for Apps
+            mAppOptInDefaultNetworkController.onOttCallStateChanged(uid, isAdded);
+        });
     }
 }

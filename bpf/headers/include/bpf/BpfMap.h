@@ -24,10 +24,21 @@
 #include <android-base/unique_fd.h>
 
 #include "BpfSyscallWrappers.h"
-#include "bpf/BpfUtils.h"
+#include "bpf/KernelUtils.h"
 
 #include <cstdio>
 #include <functional>
+
+#ifdef BPF_MAP_MAKE_VISIBLE_FOR_TESTING
+#undef BPFMAP_VERBOSE
+#define BPFMAP_VERBOSE
+#undef BPFMAP_VERBOSE_ABORT
+#define BPFMAP_VERBOSE_ABORT
+#endif
+
+#ifdef BPFMAP_VERBOSE
+#include <log/log.h>
+#endif
 
 namespace android {
 namespace bpf {
@@ -36,13 +47,6 @@ using base::Result;
 using base::ResultError;
 using base::unique_fd;
 using std::function;
-
-#ifdef BPF_MAP_MAKE_VISIBLE_FOR_TESTING
-#undef BPFMAP_VERBOSE
-#define BPFMAP_VERBOSE
-#undef BPFMAP_VERBOSE_ABORT
-#define BPFMAP_VERBOSE_ABORT
-#endif
 
 [[noreturn]] __attribute__((__format__(__printf__, 2, 3))) static inline
 void Abort(int __unused error, const char* __unused fmt, ...) {
@@ -171,7 +175,8 @@ class BpfMapRO {
 
     // ~16KiB initial stack usage seems reasonable
     static constexpr int BATCHSIZE = 16384 / (sizeof(Key) + sizeof(Value));
-    static_assert(BATCHSIZE >= 64, "consider Key/Value size, whether incr mem limit, decr batch req");
+    static_assert(BATCHSIZE >= 15, "consider Key/Value size, whether incr mem limit, "
+                                    "decr batch req");
     static_assert(BATCHSIZE * sizeof(Key) + BATCHSIZE * sizeof(Value) <= 16384);
 
     Result<void> doBulkLookupAndMaybeDelete(bool del, const function<void(const Key &, const Value &)> &f) const {
@@ -184,7 +189,7 @@ class BpfMapRO {
         // is almost always enough for a bucket (which is what you'd expect, it's not a good
         // hashtable if there's lots of items in a single bucket)
         //
-        // Since we start with 64+ we shouldn't ever actually need to increase N...
+        // Since we start with 15+ we shouldn't ever actually need to increase N...
         // Also note that the 'true' condition is not really an infinite loop,
         // as we'll blow up the stack and crash instead of looping infinitely.
         // But that also shouldn't happen cause it would imply/require a ridiculously
@@ -318,6 +323,20 @@ class BpfMapRO {
         return key.error();
     }
 
+    Result<uint32_t> count() const {
+        uint32_t i = 0;
+        auto res = forAll([&i](const Key&) { i++; });
+        if (!res.ok()) return res.error();
+        return i;
+    }
+
+    // Note: this requires kernel 4.14+
+    Result<uint32_t> maxEntries() const {
+        int v = bpfGetFdMaxEntries(mMapFd);
+        if (v < 0) return ERROR_FROM_ERRNO("maxEntries");
+        return (uint32_t)v;
+    }
+
   protected:
     unique_fd mMapFd;
 };
@@ -331,8 +350,8 @@ class BpfMapRW : public BpfMapRO<Key, Value> {
   public:
     using BpfMapRO<Key, Value>::BpfMapRO;
 
-    explicit BpfMapRW<Key, Value>(const char* pathname) {
-        mMapFd.reset(mapRetrieveRW(pathname));
+    explicit BpfMapRW<Key, Value>(const char* pathname, bool exclusive = false) {
+        mMapFd.reset(exclusive ? mapRetrieveExclusiveRW(pathname) : mapRetrieveRW(pathname));
         abortOnMismatch(/* writable */ true);
     }
 
@@ -359,6 +378,26 @@ class BpfMapRW : public BpfMapRO<Key, Value> {
         return {};
     }
 #endif
+};
+
+template <class Value>
+class BpfArrayRW : public BpfMapRW<uint32_t, Value> {
+  public:
+    using BpfMapRW<uint32_t, Value>::getFirstKey;
+    using BpfMapRW<uint32_t, Value>::getNextKey;
+    using BpfMapRW<uint32_t, Value>::writeValue;
+
+    Result<void> wipe() {
+        const Value v = {};
+        auto k = getFirstKey();
+        while (k.ok()) {
+            auto res = writeValue(k.value(), v, BPF_EXIST);
+            if (!res.ok()) return res.error();
+            k = getNextKey(k.value());
+        }
+        if (k.error().code() == ENOENT) return {};  // end
+        return k.error();
+    }
 };
 
 template <class Key, class Value>

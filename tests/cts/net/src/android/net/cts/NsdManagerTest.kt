@@ -15,9 +15,13 @@
  */
 package android.net.cts
 
+import android.Manifest.permission.ACCESS_LOCAL_NETWORK
 import android.Manifest.permission.MANAGE_TEST_NETWORKS
+import android.Manifest.permission.NEARBY_WIFI_DEVICES
 import android.Manifest.permission.NETWORK_SETTINGS
+import android.Manifest.permission.READ_DEVICE_CONFIG
 import android.app.compat.CompatChanges
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.ConnectivityManager.NetworkCallback
 import android.net.DnsResolver
@@ -44,10 +48,15 @@ import android.net.nsd.NsdManager.PROTOCOL_DNS_SD
 import android.net.nsd.NsdServiceInfo
 import android.net.nsd.OffloadEngine
 import android.net.nsd.OffloadServiceInfo
+import android.net.nsd.OffloadSession
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.PatternMatcher
 import android.platform.test.annotations.AppModeFull
+import android.platform.test.annotations.RequiresFlagsDisabled
+import android.platform.test.annotations.RequiresFlagsEnabled
+import android.platform.test.flag.junit.DeviceFlagsValueProvider
 import android.provider.DeviceConfig.NAMESPACE_TETHERING
 import android.system.OsConstants.ETH_P_IPV6
 import android.system.OsConstants.IPPROTO_IPV6
@@ -56,9 +65,13 @@ import android.system.OsConstants.RT_SCOPE_LINK
 import android.util.Log
 import androidx.test.filters.SmallTest
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.UiDevice
+import androidx.test.uiautomator.Until
 import com.android.compatibility.common.util.PollingCheck
 import com.android.compatibility.common.util.PropertyUtil
 import com.android.compatibility.common.util.SystemUtil
+import com.android.compatibility.common.util.UiAutomatorUtils2
 import com.android.modules.utils.build.SdkLevel.isAtLeastU
 import com.android.net.module.util.DnsPacket
 import com.android.net.module.util.DnsPacket.ANSECTION
@@ -77,6 +90,7 @@ import com.android.testutils.NsdDiscoveryRecord.DiscoveryEvent.DiscoveryStarted
 import com.android.testutils.NsdDiscoveryRecord.DiscoveryEvent.DiscoveryStopped
 import com.android.testutils.NsdDiscoveryRecord.DiscoveryEvent.ServiceFound
 import com.android.testutils.NsdDiscoveryRecord.DiscoveryEvent.ServiceLost
+import com.android.testutils.NsdDiscoveryRecord.DiscoveryEvent.StartDiscoveryFailed
 import com.android.testutils.NsdEvent
 import com.android.testutils.NsdRecord
 import com.android.testutils.NsdRegistrationRecord
@@ -85,19 +99,25 @@ import com.android.testutils.NsdRegistrationRecord.RegistrationEvent.ServiceRegi
 import com.android.testutils.NsdRegistrationRecord.RegistrationEvent.ServiceUnregistered
 import com.android.testutils.NsdResolveRecord
 import com.android.testutils.NsdResolveRecord.ResolveEvent.ResolutionStopped
+import com.android.testutils.NsdResolveRecord.ResolveEvent.ResolveFailed
 import com.android.testutils.NsdResolveRecord.ResolveEvent.ServiceResolved
 import com.android.testutils.NsdResolveRecord.ResolveEvent.StopResolutionFailed
 import com.android.testutils.NsdServiceInfoCallbackRecord
+import com.android.testutils.NsdServiceInfoCallbackRecord.ServiceInfoCallbackEvent.RegisterCallbackFailed
+import com.android.testutils.NsdServiceInfoCallbackRecord.ServiceInfoCallbackEvent.RegisterCallbackSucceeded
 import com.android.testutils.NsdServiceInfoCallbackRecord.ServiceInfoCallbackEvent.ServiceUpdated
 import com.android.testutils.NsdServiceInfoCallbackRecord.ServiceInfoCallbackEvent.ServiceUpdatedLost
 import com.android.testutils.NsdServiceInfoCallbackRecord.ServiceInfoCallbackEvent.UnregisterCallbackSucceeded
 import com.android.testutils.PollPacketReader
-import com.android.testutils.TestableNetworkCallback.Event.CapabilitiesChanged
-import com.android.testutils.TestableNetworkCallback.Event.LinkPropertiesChanged
 import com.android.testutils.TestDnsPacket
 import com.android.testutils.TestableNetworkAgent
 import com.android.testutils.TestableNetworkCallback
+import com.android.testutils.TestableNetworkCallback.Event.CapabilitiesChanged
+import com.android.testutils.TestableNetworkCallback.Event.LinkPropertiesChanged
 import com.android.testutils.assertEmpty
+import com.android.testutils.assertThrows
+import com.android.testutils.backtraceMdnsPackets
+import com.android.testutils.filters.CtsNetTestCasesLocalNetNoPermissions
 import com.android.testutils.filters.CtsNetTestCasesMaxTargetSdk30
 import com.android.testutils.filters.CtsNetTestCasesMaxTargetSdk33
 import com.android.testutils.pollForAdvertisement
@@ -108,6 +128,9 @@ import com.android.testutils.pollForReply
 import com.android.testutils.runAsShell
 import com.android.testutils.tryTest
 import com.android.testutils.waitForIdle
+import com.android.tethering.flags.Flags.FLAG_NSD_SERVICE_PICKER
+import com.android.tethering.mainline.beta.Flags
+import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.io.IOException
 import java.net.Inet6Address
@@ -117,7 +140,10 @@ import java.net.ServerSocket
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.Random
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
+import java.util.regex.Pattern
 import kotlin.math.min
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -130,6 +156,7 @@ import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
 import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
@@ -138,6 +165,9 @@ import org.junit.runner.RunWith
 
 private const val TAG = "NsdManagerTest"
 private const val TIMEOUT_MS = 2000L
+
+// Use a longer timeout for UI operations, which may take a while due to UI transitions for example
+private const val UI_TIMEOUT_MS = 30_000L
 
 // Registration may take a long time if there are devices with the same hostname on the network,
 // as the device needs to try another name and probe again. This is especially true since when using
@@ -150,6 +180,14 @@ private const val MDNS_PORT = 5353.toShort()
 private const val TYPE_KEY = 25
 private const val QCLASS_INTERNET = 0x0001
 private const val NAME_RECORDS_TTL_MILLIS: Long = 120
+private const val FLAG_NSD_MDNS_SCAN_OFFLOAD =
+    "com.android.tethering.flags.nsd_mdns_scan_offload"
+private const val NOT_MDNS_CAPABLE_INTERFACE = "lo"
+private const val NO_SUBTYPE = ""
+private const val FLAG_ACCESS_LOCAL_NETWORK_PERMISSION_ENABLED =
+    "android.net.connectivity.android.permission.flags.access_local_network_permission_enabled"
+private const val FLAG_NSD_SERVICE_PICKER =
+    "android.net.connectivity.com.android.tethering.flags.nsd_service_picker"
 private val multicastIpv6Addr = parseNumericAddress("ff02::fb") as Inet6Address
 private val testSrcAddr = parseNumericAddress("2001:db8::123") as Inet6Address
 
@@ -165,6 +203,9 @@ class NsdManagerTest {
 
     @get:Rule
     val deviceConfigRule = DeviceConfigRule()
+
+    @get:Rule
+    val checkFlagsRule = DeviceFlagsValueProvider.createCheckFlagsRule()!!
 
     private val context by lazy { InstrumentationRegistry.getInstrumentation().context }
     private val nsdManager by lazy {
@@ -191,6 +232,7 @@ class NsdManagerTest {
 
     private lateinit var testNetwork1: TestTapNetwork
     private lateinit var testNetwork2: TestTapNetwork
+    private lateinit var mdnsNotSupportedNetwork: TestNetwork
 
     private class TestTapNetwork(
         val iface: TestNetworkInterface,
@@ -206,11 +248,23 @@ class NsdManagerTest {
         }
     }
 
+    private class TestNetwork(
+        val requestCb: NetworkCallback,
+        val agent: TestableNetworkAgent,
+    ) {
+        fun close(cm: ConnectivityManager) {
+            cm.unregisterNetworkCallback(requestCb)
+            agent.unregister()
+            agent.waitForIdle(TIMEOUT_MS)
+        }
+    }
+
     private class TestNsdOffloadEngine : OffloadEngine,
         NsdRecord<TestNsdOffloadEngine.OffloadEvent>() {
         sealed class OffloadEvent : NsdEvent {
             data class AddOrUpdateEvent(val info: OffloadServiceInfo) : OffloadEvent()
             data class RemoveEvent(val info: OffloadServiceInfo) : OffloadEvent()
+            data class SessionCreateEvent(val offloadSession: OffloadSession) : OffloadEvent()
         }
 
         override fun onOffloadServiceUpdated(info: OffloadServiceInfo) {
@@ -219,6 +273,10 @@ class NsdManagerTest {
 
         override fun onOffloadServiceRemoved(info: OffloadServiceInfo) {
             add(OffloadEvent.RemoveEvent(info))
+        }
+
+        override fun onOffloadSessionCreated(offloadSession: OffloadSession) {
+            add(OffloadEvent.SessionCreateEvent(offloadSession))
         }
     }
 
@@ -229,21 +287,52 @@ class NsdManagerTest {
         runAsShell(MANAGE_TEST_NETWORKS) {
             testNetwork1 = createTestNetwork()
             testNetwork2 = createTestNetwork()
+            mdnsNotSupportedNetwork = createTestNetwork(NOT_MDNS_CAPABLE_INTERFACE)
         }
+    }
+
+    private fun createTestNetwork(interfaceName: String): TestNetwork {
+        val (cb, agent) = setupNetworkAgent(
+            interfaceName,
+            linkLocalAddressTimeout = 0
+        )
+        return TestNetwork(cb, agent)
     }
 
     private fun createTestNetwork(): TestTapNetwork {
         val tnm = context.getSystemService(TestNetworkManager::class.java)!!
         val iface = tnm.createTapInterface()
+        val interfaceName = iface.interfaceName
+        val (cb, agent) = setupNetworkAgent(
+            interfaceName,
+            linkLocalAddressTimeout = TIMEOUT_MS
+        )
+        val network = agent.network!!
+        return TestTapNetwork(iface, cb, agent, network)
+    }
+
+    // Common helper function
+    private fun setupNetworkAgent(
+        interfaceName: String,
+        linkLocalAddressTimeout: Long
+    ): Pair<TestableNetworkCallback, TestableNetworkAgent> {
         val cb = TestableNetworkCallback()
         cm.requestNetwork(
-            TestableNetworkAgent.makeNetworkRequestForInterface(iface.interfaceName),
+            TestableNetworkAgent.makeNetworkRequestForInterface(interfaceName),
             cb
         )
-        val agent = TestableNetworkAgent.createOnInterface(context, handlerThread.looper,
-            iface.interfaceName, TIMEOUT_MS)
-        val network = agent.network ?: fail("Registered agent should have a network")
 
+        val agent = TestableNetworkAgent.createOnInterface(
+            context,
+            handlerThread.looper,
+            interfaceName,
+            linkLocalAddressTimeout
+        )
+
+        // Ensure the network is created
+        agent.network ?: fail("Registered agent should have a network for interface $interfaceName")
+
+        // Wait for LinkProperties to be populated
         cb.eventuallyExpect<LinkPropertiesChanged>(TIMEOUT_MS) {
             it.lp.linkAddresses.isNotEmpty()
         }
@@ -253,7 +342,8 @@ class NsdManagerTest {
         cb.eventuallyExpect<CapabilitiesChanged>(TIMEOUT_MS, from = 0) {
             it.caps.hasCapability(NET_CAPABILITY_VALIDATED)
         }
-        return TestTapNetwork(iface, cb, agent, network)
+
+        return Pair(cb, agent)
     }
 
     private fun makeTestServiceInfo(network: Network? = null) = NsdServiceInfo().also {
@@ -278,6 +368,7 @@ class NsdManagerTest {
             // Avoid throwing here if initializing failed in setUp
             if (this::testNetwork1.isInitialized) testNetwork1.close(cm)
             if (this::testNetwork2.isInitialized) testNetwork2.close(cm)
+            if (this::mdnsNotSupportedNetwork.isInitialized) mdnsNotSupportedNetwork.close(cm)
         }
         handlerThread.waitForIdle(TIMEOUT_MS)
         handlerThread.quitSafely()
@@ -552,6 +643,191 @@ class NsdManagerTest {
         }
     }
 
+    @Test
+    @CtsNetTestCasesLocalNetNoPermissions
+    @RequiresFlagsDisabled(FLAG_NSD_SERVICE_PICKER)
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.BAKLAVA)
+    fun testDiscoverServices_missingLocalNetPermission_failsPermissionDenied() {
+        assumeTrue(android.permission.flags.Flags.accessLocalNetworkPermissionEnabled())
+        val perm = context.checkSelfPermission(ACCESS_LOCAL_NETWORK)
+        assertEquals(PackageManager.PERMISSION_DENIED, perm)
+
+        val discoveryRecord = NsdDiscoveryRecord()
+        nsdManager.discoverServices(
+            serviceType,
+            NsdManager.PROTOCOL_DNS_SD,
+            testNetwork1.network,
+            Executor { it.run() },
+            discoveryRecord
+        )
+        val failedCb = discoveryRecord.expectCallback<StartDiscoveryFailed>()
+        assertEquals(NsdManager.FAILURE_PERMISSION_DENIED, failedCb.errorCode)
+    }
+
+    @Test
+    @CtsNetTestCasesLocalNetNoPermissions
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.BAKLAVA)
+    @RequiresFlagsEnabled(Flags.FLAG_LNP_DEVELOPER_OPT_IN)
+    fun testLocalNetworkDevOptIn_permissionCheckFails_returnsInternalError() {
+        assumeFalse(android.permission.flags.Flags.accessLocalNetworkPermissionEnabled())
+        val perm = context.checkSelfPermission(NEARBY_WIFI_DEVICES)
+        assertEquals(PackageManager.PERMISSION_DENIED, perm)
+
+        val discoveryRecord = NsdDiscoveryRecord()
+        nsdManager.discoverServices(
+            serviceType,
+            NsdManager.PROTOCOL_DNS_SD,
+            testNetwork1.network,
+            Executor { it.run() },
+            discoveryRecord
+        )
+        val failedCb = discoveryRecord.expectCallback<StartDiscoveryFailed>()
+        assertEquals(NsdManager.FAILURE_INTERNAL_ERROR, failedCb.errorCode)
+    }
+
+    @Test
+    fun testCheckPermissionForService_deniedByDefault() {
+        assumeTrue(runAsShell(READ_DEVICE_CONFIG) {
+            com.android.tethering.flags.Flags.nsdServicePicker()
+        })
+        val permissionDeniedFuture = CompletableFuture<Int>()
+        nsdManager.checkPermissionForService(serviceName, serviceType, Runnable::run) {
+            permissionDeniedFuture.complete(it)
+        }
+        assertEquals(
+            NsdManager.SERVICE_PERMISSION_DENIED,
+            permissionDeniedFuture.get(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        )
+    }
+
+    @Test
+    @CtsNetTestCasesLocalNetNoPermissions
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    @RequiresFlagsEnabled(
+        FLAG_ACCESS_LOCAL_NETWORK_PERMISSION_ENABLED,
+        FLAG_NSD_SERVICE_PICKER
+    )
+    fun testDiscoverServices_missingLocalNetPermission_showsPicker() {
+        val perm = context.checkSelfPermission(ACCESS_LOCAL_NETWORK)
+        assertEquals(PackageManager.PERMISSION_DENIED, perm)
+
+        val uiDevice = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        uiDevice.wakeUp()
+        uiDevice.executeShellCommand("wm dismiss-keyguard")
+        val packetReader = makePacketReader()
+        val discoveryRecord = NsdDiscoveryRecord()
+        tryTest {
+            nsdManager.discoverServices(
+                serviceType,
+                PROTOCOL_DNS_SD,
+                testNetwork1.network,
+                Executor { it.run() },
+                discoveryRecord
+            )
+            discoveryRecord.expectCallback<DiscoveryStarted>()
+            assertNotNull(packetReader.pollForQuery("$serviceType.local", DnsResolver.TYPE_PTR))
+
+            /* Inject two services without registerService as the test does not have permissions
+               Generated with:
+               scapy.raw(scapy.DNS(rd=0, qr=1, aa=1, qd = None, an =
+                   scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                   rdata='NsdTest123456789._nmt123456789._tcp.local'))).hex()
+             */
+            val ptrResponseTemplate = hexStringToByteArray("0000840000000001000000000d5f6e6d74313" +
+                    "233343536373839045f746370056c6f63616c00000c000100000078002b104e7364546573743" +
+                    "132333435363738390d5f6e6d74313233343536373839045f746370056c6f63616c00")
+            val payload1 = ptrResponseTemplate.clone().apply {
+                replaceServiceNameAndTypeWithTestSuffix(this, serviceName)
+            }
+            val payload2 = ptrResponseTemplate.clone().apply {
+                replaceServiceNameAndTypeWithTestSuffix(this, serviceName2)
+            }
+            packetReader.sendResponse(buildMdnsPacket(payload1))
+            packetReader.sendResponse(buildMdnsPacket(payload2))
+
+            // Wait for the picker to appear and click on the second service
+            UiAutomatorUtils2.waitFindObject(
+                By.text(serviceName2), UI_TIMEOUT_MS
+            ).click()
+
+            // Expect the next callback to be the 2nd service being found, even though the response
+            // for the 1st service was sent first
+            val foundInfo = discoveryRecord.expectCallback<ServiceFound>(UI_TIMEOUT_MS)
+            assertEquals(serviceName2, foundInfo.serviceInfo.serviceName)
+
+            // The service should now be allowlisted
+            val permissionGrantedFuture = CompletableFuture<Int>()
+            nsdManager.checkPermissionForService(serviceName2, serviceType, Runnable::run) {
+                permissionGrantedFuture.complete(it)
+            }
+            assertEquals(NsdManager.SERVICE_PERMISSION_GRANTED,
+                permissionGrantedFuture.get(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        } cleanup {
+            packetReader.handler.post { packetReader.stop() }
+            handlerThread.waitForIdle(TIMEOUT_MS)
+            nsdManager.stopServiceDiscovery(discoveryRecord)
+            // No other callback (including for the 1st service) is received until DiscoveryStopped
+            discoveryRecord.expectCallback<DiscoveryStopped>()
+        }
+    }
+
+    @Test
+    fun testDiscoverServices_withServiceNameFilterAndPicker_showsFilteredServicesInPicker() {
+        assumeTrue(runAsShell(READ_DEVICE_CONFIG) {
+            com.android.tethering.flags.Flags.nsdServicePicker()
+        })
+        val uiDevice = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        uiDevice.wakeUp()
+        uiDevice.executeShellCommand("wm dismiss-keyguard")
+        val packetReader = makePacketReader()
+        val discoveryRecord = NsdDiscoveryRecord()
+        tryTest {
+            val request = DiscoveryRequest.Builder(serviceType)
+                .setNetwork(testNetwork1.network)
+                .setFlags(DiscoveryRequest.FLAG_SHOW_PICKER)
+                .setServiceNameFilter(PatternMatcher(serviceName2, PatternMatcher.PATTERN_LITERAL))
+                .build()
+            nsdManager.discoverServices(
+                request,
+                Executor { it.run() },
+                discoveryRecord
+            )
+            discoveryRecord.expectCallback<DiscoveryStarted>()
+            assertNotNull(packetReader.pollForQuery("$serviceType.local", DnsResolver.TYPE_PTR))
+
+            /* Generated with:
+               scapy.raw(scapy.DNS(rd=0, qr=1, aa=1, qd = None, an =
+                   scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                   rdata='NsdTest123456789._nmt123456789._tcp.local'))).hex()
+             */
+            val ptrResponseTemplate = hexStringToByteArray("0000840000000001000000000d5f6e6d74313" +
+                    "233343536373839045f746370056c6f63616c00000c000100000078002b104e7364546573743" +
+                    "132333435363738390d5f6e6d74313233343536373839045f746370056c6f63616c00")
+            val payload1 = ptrResponseTemplate.clone().apply {
+                replaceServiceNameAndTypeWithTestSuffix(this, serviceName)
+            }
+            val payload2 = ptrResponseTemplate.clone().apply {
+                replaceServiceNameAndTypeWithTestSuffix(this, serviceName2)
+            }
+            packetReader.sendResponse(buildMdnsPacket(payload1))
+            packetReader.sendResponse(buildMdnsPacket(payload2))
+
+            // serviceName should be filtered out by serviceNameFilter, so it should not appear.
+            // Only serviceName2 should appear, although its payload was received later.
+            UiAutomatorUtils2.waitFindObject(
+                By.text(serviceName2), UI_TIMEOUT_MS
+            )
+
+            val service1Text = uiDevice.findObject(By.text(serviceName))
+            assertNull(service1Text, "Picker showed filtered service $serviceName")
+        } cleanup {
+            packetReader.handler.post { packetReader.stop() }
+            handlerThread.waitForIdle(TIMEOUT_MS)
+            nsdManager.stopServiceDiscovery(discoveryRecord)
+            discoveryRecord.expectCallback<DiscoveryStopped>()
+        }
+    }
+
     private fun checkAddressScopeId(iface: TestNetworkInterface, address: List<InetAddress>) {
         val targetSdkVersion = context.packageManager
             .getTargetSdkVersion(context.applicationInfo.packageName)
@@ -571,10 +847,10 @@ class NsdManagerTest {
         val si = makeTestServiceInfo()
         val registrationRecord = NsdRegistrationRecord()
         val registeredInfo = registerService(registrationRecord, si)
+        val discoveryRecord = NsdDiscoveryRecord()
         tryTest {
             val resolveRecord = NsdResolveRecord()
 
-            val discoveryRecord = NsdDiscoveryRecord()
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, discoveryRecord)
 
             val foundInfo1 = discoveryRecord.waitForServiceDiscovered(
@@ -598,8 +874,9 @@ class NsdManagerTest {
             }
             // TODO: check that MDNS packets are sent only on testNetwork1.
         } cleanupStep {
-            nsdManager.unregisterService(registrationRecord)
+            nsdManager.stopServiceDiscovery(discoveryRecord)
         } cleanup {
+            nsdManager.unregisterService(registrationRecord)
             registrationRecord.expectCallback<ServiceUnregistered>()
         }
     }
@@ -638,8 +915,12 @@ class NsdManagerTest {
                     serviceName, serviceType, testNetwork1.network)
             assertEquals(testNetwork1.network, foundInfo3.network)
         } cleanupStep {
+            nsdManager.stopServiceDiscovery(discoveryRecord)
             nsdManager.stopServiceDiscovery(discoveryRecord2)
+            nsdManager.stopServiceDiscovery(discoveryRecord3)
+            discoveryRecord.expectCallback<DiscoveryStopped>()
             discoveryRecord2.expectCallback<DiscoveryStopped>()
+            discoveryRecord3.expectCallback<DiscoveryStopped>()
         } cleanup {
             nsdManager.unregisterService(registrationRecord)
         }
@@ -651,6 +932,7 @@ class NsdManagerTest {
         val si = NsdServiceInfo().apply {
             serviceType = this@NsdManagerTest.serviceType
             serviceName = serviceNames
+            network = testNetwork1.network
             port = 12345 // Test won't try to connect so port does not matter
         }
 
@@ -658,10 +940,10 @@ class NsdManagerTest {
         val registrationRecord = NsdRegistrationRecord()
         nsdManager.registerService(si, NsdManager.PROTOCOL_DNS_SD, registrationRecord)
         registrationRecord.expectCallback<ServiceRegistered>(REGISTRATION_TIMEOUT_MS)
+        val discoveryRecord = NsdDiscoveryRecord()
 
         tryTest {
             // Discover that service name.
-            val discoveryRecord = NsdDiscoveryRecord()
             nsdManager.discoverServices(
                 serviceType, NsdManager.PROTOCOL_DNS_SD, discoveryRecord
             )
@@ -674,8 +956,10 @@ class NsdManagerTest {
             val resolvedCb = resolveRecord.expectCallback<ServiceResolved>()
             assertEquals(foundInfo.serviceName, resolvedCb.serviceInfo.serviceName)
         } cleanupStep {
-            nsdManager.unregisterService(registrationRecord)
+            nsdManager.stopServiceDiscovery(discoveryRecord)
+            discoveryRecord.expectCallback<DiscoveryStopped>()
         } cleanup {
+            nsdManager.unregisterService(registrationRecord)
             registrationRecord.expectCallback<ServiceUnregistered>()
         }
     }
@@ -722,7 +1006,24 @@ class NsdManagerTest {
         }
     }
 
-    fun checkOffloadServiceInfo(serviceInfo: OffloadServiceInfo, si: NsdServiceInfo) {
+    @Test
+    @CtsNetTestCasesLocalNetNoPermissions
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.BAKLAVA)
+    fun testRegisterService_missingLocalNetworkPermission_throwsSecurityException() {
+        assumeTrue(android.permission.flags.Flags.accessLocalNetworkPermissionEnabled())
+        val perm = context.checkSelfPermission(ACCESS_LOCAL_NETWORK)
+        assertEquals(PackageManager.PERMISSION_DENIED, perm)
+
+        val si = makeTestServiceInfo()
+        val registrationRecord = NsdRegistrationRecord()
+        assertThrows(SecurityException::class.java, { registerService(registrationRecord, si) })
+    }
+
+    fun checkOffloadServiceInfo(
+        serviceInfo: OffloadServiceInfo,
+        si: NsdServiceInfo,
+        offloadType: Long
+    ) {
         val expectedServiceType = si.serviceType.split(",")[0]
         assertEquals(si.serviceName, serviceInfo.key.serviceName)
         assertEquals(expectedServiceType, serviceInfo.key.serviceType)
@@ -731,7 +1032,7 @@ class NsdManagerTest {
         assertTrue(serviceInfo.hostname.endsWith("local"))
         // Test service types should not be in the priority list
         assertEquals(Integer.MAX_VALUE, serviceInfo.priority)
-        assertEquals(OffloadEngine.OFFLOAD_TYPE_REPLY.toLong(), serviceInfo.offloadType)
+        assertEquals(offloadType, serviceInfo.offloadType)
         val offloadPayload = serviceInfo.offloadPayload
         assertNotNull(offloadPayload)
         val dnsPacket = TestDnsPacket(offloadPayload, dstAddr = multicastIpv6Addr)
@@ -768,6 +1069,199 @@ class NsdManagerTest {
     }
 
     @Test
+    fun testNsdManager_registerOffloadSession() {
+        assumeTrue(runAsShell(READ_DEVICE_CONFIG) {
+            com.android.tethering.flags.Flags.nsdMdnsScanOffload()
+        })
+        val discoveryRecord1 = NsdDiscoveryRecord()
+        val discoveryRecord2 = NsdDiscoveryRecord()
+        val discoveryRecord3 = NsdDiscoveryRecord()
+        val offloadEngine = TestNsdOffloadEngine()
+        val cbRecord = NsdServiceInfoCallbackRecord()
+        // Test discovering without an Executor
+
+        tryTest {
+            nsdManager.discoverServices(
+                "_subtype1.$serviceType",
+                NsdManager.PROTOCOL_DNS_SD,
+                discoveryRecord1
+            )
+            discoveryRecord1.expectCallback<DiscoveryStarted>()
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.registerOffloadEngine(
+                    NOT_MDNS_CAPABLE_INTERFACE,
+                    OffloadEngine.OFFLOAD_TYPE_QUERY.toLong(),
+                    0L,
+                    { it.run() }, offloadEngine)
+            }
+            val sessionCreateEvent = offloadEngine
+                .expectCallback<TestNsdOffloadEngine.OffloadEvent.SessionCreateEvent>()
+            val offloadSession = sessionCreateEvent.offloadSession
+            assertNotNull(offloadSession)
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName.isEmpty() &&
+                    it.info.subtypes == listOf("subtype1")
+                }
+
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName.isEmpty() &&
+                            it.info.subtypes == listOf("subtype1")
+                }
+
+            nsdManager.discoverServices(
+                "_subtype2.$serviceType",
+                NsdManager.PROTOCOL_DNS_SD,
+                discoveryRecord2
+            )
+
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName.isEmpty() &&
+                            it.info.subtypes.size == 2 &&
+                            it.info.subtypes == listOf("subtype1", "subtype2")
+                }
+
+            discoveryRecord2.expectCallback<DiscoveryStarted>()
+
+            nsdManager.discoverServices(
+                serviceType,
+                NsdManager.PROTOCOL_DNS_SD,
+                discoveryRecord3
+            )
+
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName.isEmpty() &&
+                            it.info.subtypes.size == 3 &&
+                            it.info.subtypes == listOf("subtype1", "subtype2", NO_SUBTYPE)
+                }
+
+            discoveryRecord3.expectCallback<DiscoveryStarted>()
+
+            val serviceTypeWithDotSuffix = serviceType + "."
+            val nsdServiceInfo = NsdServiceInfo("MyService", serviceTypeWithDotSuffix)
+                .also { it ->
+                    it.subtypes = setOf("_subtype1", "_subtype2")
+            }
+            runAsShell(NETWORK_SETTINGS) {
+                offloadSession.notifyServiceFound(nsdServiceInfo)
+            }
+            val foundInfo1 = discoveryRecord1.waitForServiceDiscovered("MyService", serviceType)
+            val foundInfo2 = discoveryRecord2.waitForServiceDiscovered("MyService", serviceType)
+            val foundInfo3 = discoveryRecord3.waitForServiceDiscovered("MyService", serviceType)
+            assertEquals(foundInfo1.serviceName, foundInfo2.serviceName)
+            assertEquals(foundInfo2.serviceName, foundInfo3.serviceName)
+            assertEquals(foundInfo1.serviceType, "$serviceType.")
+
+            nsdManager.registerServiceInfoCallback(foundInfo1, { it.run() }, cbRecord)
+            cbRecord.expectCallback<RegisterCallbackSucceeded>()
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    foundInfo1.serviceName == it.info.key.serviceName && it.info.subtypes.isEmpty()
+                }
+
+            val nsdServiceInfoWithHostname = NsdServiceInfo(
+                foundInfo1.serviceName,
+                serviceType
+            ).also { it ->
+                it.hostname = "My.TestHost"
+                it.port = 5353
+                it.subtypes = setOf("_subtype1", "_subtype2")
+                it.setAttribute("attr1", "attr1Value".toByteArray())
+                it.setAttribute("attr2", "attr2Value".toByteArray())
+                it.hostAddresses = listOf(
+                    parseNumericAddress("192.0.2.123"),
+                    parseNumericAddress("2001:db8::123")
+                )
+            }
+            runAsShell(NETWORK_SETTINGS) {
+                offloadSession.notifyServiceUpdated(nsdServiceInfoWithHostname)
+            }
+            val serviceInfoCb = cbRecord.expectCallback<ServiceUpdated>()
+            assertEquals(
+                nsdServiceInfoWithHostname.serviceName,
+                serviceInfoCb.serviceInfo.serviceName
+            )
+            assertEquals(nsdServiceInfoWithHostname.port, serviceInfoCb.serviceInfo.port)
+            assertEquals(nsdServiceInfoWithHostname.hostname, serviceInfoCb.serviceInfo.hostname)
+            assertContentEquals(
+                nsdServiceInfoWithHostname.hostAddresses,
+                serviceInfoCb.serviceInfo.hostAddresses
+            )
+            assertThat(nsdServiceInfoWithHostname.attributes.keys)
+                .isEqualTo(serviceInfoCb.serviceInfo.attributes.keys)
+            for (key in nsdServiceInfoWithHostname.attributes.keys) {
+                val expectedVal = nsdServiceInfoWithHostname.attributes[key]
+                val actualVal = serviceInfoCb.serviceInfo.attributes[key]
+                assertContentEquals(expectedVal, actualVal)
+            }
+            nsdServiceInfoWithHostname.serviceType = serviceTypeWithDotSuffix
+            runAsShell(NETWORK_SETTINGS) {
+                offloadSession.notifyServiceLost(nsdServiceInfoWithHostname)
+            }
+            cbRecord.expectCallback<ServiceUpdatedLost>()
+            val serviceLostEvent = discoveryRecord3.expectCallback<ServiceLost>()
+            assertEquals("$serviceType.", serviceLostEvent.serviceInfo.serviceType)
+            assertEquals(2, serviceLostEvent.serviceInfo.subtypes.size)
+            assertContentEquals(
+                listOf("_subtype1", "_subtype2"),
+                serviceLostEvent.serviceInfo.subtypes
+            )
+            discoveryRecord2.expectCallback<ServiceLost>()
+            discoveryRecord1.expectCallback<ServiceLost>()
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName == "MyService" &&
+                            it.info.hostname == "My.TestHost" &&
+                            it.info.subtypes.isEmpty()
+                }
+        } cleanupStep {
+            nsdManager.stopServiceDiscovery(discoveryRecord3)
+            discoveryRecord3.expectCallback<DiscoveryStopped>()
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName.isEmpty() &&
+                            it.info.subtypes.size == 2 &&
+                            it.info.subtypes == listOf("subtype1", "subtype2")
+                }
+        } cleanupStep {
+            nsdManager.stopServiceDiscovery(discoveryRecord2)
+            discoveryRecord2.expectCallback<DiscoveryStopped>()
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName.isEmpty() &&
+                            it.info.subtypes.size == 1 &&
+                            it.info.subtypes == listOf("subtype1")
+                }
+        } cleanupStep {
+            nsdManager.stopServiceDiscovery(discoveryRecord1)
+            discoveryRecord1.expectCallback<DiscoveryStopped>()
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.RemoveEvent> {
+                    it.info.key.serviceName.isEmpty() &&
+                            it.info.subtypes.size == 1 &&
+                            it.info.subtypes == listOf("subtype1")
+                }
+        } cleanupStep {
+            nsdManager.unregisterServiceInfoCallback(cbRecord)
+            cbRecord.expectCallback<UnregisterCallbackSucceeded>()
+            offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.RemoveEvent> {
+                    it.info.key.serviceName == "MyService" &&
+                            it.info.hostname == "My.TestHost" &&
+                            it.info.subtypes.isEmpty()
+                }
+            offloadEngine.assertNoCallback(timeoutMs = 0)
+        } cleanup {
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.unregisterOffloadEngine(offloadEngine)
+            }
+        }
+    }
+
+    @Test
     fun testNsdManager_registerOffloadEngine() {
         val targetSdkVersion = context.packageManager
             .getTargetSdkVersion(context.applicationInfo.packageName)
@@ -791,8 +1285,16 @@ class NsdManagerTest {
         si2.port = 12345
         val record2 = NsdRegistrationRecord()
         val offloadEngine = TestNsdOffloadEngine()
+        val offloadType = runAsShell(READ_DEVICE_CONFIG) {
+            (OffloadEngine.OFFLOAD_TYPE_REPLY
+                    or OffloadEngine.OFFLOAD_TYPE_FILTER_REPLIES).toLong()
+        }
 
         tryTest {
+            val offloadTypeInRegistration = OffloadEngine.OFFLOAD_TYPE_REPLY.toLong()
+            val offloadScanEnabled = runAsShell(READ_DEVICE_CONFIG) {
+                com.android.tethering.flags.Flags.nsdMdnsScanOffload()
+            }
             // Register service before the OffloadEngine is registered.
             nsdManager.registerService(si1, NsdManager.PROTOCOL_DNS_SD, record1)
             record1.expectCallback<ServiceRegistered>()
@@ -806,7 +1308,11 @@ class NsdManagerTest {
                 .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
                     it.info.key.serviceName == si1.serviceName
                 }
-            checkOffloadServiceInfo(addOrUpdateEvent1.info, si1)
+            checkOffloadServiceInfo(
+                addOrUpdateEvent1.info,
+                si1,
+                if (offloadScanEnabled) offloadTypeInRegistration else offloadType
+            )
 
             // Register service after OffloadEngine is registered.
             nsdManager.registerService(si2, NsdManager.PROTOCOL_DNS_SD, record2)
@@ -815,7 +1321,11 @@ class NsdManagerTest {
                 .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
                     it.info.key.serviceName == si2.serviceName
                 }
-            checkOffloadServiceInfo(addOrUpdateEvent2.info, si2)
+            checkOffloadServiceInfo(
+                addOrUpdateEvent2.info,
+                si2,
+                if (offloadScanEnabled) offloadTypeInRegistration else offloadType
+            )
 
             nsdManager.unregisterService(record2)
             record2.expectCallback<ServiceUnregistered>()
@@ -823,7 +1333,11 @@ class NsdManagerTest {
                 .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.RemoveEvent> {
                     it.info.key.serviceName == si2.serviceName
                 }
-            checkOffloadServiceInfo(unregisterEvent.info, si2)
+            checkOffloadServiceInfo(
+                unregisterEvent.info,
+                si2,
+                if (offloadScanEnabled) offloadTypeInRegistration else offloadType
+            )
         } cleanupStep {
             runAsShell(NETWORK_SETTINGS) {
                 nsdManager.unregisterOffloadEngine(offloadEngine)
@@ -831,6 +1345,318 @@ class NsdManagerTest {
         } cleanup {
             nsdManager.unregisterService(record1)
             record1.expectCallback<ServiceUnregistered>()
+        }
+    }
+
+    @Test
+    fun testNsdManager_registerServiceAfterOffloadEngine_verifyOffloadInfoUpdates() {
+        val si = NsdServiceInfo()
+        si.serviceType = "$serviceType,_subtype"
+        si.serviceName = serviceName
+        si.network = testNetwork1.network
+        si.port = 23456
+        val record = NsdRegistrationRecord()
+        val offloadEngine = TestNsdOffloadEngine()
+
+        tryTest {
+            // Register OffloadEngine before the service is registered.
+            val offloadType = OffloadEngine.OFFLOAD_TYPE_REPLY or
+                                OffloadEngine.OFFLOAD_TYPE_FILTER_REPLIES
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.registerOffloadEngine(
+                    testNetwork1.iface.interfaceName,
+                    offloadType.toLong(),
+                    OffloadEngine.OFFLOAD_CAPABILITY_BYPASS_MULTICAST_LOCK.toLong(),
+                    { it.run() },
+                    offloadEngine
+                )
+            }
+            // Register service
+            nsdManager.registerService(si, NsdManager.PROTOCOL_DNS_SD, record)
+            val addOrUpdateEvent1 = offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName == si.serviceName
+                }
+            checkOffloadServiceInfo(
+                addOrUpdateEvent1.info,
+                si,
+                offloadType.toLong() and addOrUpdateEvent1.info.offloadType
+            )
+            record.expectCallback<ServiceRegistered>()
+            val addOrUpdateEvent2 = offloadEngine
+                .expectCallbackEventually<TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                    it.info.key.serviceName == si.serviceName
+                }
+            checkOffloadServiceInfo(
+                addOrUpdateEvent2.info,
+                si,
+                offloadType.toLong() and addOrUpdateEvent2.info.offloadType
+            )
+        } cleanupStep {
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.unregisterOffloadEngine(offloadEngine)
+            }
+        } cleanup {
+            nsdManager.unregisterService(record)
+            record.expectCallback<ServiceUnregistered>()
+        }
+    }
+
+    private fun checkSelectiveMdnsResponseOffloadServiceInfo(
+        serviceName: String,
+        serviceType: String,
+        subtypes: List<String>,
+        hostName: String,
+        serviceInfo: OffloadServiceInfo,
+        offloadType: Long
+    ) {
+        val expected = OffloadServiceInfo(
+            OffloadServiceInfo.Key(serviceName, serviceType),
+            subtypes,
+            hostName,
+            null /* offloadPayload */,
+            0 /* priority */,
+            offloadType
+        )
+        assertEquals(expected, serviceInfo)
+    }
+
+    @Test
+    fun testNsdManager_registerOffloadEngine_discoveryAndResolution() {
+        val discoveryRecord = NsdDiscoveryRecord()
+        val resolveRecord = NsdResolveRecord()
+        val offloadEngine = TestNsdOffloadEngine()
+        val si = makeTestServiceInfo(testNetwork1.network)
+
+        tryTest {
+            // Start discovery before the OffloadEngine is registered.
+            val discoveryRequest = DiscoveryRequest.Builder(serviceType)
+                .setSubtype("_subtype")
+                .setNetwork(testNetwork1.network)
+                .build()
+            nsdManager.discoverServices(discoveryRequest, { it.run() }, discoveryRecord)
+            discoveryRecord.expectCallback<DiscoveryStarted>()
+
+            val offloadType = OffloadEngine.OFFLOAD_TYPE_FILTER_REPLIES
+            val mdnsScanOffloadEnabled = runAsShell(READ_DEVICE_CONFIG) {
+                com.android.tethering.flags.Flags.nsdMdnsScanOffload()
+            }
+            val expectedOffloadType = if (mdnsScanOffloadEnabled) {
+                offloadType
+            } else {
+                OffloadEngine.OFFLOAD_TYPE_FILTER_REPLIES or OffloadEngine.OFFLOAD_TYPE_QUERY
+            }
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.registerOffloadEngine(testNetwork1.iface.interfaceName,
+                    offloadType.toLong(),
+                    0L, /* offloadCapability */
+                    { it.run() }, offloadEngine)
+            }
+            val sessionCreateEvent =
+                offloadEngine.expectCallback<TestNsdOffloadEngine.OffloadEvent.SessionCreateEvent>()
+            assertThat(sessionCreateEvent).isNotNull()
+
+            // Check discovery info is offloaded.
+            // Use expectCallbackEventually because if another component on the
+            // device is discovering services on all networks, the offloadEngine
+            // would receive callbacks for unrelated discovery.
+            val discoveryInfoEvent =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                        it.info.key.serviceType == serviceType
+                }
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                "" /* serviceName */,
+                serviceType,
+                listOf("subtype") /* subTypes */,
+                "" /* hostName */,
+                discoveryInfoEvent.info,
+                expectedOffloadType.toLong()
+            )
+
+            // Start resolution after the OffloadEngine is registered.
+            nsdManager.resolveService(si, { it.run() }, resolveRecord)
+
+            // Check resolution info is offloaded.
+            val resolutionInfoEvent =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                        it.info.key.serviceType == serviceType
+                    }
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                si.serviceName /* serviceName */,
+                serviceType,
+                listOf() /* subTypes */,
+                "" /* hostName */,
+                resolutionInfoEvent.info,
+                expectedOffloadType.toLong()
+            )
+
+            // Stop resolution and check info is removed.
+            nsdManager.stopServiceResolution(resolveRecord)
+            resolveRecord.expectCallback<ResolutionStopped>()
+            val removeResolutionInfoEvent =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.RemoveEvent> {
+                        it.info.key.serviceType == serviceType
+                }
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                si.serviceName /* serviceName */,
+                serviceType,
+                listOf() /* subTypes */,
+                "" /* hostName */,
+                removeResolutionInfoEvent.info,
+                expectedOffloadType.toLong()
+            )
+
+            // Stop discovery and check info is removed.
+            nsdManager.stopServiceDiscovery(discoveryRecord)
+            discoveryRecord.expectCallback<DiscoveryStopped>()
+            val removeDiscoveryInfoEvent =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.RemoveEvent> {
+                        it.info.key.serviceType == serviceType
+                }
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                "" /* serviceName */,
+                serviceType,
+                listOf("subtype") /* subTypes */,
+                "" /* hostName */,
+                removeDiscoveryInfoEvent.info,
+                expectedOffloadType.toLong()
+            )
+        } cleanup {
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.unregisterOffloadEngine(offloadEngine)
+            }
+        }
+    }
+
+    @Test
+    fun testNsdManager_registerOffloadEngine_discoveryAndResolution_SocketDestroyed() {
+        val discoveryRecord = NsdDiscoveryRecord()
+        val resolveRecord = NsdResolveRecord()
+        val offloadEngine = TestNsdOffloadEngine()
+        val si = makeTestServiceInfo(testNetwork1.network)
+
+        tryTest {
+            // Register an OffloadEngine
+            val offloadType = OffloadEngine.OFFLOAD_TYPE_FILTER_REPLIES
+            val isMdnsScanOffloadEnabled = runAsShell(READ_DEVICE_CONFIG) {
+                com.android.tethering.flags.Flags.nsdMdnsScanOffload()
+            }
+            val expectedOffloadType = if (isMdnsScanOffloadEnabled) {
+                offloadType
+            } else {
+                OffloadEngine.OFFLOAD_TYPE_FILTER_REPLIES or OffloadEngine.OFFLOAD_TYPE_QUERY
+            }
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.registerOffloadEngine(testNetwork1.iface.interfaceName,
+                    offloadType.toLong(),
+                    0L, /* offloadCapability */
+                    { it.run() }, offloadEngine)
+            }
+            val sessionCreateEvent =
+                offloadEngine.expectCallback<TestNsdOffloadEngine.OffloadEvent.SessionCreateEvent>()
+            assertThat(sessionCreateEvent).isNotNull()
+
+            // Start a discovery
+            val discoveryRequest = DiscoveryRequest.Builder(serviceType)
+                .setSubtype("_subtype")
+                .setNetwork(testNetwork1.network)
+                .build()
+            nsdManager.discoverServices(discoveryRequest, { it.run() }, discoveryRecord)
+            discoveryRecord.expectCallback<DiscoveryStarted>()
+
+            // Check discovery info is offloaded.
+            // Use expectCallbackEventually because if another component on the
+            // device is discovering services on all networks, the offloadEngine
+            // would receive callbacks for unrelated discovery.
+            val discoveryInfoEvent =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                        it.info.key.serviceType == serviceType
+                }
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                "" /* serviceName */,
+                serviceType,
+                listOf("subtype") /* subTypes */,
+                "" /* hostName */,
+                discoveryInfoEvent.info,
+                expectedOffloadType.toLong()
+            )
+
+            // Start a resolution.
+            nsdManager.resolveService(si, { it.run() }, resolveRecord)
+
+            // Check resolution info is offloaded.
+            val resolutionInfoEvent =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.AddOrUpdateEvent> {
+                        it.info.key.serviceType == serviceType
+                }
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                si.serviceName /* serviceName */,
+                serviceType,
+                listOf() /* subTypes */,
+                "" /* hostName */,
+                resolutionInfoEvent.info,
+                expectedOffloadType.toLong()
+            )
+
+            // Disconnect testNetwork1
+            runAsShell(MANAGE_TEST_NETWORKS) {
+                testNetwork1.close(cm)
+            }
+
+            // Check that remove offload callbacks are received for both resolution and discovery.
+            // The order is not guaranteed.
+            val removeEvent1 =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.RemoveEvent> {
+                        it.info.key.serviceType == serviceType
+                }
+            val removeEvent2 =
+                offloadEngine.expectCallbackEventually<
+                    TestNsdOffloadEngine.OffloadEvent.RemoveEvent> {
+                        it.info.key.serviceType == serviceType
+                }
+
+            val (resolutionEvent, discoveryEvent) =
+                if (removeEvent1.info.key.serviceName == si.serviceName) {
+                    assertEquals("", removeEvent2.info.key.serviceName)
+                    Pair(removeEvent1, removeEvent2)
+                } else {
+                    assertEquals(si.serviceName, removeEvent2.info.key.serviceName)
+                    assertEquals("", removeEvent1.info.key.serviceName)
+                    Pair(removeEvent2, removeEvent1)
+                }
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                si.serviceName /* serviceName */,
+                serviceType,
+                listOf() /* subTypes */,
+                "" /* hostName */,
+                resolutionEvent.info,
+                expectedOffloadType.toLong()
+            )
+            checkSelectiveMdnsResponseOffloadServiceInfo(
+                "" /* serviceName */,
+                serviceType,
+                listOf("subtype") /* subTypes */,
+                "" /* hostName */,
+                discoveryEvent.info,
+                expectedOffloadType.toLong()
+            )
+        } cleanupStep {
+            runAsShell(NETWORK_SETTINGS) {
+                nsdManager.unregisterOffloadEngine(offloadEngine)
+            }
+        } cleanupStep {
+            nsdManager.stopServiceResolution(resolveRecord)
+            resolveRecord.expectCallback<ResolutionStopped>()
+        } cleanup {
+            nsdManager.stopServiceDiscovery(discoveryRecord)
+            discoveryRecord.expectCallback<DiscoveryStopped>()
         }
     }
 
@@ -938,6 +1764,21 @@ class NsdManagerTest {
     }
 
     @Test
+    @CtsNetTestCasesLocalNetNoPermissions
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.BAKLAVA)
+    fun testResolveService_missingLocalNetworkPermission_failsPermissionDenied() {
+        assumeTrue(android.permission.flags.Flags.accessLocalNetworkPermissionEnabled())
+        val perm = context.checkSelfPermission(ACCESS_LOCAL_NETWORK)
+        assertEquals(PackageManager.PERMISSION_DENIED, perm)
+
+        val si = makeTestServiceInfo()
+        val resolveRecord = NsdResolveRecord()
+        nsdManager.resolveService(si, { it.run() }, resolveRecord)
+        val failedCb = resolveRecord.expectCallback<ResolveFailed>()
+        assertEquals(NsdManager.FAILURE_PERMISSION_DENIED, failedCb.errorCode)
+    }
+
+    @Test
     fun testRegisterServiceInfoCallback() {
         val lp = cm.getLinkProperties(testNetwork1.network)
         assertNotNull(lp)
@@ -961,6 +1802,7 @@ class NsdManagerTest {
 
             // Register service callback and check the addresses are the same as network addresses
             nsdManager.registerServiceInfoCallback(foundInfo, { it.run() }, cbRecord)
+            cbRecord.expectCallback<RegisterCallbackSucceeded>()
             val serviceInfoCb = cbRecord.expectCallback<ServiceUpdated>()
             assertEquals(foundInfo.serviceName, serviceInfoCb.serviceInfo.serviceName)
             val hostAddresses = serviceInfoCb.serviceInfo.hostAddresses
@@ -982,6 +1824,21 @@ class NsdManagerTest {
             nsdManager.stopServiceDiscovery(discoveryRecord)
             discoveryRecord.expectCallback<DiscoveryStopped>()
         }
+    }
+
+    @Test
+    @CtsNetTestCasesLocalNetNoPermissions
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.BAKLAVA)
+    fun testRegisterServiceInfoCallback_missingLocalNetworkPermission_failsPermissionDenied() {
+        assumeTrue(android.permission.flags.Flags.accessLocalNetworkPermissionEnabled())
+        val perm = context.checkSelfPermission(ACCESS_LOCAL_NETWORK)
+        assertEquals(PackageManager.PERMISSION_DENIED, perm)
+
+        val si = makeTestServiceInfo()
+        val cbRecord = NsdServiceInfoCallbackRecord()
+        nsdManager.registerServiceInfoCallback(si, { it.run() }, cbRecord)
+        val failedCb = cbRecord.expectCallback<RegisterCallbackFailed>()
+        assertEquals(NsdManager.FAILURE_PERMISSION_DENIED, failedCb.errorCode)
     }
 
     @Test
@@ -1250,12 +2107,12 @@ class NsdManagerTest {
 
         // Register service on testNetwork1
         val registrationRecord = NsdRegistrationRecord()
-        nsdManager.registerService(
-            si,
-            NsdManager.PROTOCOL_DNS_SD,
-            { it.run() },
+            nsdManager.registerService(
+                si,
+                NsdManager.PROTOCOL_DNS_SD,
+                { it.run() },
                 registrationRecord
-        )
+            )
 
         tryTest {
             assertNotNull(packetReader.pollForProbe(serviceName, serviceType),
@@ -1290,20 +2147,23 @@ class NsdManagerTest {
 
         // Register service on testNetwork1
         val registrationRecord = NsdRegistrationRecord()
-        nsdManager.registerService(
-            si,
-            NsdManager.PROTOCOL_DNS_SD,
-            { it.run() },
-                registrationRecord
-        )
 
         tryTest {
-            assertNotNull(packetReader.pollForProbe(serviceName, serviceType),
-                    "Did not find a probe for the service")
-            packetReader.sendResponse(buildConflictingAnnouncementForCustomHost())
+            val cb = runAsShell(NETWORK_SETTINGS) {
+                nsdManager.registerService(
+                    si,
+                    NsdManager.PROTOCOL_DNS_SD,
+                    { it.run() },
+                    registrationRecord
+                )
 
-            // Registration must use an updated hostname to avoid the conflict
-            val cb = registrationRecord.expectCallback<ServiceRegistered>(REGISTRATION_TIMEOUT_MS)
+                assertNotNull(packetReader.pollForProbe(serviceName, serviceType),
+                    "Did not find a probe for the service")
+                packetReader.sendResponse(buildConflictingAnnouncementForCustomHost())
+
+                // Registration must use an updated hostname to avoid the conflict
+                registrationRecord.expectCallback<ServiceRegistered>(REGISTRATION_TIMEOUT_MS)
+            }
             // Service name is not renamed because there's no conflict on the service name.
             assertEquals(serviceName, cb.serviceInfo.serviceName)
             val hostname = cb.serviceInfo.hostname ?: fail("Missing hostname")
@@ -1330,21 +2190,26 @@ class NsdManagerTest {
 
         // Register service on testNetwork1
         val registrationRecord = NsdRegistrationRecord()
-        nsdManager.registerService(
-            si,
-            NsdManager.PROTOCOL_DNS_SD,
-            { it.run() },
-                registrationRecord
-        )
 
         tryTest {
-            assertNotNull(packetReader.pollForProbe(serviceName, serviceType),
-                    "Did not find a probe for the service")
-            // Not a conflict because no record is registered for the hostname
-            packetReader.sendResponse(buildConflictingAnnouncementForCustomHost())
+            val cb = runAsShell(NETWORK_SETTINGS) {
+                nsdManager.registerService(
+                    si,
+                    NsdManager.PROTOCOL_DNS_SD,
+                    { it.run() },
+                    registrationRecord
+                )
 
-            // Registration is not renamed because there's no conflict
-            val cb = registrationRecord.expectCallback<ServiceRegistered>(REGISTRATION_TIMEOUT_MS)
+                assertNotNull(
+                    packetReader.pollForProbe(serviceName, serviceType),
+                    "Did not find a probe for the service"
+                )
+                // Not a conflict because no record is registered for the hostname
+                packetReader.sendResponse(buildConflictingAnnouncementForCustomHost())
+
+                // Registration is not renamed because there's no conflict
+                registrationRecord.expectCallback<ServiceRegistered>(REGISTRATION_TIMEOUT_MS)
+            }
             assertEquals(serviceName, cb.serviceInfo.serviceName)
             assertEquals(customHostname, cb.serviceInfo.hostname)
         } cleanupStep {
@@ -1440,42 +2305,52 @@ class NsdManagerTest {
         // Register service on testNetwork1
         val registrationRecord = NsdRegistrationRecord()
         val discoveryRecord = NsdDiscoveryRecord()
-        val registeredService = registerService(registrationRecord, si)
         val packetReader = makePacketReader()
 
         tryTest {
-            assertNotNull(packetReader.pollForAdvertisement(serviceName, serviceType),
-                "No announcements sent after initial probing")
+            val registeredService = runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord, si)
+            }
+
+            assertNotNull(
+                packetReader.pollForAdvertisement(serviceName, serviceType),
+                "No announcements sent after initial probing"
+            )
 
             assertEquals(si.serviceName, registeredService.serviceName)
             assertEquals(si.hostname, registeredService.hostname)
 
-            nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD,
-                    testNetwork1.network, { it.run() }, discoveryRecord)
+            nsdManager.discoverServices(
+                serviceType, NsdManager.PROTOCOL_DNS_SD,
+                testNetwork1.network, { it.run() }, discoveryRecord
+            )
             val discoveredInfo = discoveryRecord.waitForServiceDiscovered(
-                    si.serviceName, serviceType)
+                si.serviceName, serviceType
+            )
 
             // Send a conflicting announcement
             val conflictingAnnouncement = buildConflictingAnnouncementForCustomHost()
             packetReader.sendResponse(conflictingAnnouncement)
 
             // Expect to see probes (RFC6762 9., service is reset to probing state)
-            assertNotNull(packetReader.pollForProbe(serviceName, serviceType),
-                    "Probe not received within timeout after conflict")
+            assertNotNull(
+                packetReader.pollForProbe(serviceName, serviceType),
+                "Probe not received within timeout after conflict"
+            )
 
             // Send the conflicting packet again to reply to the probe
             packetReader.sendResponse(conflictingAnnouncement)
 
             val newRegistration =
-                    registrationRecord
-                            .expectCallbackEventually<ServiceRegistered>(REGISTRATION_TIMEOUT_MS) {
-                                it.serviceInfo.serviceName == serviceName &&
-                                        it.serviceInfo.hostname.let { hostname ->
-                                    hostname != null &&
-                                            hostname.startsWith(customHostname) &&
-                                            hostname != customHostname
-                                }
+                registrationRecord
+                .expectCallbackEventually<ServiceRegistered>(REGISTRATION_TIMEOUT_MS) {
+                    it.serviceInfo.serviceName == serviceName &&
+                            it.serviceInfo.hostname.let { hostname ->
+                                hostname != null &&
+                                        hostname.startsWith(customHostname) &&
+                                        hostname != customHostname
                             }
+                }
 
             val resolvedInfo = resolveService(discoveredInfo)
             assertEquals(newRegistration.serviceInfo.serviceName, resolvedInfo.serviceName)
@@ -1503,7 +2378,9 @@ class NsdManagerTest {
         // Register service on testNetwork1
         val registrationRecord = NsdRegistrationRecord()
         val discoveryRecord = NsdDiscoveryRecord()
-        val registeredService = registerService(registrationRecord, si)
+        val registeredService = runAsShell(NETWORK_SETTINGS) {
+            registerService(registrationRecord, si)
+        }
         val packetReader = makePacketReader()
 
         tryTest {
@@ -1995,7 +2872,9 @@ class NsdManagerTest {
         val discoveryRecord1 = NsdDiscoveryRecord()
         val discoveryRecord2 = NsdDiscoveryRecord()
         tryTest {
-            registerService(registrationRecord1, si1)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord1, si1)
+            }
 
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD,
                     testNetwork1.network, Executor { it.run() }, discoveryRecord1)
@@ -2008,7 +2887,9 @@ class NsdManagerTest {
             assertEquals(si1.hostname, resolvedInfo.hostname)
             assertAddressEquals(hostAddresses1, resolvedInfo.hostAddresses)
 
-            registerService(registrationRecord2, si2)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord2, si2)
+            }
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD,
                     testNetwork1.network, Executor { it.run() }, discoveryRecord2)
 
@@ -2061,8 +2942,10 @@ class NsdManagerTest {
 
         val discoveryRecord = NsdDiscoveryRecord()
         tryTest {
-            registerService(registrationRecord1, si1)
-            registerService(registrationRecord2, si2)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord1, si1)
+                registerService(registrationRecord2, si2)
+            }
 
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD,
                     testNetwork1.network, Executor { it.run() }, discoveryRecord)
@@ -2112,7 +2995,9 @@ class NsdManagerTest {
 
         val discoveryRecord = NsdDiscoveryRecord()
         tryTest {
-            registerService(registrationRecord1, si1)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord1, si1)
+            }
 
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD,
                     testNetwork1.network, Executor { it.run() }, discoveryRecord)
@@ -2126,7 +3011,9 @@ class NsdManagerTest {
             assertEquals(si1.hostname, resolvedInfo1.hostname)
             assertAddressEquals(hostAddresses, resolvedInfo1.hostAddresses)
 
-            registerService(registrationRecord2, si2)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord2, si2)
+            }
 
             val discoveredInfo2 = discoveryRecord.waitForServiceDiscovered(
                     serviceName2, serviceType, testNetwork1.network)
@@ -2217,13 +3104,17 @@ class NsdManagerTest {
         val discoveryRecord = NsdDiscoveryRecord()
 
         tryTest {
-            registerService(registrationRecord1, si1)
-            registerService(registrationRecord2, si2)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord1, si1)
+                registerService(registrationRecord2, si2)
+            }
 
             nsdManager.unregisterService(registrationRecord1)
             registrationRecord1.expectCallback<ServiceUnregistered>()
 
-            registerService(registrationRecord3, si3)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord3, si3)
+            }
 
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD,
                     testNetwork1.network, Executor { it.run() }, discoveryRecord)
@@ -2309,7 +3200,9 @@ class NsdManagerTest {
         val packetReader = makePacketReader()
         val registrationRecord = NsdRegistrationRecord()
         tryTest {
-            registerService(registrationRecord, si)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord, si)
+            }
 
             val announcement = packetReader.pollForReply("$customHostname.local", TYPE_KEY)
             assertNotNull(announcement)
@@ -2363,7 +3256,9 @@ class NsdManagerTest {
         val registrationRecord1 = NsdRegistrationRecord()
         val registrationRecord2 = NsdRegistrationRecord()
         tryTest {
-            registerService(registrationRecord1, si1)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord1, si1)
+            }
 
             var announcement =
                 packetReader.pollForReply("$serviceName.$serviceType.local", TYPE_KEY)
@@ -2383,7 +3278,9 @@ class NsdManagerTest {
             }
             assertEquals(3, addressRecords.size)
 
-            registerService(registrationRecord2, si2)
+            runAsShell(NETWORK_SETTINGS) {
+                registerService(registrationRecord2, si2)
+            }
 
             announcement = packetReader.pollForReply("$serviceName2.$serviceType2.local", TYPE_KEY)
             assertNotNull(announcement)
@@ -2611,6 +3508,130 @@ class NsdManagerTest {
         }
     }
 
+    @Test
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    fun testDiscoverServices_withDisplayNameAttributeAndPicker() {
+        val uiDevice = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        uiDevice.wakeUp()
+        uiDevice.executeShellCommand("wm dismiss-keyguard")
+        val packetReader = makePacketReader()
+        val discoveryRecord = NsdDiscoveryRecord()
+        tryTest {
+            val request = DiscoveryRequest.Builder(serviceType)
+                .setNetwork(testNetwork1.network)
+                .setFlags(DiscoveryRequest.FLAG_SHOW_PICKER)
+                .setDisplayNameAttribute("displayattr")
+                .build()
+            nsdManager.discoverServices(
+                request,
+                Executor { it.run() },
+                discoveryRecord
+            )
+            discoveryRecord.expectCallback<DiscoveryStarted>()
+            assertNotNull(packetReader.pollForQuery("$serviceType.local", DnsResolver.TYPE_PTR))
+
+            // Service 1 has the "displayattr" attribute
+            /*
+               Generated with:
+               scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None,
+                an = [scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                        rdata='NsdTest123456789._nmt123456789._tcp.local')],
+                ar = [scapy.DNSRRSRV(rrname='NsdTest123456789._nmt123456789._tcp.local',
+                        rclass=0x8001, port=31234, target='testhost.local', ttl=120),
+                    scapy.DNSRR(rrname='NsdTest123456789._nmt123456789._tcp.local', type='TXT',
+                        ttl=120, rdata='displayattr=Display Name 1'),
+                    scapy.DNSRR(rrname='testhost.local', type='AAAA', ttl=120,
+                                    rdata='2001:db8::1')]
+               ))).hex()
+             */
+            val payload1 = hexStringToByteArray("0000840000000001000000030d5f6e6d7431323334353637" +
+                    "3839045f746370056c6f63616c00000c0001000000780013104e736454657374313233343536" +
+                    "373839c00cc03000210001000000780011000000007a020874657374686f7374c01fc0300010" +
+                    "000100000078001b1a646973706c6179617474723d446973706c6179204e616d652031c05500" +
+                    "1c000100000078001020010db8000000000000000000000001")
+            replaceServiceNameAndTypeWithTestSuffix(payload1, serviceName)
+            packetReader.sendResponse(buildMdnsPacket(payload1))
+
+            // Service 2 does NOT have the "displayattr" attribute
+            /*
+               Generated with:
+               scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None,
+                an = [scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                        rdata='NsdTest123456789._nmt123456789._tcp.local')],
+                ar = [scapy.DNSRRSRV(rrname='NsdTest123456789._nmt123456789._tcp.local',
+                        rclass=0x8001, port=31235, target='testhost2.local', ttl=120),
+                    scapy.DNSRR(rrname='NsdTest123456789._nmt123456789._tcp.local', type='TXT',
+                        ttl=120, rdata='otherattr=somevalue'),
+                    scapy.DNSRR(rrname='testhost2.local', type='AAAA', ttl=120,
+                                    rdata='2001:db8::2')]
+               ))).hex()
+             */
+            val payload2 = hexStringToByteArray("0000840000000001000000030d5f6e6d7431323334353637" +
+                    "3839045f746370056c6f63616c00000c0001000000780013104e736454657374313233343536" +
+                    "373839c00cc03000210001000000780012000000007a030974657374686f737432c01fc03000" +
+                    "100001000000780014136f74686572617474723d736f6d6576616c7565c055001c0001000000" +
+                    "78001020010db8000000000000000000000002")
+            replaceServiceNameAndTypeWithTestSuffix(payload2, serviceName2)
+            packetReader.sendResponse(buildMdnsPacket(payload2))
+
+            val service1Text = UiAutomatorUtils2.waitFindObject(
+                By.text("Display Name 1"), UI_TIMEOUT_MS
+            )
+            assertNotNull(
+                service1Text,
+                "Picker did not show service 1 with display attribute value"
+            )
+
+            val service2Text = UiAutomatorUtils2.waitFindObject(
+                By.text(serviceName2), UI_TIMEOUT_MS
+            )
+            assertNotNull(service2Text, "Picker did not show service 2 with its service name")
+        } cleanup {
+            packetReader.handler.post { packetReader.stop() }
+            handlerThread.waitForIdle(TIMEOUT_MS)
+            nsdManager.stopServiceDiscovery(discoveryRecord)
+            discoveryRecord.expectCallback<DiscoveryStopped>()
+        }
+    }
+
+    @Test
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    fun testDiscoverServices_withPicker_cancel() {
+        val uiDevice = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        uiDevice.wakeUp()
+        uiDevice.executeShellCommand("wm dismiss-keyguard")
+        val discoveryRecord = NsdDiscoveryRecord()
+        tryTest {
+            val request = DiscoveryRequest.Builder(serviceType)
+                .setNetwork(testNetwork1.network)
+                .setFlags(DiscoveryRequest.FLAG_SHOW_PICKER)
+                .build()
+            nsdManager.discoverServices(
+                request,
+                Executor { it.run() },
+                discoveryRecord
+            )
+            discoveryRecord.expectCallback<DiscoveryStarted>()
+
+            // Find and click the standard dialog negative button (Cancel)
+            val buttonMatcher = By.pkg(Pattern.compile(".*android.connectivity.resources"))
+                .res("android:id/button2")
+            val cancelButton = uiDevice.wait(Until.findObject(buttonMatcher), UI_TIMEOUT_MS)
+            assertNotNull(cancelButton, "Cancel button not found")
+            cancelButton.click()
+
+            // Expect DiscoveryStopped callback
+            discoveryRecord.expectCallback<DiscoveryStopped>()
+        } cleanup {
+            handlerThread.waitForIdle(TIMEOUT_MS)
+            // If discovery is already stopped, this is a no-op; otherwise it ensures discovery
+            // is stopped if the test failed before cancellation.
+            nsdManager.stopServiceDiscovery(discoveryRecord)
+        }
+    }
+
     private fun hasServiceTypeClientsForNetwork(clients: List<String>, network: Network): Boolean {
         return clients.any { client -> client.substring(
                 client.indexOf("network=") + "network=".length,
@@ -2683,11 +3704,14 @@ class NsdManagerTest {
      * Replaces occurrences of "NsdTest123456789" and "_nmt123456789" in mDNS payload with the
      * actual random name and type that are used by the test.
      */
-    private fun replaceServiceNameAndTypeWithTestSuffix(mdnsPayload: ByteArray) {
+    private fun replaceServiceNameAndTypeWithTestSuffix(
+        mdnsPayload: ByteArray,
+        serviceNameReplacement: String = serviceName
+    ) {
         // Test service name and types have consistent length and are always ASCII
         val testPacketName = "NsdTest123456789".encodeToByteArray()
         val testPacketTypePrefix = "_nmt123456789".encodeToByteArray()
-        val encodedServiceName = serviceName.encodeToByteArray()
+        val encodedServiceName = serviceNameReplacement.encodeToByteArray()
         val encodedTypePrefix = serviceType.split('.')[0].encodeToByteArray()
 
         val packetBuffer = ByteBuffer.wrap(mdnsPayload)
@@ -2786,6 +3810,375 @@ class NsdManagerTest {
         assertEquals(discoveredInfo.serviceName, resolvedCb.serviceInfo.serviceName)
 
         return resolvedCb.serviceInfo
+    }
+
+    @Test
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    fun testRegisterServiceInfoCallback_withDiscoveryRequest_sendsFollowupQueries() {
+        val cbRecord = NsdServiceInfoCallbackRecord()
+        val packetReader = makePacketReader()
+        val discoveryRequest = DiscoveryRequest.Builder(serviceType)
+            .setNetwork(testNetwork1.network)
+            .build()
+        nsdManager.registerServiceInfoCallback(discoveryRequest, { it.run() }, cbRecord)
+        cbRecord.expectCallback<RegisterCallbackSucceeded>()
+
+        tryTest {
+            packetReader.pollForQuery("$serviceType.local", DnsResolver.TYPE_PTR) ?: fail(
+                "PTR query not received, received packets: " + packetReader.backtraceMdnsPackets())
+
+            /*
+            Send PTR, SRV and TXT response, but no address records. Generated with:
+            scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None,
+                an = [scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                            rdata='NsdTest123456789._nmt123456789._tcp.local')],
+                ar = [scapy.DNSRRSRV(rrname='NsdTest123456789._nmt123456789._tcp.local',
+                            rclass=0x8001, port=31234, target='testhost.local', ttl=120),
+                    scapy.DNSRR(rrname='NsdTest123456789._nmt123456789._tcp.local', type='TXT',
+                            ttl=120, rdata='testkey=testvalue')]
+            ))).hex()
+             */
+            val srvTxtResponsePayload = hexStringToByteArray(
+                "0000840000000001000000020d5f6e6d74313233343536373839045f746370056c6f63616c00000c" +
+                        "0001000000780013104e736454657374313233343536373839c00cc03000210001000000" +
+                        "780011000000007a020874657374686f7374c01fc0300010000100000078001211746573" +
+                        "746b65793d7465737476616c7565"
+            )
+            replaceServiceNameAndTypeWithTestSuffix(srvTxtResponsePayload)
+            packetReader.sendResponse(buildMdnsPacket(srvTxtResponsePayload))
+
+            // Verify followup address query is received
+            val testHostname = "testhost.local"
+            val addressQuery = packetReader.pollForQuery(
+                testHostname,
+                DnsResolver.TYPE_A,
+                DnsResolver.TYPE_AAAA
+            )
+            assertNotNull(addressQuery)
+            // No callback is called yet since addresses are missing
+            cbRecord.assertNoCallback(timeoutMs = 0L)
+
+            /*
+             Send address response. Generated with:
+             scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None, an = [
+                 scapy.DNSRR(rrname='testhost.local', type='A', ttl=120,
+                     rdata='192.0.2.123'),
+                 scapy.DNSRR(rrname='testhost.local', type='AAAA', ttl=120,
+                     rdata='2001:db8::123')]
+             ))).hex()
+             */
+            val addressPayload = hexStringToByteArray(
+                "0000840000000002000000000874657374686f7374056c6f63616c0000010001000000780004c000" +
+                        "027bc00c001c000100000078001020010db8000000000000000000000123"
+            )
+            packetReader.sendResponse(buildMdnsPacket(addressPayload))
+
+            val serviceUpdated = cbRecord.expectCallback<ServiceUpdated>()
+            serviceUpdated.serviceInfo.let {
+                assertEquals(serviceName, it.serviceName)
+                assertEquals(serviceType, it.serviceType)
+                assertEquals(testNetwork1.network, it.network)
+                assertEquals(31234, it.port)
+                assertEquals(1, it.attributes.size)
+                assertArrayEquals("testvalue".encodeToByteArray(), it.attributes["testkey"])
+                assertAddressEquals(
+                    listOf(
+                        parseNumericAddress("192.0.2.123"),
+                        parseNumericAddress("2001:db8::123")
+                    ),
+                    it.hostAddresses
+                )
+            }
+
+            // Send goodbye packet (TTL 0 for the SRV record)
+            /*
+            Generated with:
+            scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None, an =
+                [scapy.DNSRRSRV(rrname='NsdTest123456789._nmt123456789._tcp.local',
+                    rclass=0x8001, port=31234, target='testhost.local', ttl=0)]
+            ))).hex()
+             */
+            val goodbyePayload = hexStringToByteArray(
+                "000084000000000100000000104e7364546573743132333435363738390d5f6e6d74313233343536" +
+                        "373839045f746370056c6f63616c0000210001000000000011000000007a020874657374" +
+                        "686f7374c030"
+            )
+            replaceServiceNameAndTypeWithTestSuffix(goodbyePayload)
+            packetReader.sendResponse(buildMdnsPacket(goodbyePayload))
+
+            val serviceLost = cbRecord.expectCallback<ServiceUpdatedLost>()
+            assertEquals(serviceName, serviceLost.serviceInfo.serviceName)
+
+            nsdManager.unregisterServiceInfoCallback(cbRecord)
+            cbRecord.expectCallback<UnregisterCallbackSucceeded>()
+        } cleanup {
+            packetReader.handler.post { packetReader.stop() }
+            handlerThread.waitForIdle(TIMEOUT_MS)
+        }
+    }
+
+    @Test
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    @CtsNetTestCasesLocalNetNoPermissions
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.BAKLAVA)
+    fun testRegisterServiceInfoCallback_missingPermissions_registrationError() {
+        assumeTrue(android.permission.flags.Flags.accessLocalNetworkPermissionEnabled())
+
+        val cbRecord = NsdServiceInfoCallbackRecord()
+        val discoveryRequest = DiscoveryRequest.Builder(serviceType)
+            .setNetwork(testNetwork1.network)
+            .setFlags(DiscoveryRequest.FLAG_NO_PICKER)
+            .build()
+        nsdManager.registerServiceInfoCallback(discoveryRequest, { it.run() }, cbRecord)
+
+        val failCb = cbRecord.expectCallback<RegisterCallbackFailed>()
+        assertEquals(NsdManager.FAILURE_PERMISSION_DENIED, failCb.errorCode)
+        cbRecord.assertNoCallback(timeoutMs = 0L)
+    }
+
+    private fun runPickerAttributeFilterTest(useServiceInfoCallback: Boolean): NsdServiceInfo {
+        val uiDevice = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        uiDevice.wakeUp()
+        uiDevice.executeShellCommand("wm dismiss-keyguard")
+        val packetReader = makePacketReader()
+        val discoveryRecord = NsdDiscoveryRecord()
+        val serviceInfoCallback = NsdServiceInfoCallbackRecord()
+        return tryTest {
+            val request = DiscoveryRequest.Builder(serviceType)
+                .setNetwork(testNetwork1.network)
+                .setFlags(DiscoveryRequest.FLAG_SHOW_PICKER)
+                .setAttributeFilters(mapOf(
+                    "testkey" to PatternMatcher("testvalue", PatternMatcher.PATTERN_LITERAL)
+                ))
+                .build()
+            if (useServiceInfoCallback) {
+                nsdManager.registerServiceInfoCallback(request, { it.run() }, serviceInfoCallback)
+                serviceInfoCallback.expectCallback<RegisterCallbackSucceeded>()
+            } else {
+                nsdManager.discoverServices(request, { it.run() }, discoveryRecord)
+                discoveryRecord.expectCallback<DiscoveryStarted>()
+            }
+            packetReader.pollForQuery("$serviceType.local", DnsResolver.TYPE_PTR) ?: fail(
+                "PTR query not received, received packets: " + packetReader.backtraceMdnsPackets())
+
+            /*
+               Send a full response that does not match the filter. Generated with:
+               scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None,
+                   an = [scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                           rdata='NsdTest123456789._nmt123456789._tcp.local')],
+                   ar = [scapy.DNSRRSRV(rrname='NsdTest123456789._nmt123456789._tcp.local',
+                           rclass=0x8001, port=12345, target='testhost.local', ttl=120),
+                       scapy.DNSRR(rrname='NsdTest123456789._nmt123456789._tcp.local', type='TXT',
+                           ttl=120, rdata='testkey=testothervalue'),
+                       scapy.DNSRR(rrname='testhost.local', type='AAAA', ttl=120,
+                           rdata='2001:db8::123')]
+               ))).hex()
+             */
+            val payload1 = hexStringToByteArray("0000840000000001000000030d5f6e6d7431323334353637" +
+                    "3839045f746370056c6f63616c00000c0001000000780013104e736454657374313233343536" +
+                    "373839c00cc030002100010000007800110000000030390874657374686f7374c01fc0300010" +
+                    "000100000078001716746573746b65793d746573746f7468657276616c7565c055001c000100" +
+                    "000078001020010db8000000000000000000000123")
+            replaceServiceNameAndTypeWithTestSuffix(payload1, serviceName)
+            packetReader.sendResponse(buildMdnsPacket(payload1))
+
+            /*
+               Send a full response that matches the filter. Generated with:
+               scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None,
+               an = [scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                       rdata='NsdTest123456789._nmt123456789._tcp.local')],
+               ar = [scapy.DNSRRSRV(rrname='NsdTest123456789._nmt123456789._tcp.local',
+                       rclass=0x8001, port=12345, target='testhost.local', ttl=120),
+                   scapy.DNSRR(rrname='NsdTest123456789._nmt123456789._tcp.local', type='TXT',
+                       ttl=120, rdata='testkey=testvalue'),
+                   scapy.DNSRR(rrname='testhost.local', type='AAAA', ttl=120,
+                       rdata='2001:db8::123')]
+               ))).hex()
+             */
+            val payload2 = hexStringToByteArray("0000840000000001000000030d5f6e6d7431323334353637" +
+                    "3839045f746370056c6f63616c00000c0001000000780013104e736454657374313233343536" +
+                    "373839c00cc030002100010000007800110000000030390874657374686f7374c01fc0300010" +
+                    "000100000078001211746573746b65793d7465737476616c7565c055001c0001000000780010" +
+                    "20010db8000000000000000000000123"
+            )
+            replaceServiceNameAndTypeWithTestSuffix(payload2, serviceName2)
+            packetReader.sendResponse(buildMdnsPacket(payload2))
+
+            // Only serviceName2 should appear because its attribute matches.
+            val service2Text = uiDevice.wait(Until.findObject(By.text(serviceName2)), UI_TIMEOUT_MS)
+            assertNotNull(service2Text, "Picker did not show matching service $serviceName2")
+
+            val service1Text = uiDevice.findObject(By.text(serviceName))
+            assertNull(service1Text, "Picker showed non-matching service $serviceName")
+
+            // Select the service
+            service2Text.click()
+
+            if (useServiceInfoCallback) {
+                return@tryTest serviceInfoCallback.expectCallback<ServiceUpdated>().serviceInfo
+            } else {
+                return@tryTest discoveryRecord.expectCallback<ServiceFound>().serviceInfo
+            }
+        } cleanup {
+            packetReader.handler.post { packetReader.stop() }
+            handlerThread.waitForIdle(TIMEOUT_MS)
+            if (useServiceInfoCallback) {
+                nsdManager.unregisterServiceInfoCallback(serviceInfoCallback)
+                serviceInfoCallback.expectCallback<UnregisterCallbackSucceeded>()
+            } else {
+                nsdManager.stopServiceDiscovery(discoveryRecord)
+                discoveryRecord.expectCallback<DiscoveryStopped>()
+            }
+        }
+    }
+
+    @Test
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    fun testDiscoverServices_withAttributeFilterAndPicker() {
+        val serviceInfo = runPickerAttributeFilterTest(useServiceInfoCallback = false)
+        serviceInfo.let {
+            assertEquals(serviceName2, it.serviceName)
+            // Port, hostname, attributes, addresses should not be set as this is a discovery
+            // record
+            assertEquals(0, it.port)
+            assertNull(it.hostname)
+            assertEquals(0, it.attributes.size)
+            assertEquals(0, it.hostAddresses.size)
+            assertEquals(testNetwork1.network, it.network)
+        }
+    }
+
+    @Test
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    fun testRegisterServiceInfoCallback_withAttributeFilterAndPicker() {
+        val serviceInfo = runPickerAttributeFilterTest(useServiceInfoCallback = true)
+        serviceInfo.let {
+            assertEquals(serviceName2, it.serviceName)
+            assertEquals(TEST_PORT, it.port)
+            assertEquals("testhost", it.hostname)
+            assertEquals(1, it.attributes.size)
+            assertArrayEquals("testvalue".encodeToByteArray(), it.attributes["testkey"])
+            assertEquals(listOf(parseNumericAddress("2001:db8::123")), it.hostAddresses)
+            assertEquals(testNetwork1.network, it.network)
+            assertEquals(0, it.interfaceIndex)
+        }
+    }
+
+    private fun runAttributeFilterFollowupQueriesTest(
+        useServiceInfoCallback: Boolean
+    ): NsdServiceInfo {
+        val packetReader = makePacketReader()
+        val cbRecord = NsdServiceInfoCallbackRecord()
+        val discoveryRecord = NsdDiscoveryRecord()
+
+        return tryTest {
+            val request = DiscoveryRequest.Builder(serviceType)
+                .setNetwork(testNetwork1.network)
+                .setAttributeFilters(mapOf(
+                    "testkey" to PatternMatcher("testvalue", PatternMatcher.PATTERN_LITERAL)
+                ))
+                .build()
+            if (useServiceInfoCallback) {
+                nsdManager.registerServiceInfoCallback(request, { it.run() }, cbRecord)
+                cbRecord.expectCallback<RegisterCallbackSucceeded>()
+            } else {
+                nsdManager.discoverServices(request, { it.run() }, discoveryRecord)
+                discoveryRecord.expectCallback<DiscoveryStarted>()
+            }
+            packetReader.pollForQuery("$serviceType.local", DnsResolver.TYPE_PTR) ?: fail(
+                "PTR query not received, received packets: " + packetReader.backtraceMdnsPackets())
+
+            /*
+             Send a PTR-only response. Generated with:
+             scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None,
+                 an = [scapy.DNSRR(rrname='_nmt123456789._tcp.local', type='PTR', ttl=120,
+                     rdata='NsdTest123456789._nmt123456789._tcp.local')]
+             ))).hex()
+             */
+            val ptrResponse = hexStringToByteArray("0000840000000001000000000d5f6e6d7431323334353" +
+                    "6373839045f746370056c6f63616c00000c0001000000780013104e736454657374313233343" +
+                    "536373839c00c"
+            )
+            replaceServiceNameAndTypeWithTestSuffix(ptrResponse)
+            packetReader.sendResponse(buildMdnsPacket(ptrResponse))
+
+            packetReader.pollForQuery("$serviceName.$serviceType.local", DnsResolver.TYPE_ANY)
+                ?: fail("Follow-up query for SRV/TXT not received, received packets: " +
+                        packetReader.backtraceMdnsPackets())
+
+            /*
+             Send a SRV/TXT response with address records. Generated with:
+             Generated with:
+             scapy.raw(scapy.dns_compress(scapy.DNS(rd=0, qr=1, aa=1, qd = None,
+                 an = [scapy.DNSRRSRV(rrname='NsdTest123456789._nmt123456789._tcp.local',
+                         rclass=0x8001, port=12345, target='testhost.local', ttl=120),
+                     scapy.DNSRR(rrname='NsdTest123456789._nmt123456789._tcp.local', type='TXT',
+                         ttl=120, rdata='testkey=testvalue')],
+                 ar = [scapy.DNSRR(rrname='testhost.local', type='AAAA', ttl=120,
+                         rdata='2001:db8::123')]
+             ))).hex()
+             */
+            val srvTxtResponseTemplate = hexStringToByteArray("000084000000000200000001104e736454" +
+                    "6573743132333435363738390d5f6e6d74313233343536373839045f746370056c6f63616c00" +
+                    "002100010000007800110000000030390874657374686f7374c030c00c001000010000007800" +
+                    "1211746573746b65793d7465737476616c7565c047001c000100000078001020010db8000000" +
+                    "000000000000000123")
+            replaceServiceNameAndTypeWithTestSuffix(srvTxtResponseTemplate)
+            packetReader.sendResponse(buildMdnsPacket(srvTxtResponseTemplate))
+
+            if (useServiceInfoCallback) {
+                return@tryTest cbRecord.expectCallback<ServiceUpdated>().serviceInfo
+            } else {
+                return@tryTest discoveryRecord.expectCallback<ServiceFound>().serviceInfo
+            }
+        } cleanup {
+            packetReader.handler.post { packetReader.stop() }
+            handlerThread.waitForIdle(TIMEOUT_MS)
+            if (useServiceInfoCallback) {
+                nsdManager.unregisterServiceInfoCallback(cbRecord)
+                cbRecord.expectCallback<UnregisterCallbackSucceeded>()
+            } else {
+                nsdManager.stopServiceDiscovery(discoveryRecord)
+                discoveryRecord.expectCallback<DiscoveryStopped>()
+            }
+        }
+    }
+
+    @Test
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    fun testDiscoverServices_withAttributeFilter_sendsFollowupQueries() {
+        val serviceInfo = runAttributeFilterFollowupQueriesTest(useServiceInfoCallback = false)
+        serviceInfo.let {
+            assertEquals(serviceName, it.serviceName)
+            // Port, hostname, attributes, addresses should not be set as this is a discovery
+            // record
+            assertEquals(0, it.port)
+            assertNull(it.hostname)
+            assertEquals(0, it.attributes.size)
+            assertEquals(0, it.hostAddresses.size)
+            assertEquals(testNetwork1.network, it.network)
+        }
+    }
+
+    @Test
+    @DevSdkIgnoreRule.IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    @RequiresFlagsEnabled(FLAG_NSD_SERVICE_PICKER)
+    fun testRegisterServiceInfoCallback_withAttributeFilter_sendsFollowupQueries() {
+        val serviceInfo = runAttributeFilterFollowupQueriesTest(useServiceInfoCallback = true)
+        serviceInfo.let {
+            assertEquals(serviceName, it.serviceName)
+            assertEquals(TEST_PORT, it.port)
+            assertEquals("testhost", it.hostname)
+            assertEquals(1, it.attributes.size)
+            assertArrayEquals("testvalue".encodeToByteArray(), it.attributes["testkey"])
+            assertEquals(listOf(parseNumericAddress("2001:db8::123")), it.hostAddresses)
+            assertEquals(testNetwork1.network, it.network)
+            assertEquals(0, it.interfaceIndex)
+        }
     }
 }
 

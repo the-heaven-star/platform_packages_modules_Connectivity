@@ -41,10 +41,13 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -79,6 +82,7 @@ import com.android.server.vcn.VcnGatewayConnection.VcnChildSessionCallback;
 import com.android.server.vcn.VcnGatewayConnection.VcnChildSessionConfiguration;
 import com.android.server.vcn.VcnGatewayConnection.VcnIkeSession;
 import com.android.server.vcn.VcnGatewayConnection.VcnNetworkAgent;
+import com.android.server.vcn.metrics.VcnMetrics;
 import com.android.server.vcn.routeselection.UnderlyingNetworkRecord;
 
 import org.junit.Before;
@@ -109,6 +113,7 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
         super.setUp();
 
         mNetworkAgent = mock(VcnNetworkAgent.class);
+
         doReturn(mNetworkAgent)
                 .when(mDeps)
                 .newNetworkAgent(any(), any(), any(), any(), any(), any(), any(), any(), any());
@@ -173,6 +178,18 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
         assertEquals(mGatewayConnection.mConnectedState, mGatewayConnection.getCurrentState());
         verify(mIkeSession, never()).close();
         verify(mIkeSession).setNetwork(TEST_UNDERLYING_NETWORK_RECORD_2.network);
+
+        int elapsedTime = 1000;
+        doReturn(ELAPSED_REAL_TIME + elapsedTime).when(mDeps).getElapsedRealTime();
+        getChildSessionCallback()
+                .onIpSecTransformsMigrated(makeDummyIpSecTransform(), makeDummyIpSecTransform());
+        mTestLooper.dispatchAll();
+
+        verify(mVcnMetrics)
+                .logUnderlyingNetworkSwitched(
+                        eq(VcnMetrics.TRANSPORT_MASK_CELLULAR),
+                        eq(VcnMetrics.TRANSPORT_MASK_WIFI),
+                        eq(elapsedTime));
     }
 
     @Test
@@ -183,6 +200,8 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
         mTestLooper.dispatchAll();
 
         assertEquals(mGatewayConnection.mConnectedState, mGatewayConnection.getCurrentState());
+        verify(mIkeSession, never()).setNetwork(any());
+        verify(mVcnMetrics, never()).logUnderlyingNetworkSwitched(anyInt(), anyInt(), anyInt());
     }
 
     private void verifyDataStallTriggersMigration(
@@ -219,6 +238,17 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
     public void testDataStallTriggersMigration() throws Exception {
         verifyDataStallTriggersMigration(
                 TEST_UNDERLYING_NETWORK_RECORD_1, mVcnNetwork, true /* expectMobilityUpdate */);
+        int elapsedTime = 1000;
+        doReturn(ELAPSED_REAL_TIME + elapsedTime).when(mDeps).getElapsedRealTime();
+        getChildSessionCallback()
+                .onIpSecTransformsMigrated(makeDummyIpSecTransform(), makeDummyIpSecTransform());
+        mTestLooper.dispatchAll();
+
+        verify(mVcnMetrics)
+                .logVcnRecoveryIkeMobilityUpdated(
+                        eq(VcnMetrics.TRANSPORT_MASK_CELLULAR),
+                        eq(VcnMetrics.VCN_RECOVERY_REASON_DATA_STALL),
+                        eq(elapsedTime));
     }
 
     @Test
@@ -227,12 +257,14 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
                 TEST_UNDERLYING_NETWORK_RECORD_1,
                 mock(Network.class),
                 false /* expectMobilityUpdate */);
+        verify(mVcnMetrics, never()).logUnderlyingNetworkSwitched(anyInt(), anyInt(), anyInt());
     }
 
     @Test
     public void testDataStallWontTriggerMigrationWhenUnderlyingNetworkLost() throws Exception {
         verifyDataStallTriggersMigration(
                 null /* networkRecord */, mock(Network.class), false /* expectMobilityUpdate */);
+        verify(mVcnMetrics, never()).logUnderlyingNetworkSwitched(anyInt(), anyInt(), anyInt());
     }
 
     private void verifyVcnTransformsApplied(
@@ -378,6 +410,76 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
 
         assertEquals(mGatewayConnection.mDisconnectingState, mGatewayConnection.getCurrentState());
         verify(mIkeSession).close();
+    }
+
+    @Test
+    public void testBackToBackMigrations() throws Exception {
+        triggerChildOpened();
+        mGatewayConnection
+                .getUnderlyingNetworkControllerCallback()
+                .onSelectedUnderlyingNetworkChanged(TEST_UNDERLYING_NETWORK_RECORD_2);
+        mTestLooper.dispatchAll();
+
+        verify(mIkeSession).setNetwork(TEST_UNDERLYING_NETWORK_RECORD_2.network);
+
+        // Trigger another migration before the first one completes
+        mGatewayConnection
+                .getUnderlyingNetworkControllerCallback()
+                .onSelectedUnderlyingNetworkChanged(TEST_UNDERLYING_NETWORK_RECORD_1);
+        mTestLooper.dispatchAll();
+
+        verify(mIkeSession).setNetwork(TEST_UNDERLYING_NETWORK_RECORD_1.network);
+
+        int elapsedTime1 = 1000;
+        doReturn(ELAPSED_REAL_TIME + elapsedTime1).when(mDeps).getElapsedRealTime();
+        getChildSessionCallback()
+                .onIpSecTransformsMigrated(makeDummyIpSecTransform(), makeDummyIpSecTransform());
+        mTestLooper.dispatchAll();
+
+        // The first migration should be logged with CELLULAR -> WIFI
+        verify(mVcnMetrics)
+                .logUnderlyingNetworkSwitched(
+                        eq(VcnMetrics.TRANSPORT_MASK_CELLULAR),
+                        eq(VcnMetrics.TRANSPORT_MASK_WIFI),
+                        eq(elapsedTime1));
+
+        clearInvocations(mVcnMetrics);
+        int elapsedTime2 = 2000;
+        doReturn(ELAPSED_REAL_TIME + elapsedTime2).when(mDeps).getElapsedRealTime();
+        getChildSessionCallback()
+                .onIpSecTransformsMigrated(makeDummyIpSecTransform(), makeDummyIpSecTransform());
+        mTestLooper.dispatchAll();
+
+        // The second migration should be logged with WIFI -> CELLULAR
+        verify(mVcnMetrics)
+                .logUnderlyingNetworkSwitched(
+                        eq(VcnMetrics.TRANSPORT_MASK_WIFI),
+                        eq(VcnMetrics.TRANSPORT_MASK_CELLULAR),
+                        eq(elapsedTime2));
+    }
+
+    @Test
+    public void testMigrationAfterIkeSessionRestart() throws Exception {
+        triggerChildOpened();
+        mGatewayConnection
+                .getUnderlyingNetworkControllerCallback()
+                .onSelectedUnderlyingNetworkChanged(TEST_UNDERLYING_NETWORK_RECORD_2);
+        mTestLooper.dispatchAll();
+
+        verify(mIkeSession).setNetwork(TEST_UNDERLYING_NETWORK_RECORD_2.network);
+
+        // Restart session (increment token)
+        mIkeSession = mGatewayConnection.buildIkeSession(TEST_UNDERLYING_NETWORK_RECORD_1.network);
+        mGatewayConnection.setIkeSession(mIkeSession);
+
+        int elapsedTime = 1000;
+        doReturn(ELAPSED_REAL_TIME + elapsedTime).when(mDeps).getElapsedRealTime();
+        getChildSessionCallback()
+                .onIpSecTransformsMigrated(makeDummyIpSecTransform(), makeDummyIpSecTransform());
+        mTestLooper.dispatchAll();
+
+        // Migration from previous session should be discarded; no metrics logged
+        verify(mVcnMetrics, never()).logUnderlyingNetworkSwitched(anyInt(), anyInt(), anyInt());
     }
 
     private void triggerChildOpened() {
@@ -614,23 +716,48 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
     }
 
     @Test
-    public void testValidatedTriggered_logsMetrics() throws Exception {
+    public void testValidationTriggered_logsMetrics() throws Exception {
+        // Relay calls to a real VcnNetworkAgent.
+        doAnswer(
+                        invocation -> {
+                            final VcnNetworkAgent agent =
+                                    new VcnNetworkAgent(
+                                            invocation.getArgument(0),
+                                            invocation.getArgument(1),
+                                            invocation.getArgument(2),
+                                            invocation.getArgument(3),
+                                            invocation.getArgument(4),
+                                            invocation.getArgument(5),
+                                            invocation.getArgument(6),
+                                            invocation.getArgument(7),
+                                            invocation.getArgument(8));
+                            mNetworkAgent = spy(agent);
+
+                            doReturn(mVcnNetwork).when(mNetworkAgent).getNetwork();
+                            doReturn(NETWORK_AGENT_ID).when(mNetworkAgent).getIdentityHashCode();
+                            return mNetworkAgent;
+                        })
+                .when(mDeps)
+                .newNetworkAgent(any(), any(), any(), any(), any(), any(), any(), any(), any());
+
         triggerChildOpened();
         mTestLooper.dispatchAll();
 
+        // Network was first validated.
         triggerValidation(NetworkAgent.VALIDATION_STATUS_VALID);
-
-        verify(mVcnMetrics).logVcnNetworkValidated(anyInt(), eq(NETWORK_AGENT_ID));
-    }
-
-    @Test
-    public void testNotValidatedTriggered_logsMetrics() throws Exception {
-        triggerChildOpened();
-        mTestLooper.dispatchAll();
-
+        // Network then becomes invalid.
         triggerValidation(NetworkAgent.VALIDATION_STATUS_NOT_VALID);
 
-        verify(mVcnMetrics).logVcnNetworkNotValidated(anyInt(), eq(NETWORK_AGENT_ID));
+        verify(mVcnMetrics)
+                .logVcnNetworkValidationStatus(
+                        anyInt(),
+                        eq(VcnMetrics.VALIDATION_STATUS_PENDING),
+                        eq(VcnMetrics.VALIDATION_STATUS_VALID));
+        verify(mVcnMetrics)
+                .logVcnNetworkValidationStatus(
+                        anyInt(),
+                        eq(VcnMetrics.VALIDATION_STATUS_VALID),
+                        eq(VcnMetrics.VALIDATION_STATUS_NOT_VALID));
     }
 
     @Test
@@ -648,7 +775,7 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
 
         verifySafeModeStateAndCallbackFired(2 /* invocationCount */, false /* isInSafeMode */);
         assertFalse(mGatewayConnection.isInSafeMode());
-        verify(mVcnMetrics).logExitSafeMode(anyInt());
+        verify(mVcnMetrics).logExitSafeMode();
     }
 
     @Test
@@ -677,7 +804,7 @@ public class VcnGatewayConnectionConnectedStateTest extends VcnGatewayConnection
         mTestLooper.dispatchAll();
 
         verifySafeModeStateAndCallbackFired(2 /* invocationCount */, true /* isInSafeMode */);
-        verify(mVcnMetrics).logEnterSafeMode(anyInt());
+        verify(mVcnMetrics).logEnterSafeMode();
     }
 
     private void verifySetSafeModeAlarm(

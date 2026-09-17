@@ -26,6 +26,8 @@ import static android.net.NetworkRequest.Type.TRACK_DEFAULT;
 import static android.net.NetworkRequest.Type.TRACK_SYSTEM_DEFAULT;
 import static android.net.QosCallback.QosCallbackRegistrationException;
 
+import static com.android.tethering.flags.Flags.FLAG_NETSTATS_PER_QUERY_FLAGS;
+
 import android.annotation.CallbackExecutor;
 import android.annotation.FlaggedApi;
 import android.annotation.IntDef;
@@ -94,6 +96,7 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -105,6 +108,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Class that answers queries about the state of network connectivity. It also
@@ -916,7 +920,7 @@ public class ConnectivityManager {
      * @see #FIREWALL_CHAIN_OEM_DENY_3
      * @hide
      */
-    @FlaggedApi(Flags.FLAG_BLOCKED_REASON_OEM_DENY_CHAINS)
+    @FlaggedApi(FLAG_NETSTATS_PER_QUERY_FLAGS)
     @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
     public static final int BLOCKED_REASON_OEM_DENY = 1 << 7;
 
@@ -1202,6 +1206,8 @@ public class ConnectivityManager {
     public static final long FEATURE_USE_DECLARED_METHODS_FOR_CALLBACKS = 1L;
     /** @hide */
     public static final long FEATURE_QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER = 1L << 1;
+    /** @hide */
+    public static final long FEATURE_OTT_NETWORK_SLICING = 1L << 2;
 
     /** @hide */
     @Retention(RetentionPolicy.SOURCE)
@@ -1451,7 +1457,7 @@ public class ConnectivityManager {
      * terminate with an error). Additionally, the designated apps should be
      * blocked from using any non-enterprise network even if they specify it
      * explicitly, unless they hold specific privilege overriding this (see
-     * {@link android.Manifest.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS}).
+     * {@link android.Manifest.permission#CONNECTIVITY_USE_RESTRICTED_NETWORKS}).
      * @hide
      */
     @SystemApi(client = MODULE_LIBRARIES)
@@ -1590,7 +1596,7 @@ public class ConnectivityManager {
      * If set to {@code true}, informs the system that the UIDs in the specified ranges must not
      * have any connectivity except if a VPN is connected and applies to the UIDs, or if the UIDs
      * otherwise have permission to bypass the VPN (e.g., because they have the
-     * {@link android.Manifest.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS} permission, or when
+     * {@link android.Manifest.permission#CONNECTIVITY_USE_RESTRICTED_NETWORKS} permission, or when
      * using a socket protected by a method such as {@link VpnService#protect(DatagramSocket)}. If
      * set to {@code false}, a previously-added restriction is removed.
      * <p>
@@ -3137,7 +3143,7 @@ public class ConnectivityManager {
      * return false rather than throw an exception.</p>
      *
      * <p>If the device has a hotspot provisioning app, the caller is required to hold the
-     * {@link android.Manifest.permission.TETHER_PRIVILEGED} permission.</p>
+     * {@link android.Manifest.permission#TETHER_PRIVILEGED} permission.</p>
      *
      * <p>Otherwise, this method requires the caller to hold the ability to modify system
      * settings as determined by {@link android.provider.Settings.System#canWrite}.</p>
@@ -3197,9 +3203,9 @@ public class ConnectivityManager {
      * schedules tether provisioning re-checks if appropriate.
      *
      * @param type The type of tethering to start. Must be one of
-     *         {@link ConnectivityManager.TETHERING_WIFI},
-     *         {@link ConnectivityManager.TETHERING_USB}, or
-     *         {@link ConnectivityManager.TETHERING_BLUETOOTH}.
+     *         {@link ConnectivityManager#TETHERING_WIFI},
+     *         {@link ConnectivityManager#TETHERING_USB}, or
+     *         {@link ConnectivityManager#TETHERING_BLUETOOTH}.
      * @param showProvisioningUi a boolean indicating to show the provisioning app UI if there
      *         is one. This should be true the first time this function is called and also any time
      *         the user can see this UI. It gives users information from their carrier about the
@@ -3252,9 +3258,9 @@ public class ConnectivityManager {
      * applicable.
      *
      * @param type The type of tethering to stop. Must be one of
-     *         {@link ConnectivityManager.TETHERING_WIFI},
-     *         {@link ConnectivityManager.TETHERING_USB}, or
-     *         {@link ConnectivityManager.TETHERING_BLUETOOTH}.
+     *         {@link ConnectivityManager#TETHERING_WIFI},
+     *         {@link ConnectivityManager#TETHERING_USB}, or
+     *         {@link ConnectivityManager#TETHERING_BLUETOOTH}.
      *
      * @deprecated Use {@link TetheringManager#stopTethering} instead.
      * @hide
@@ -6922,6 +6928,96 @@ public class ConnectivityManager {
     public void unregisterQuicConnectionClosePayload(final ParcelFileDescriptor pfd) {
         try {
             mService.unregisterQuicConnectionClosePayload(pfd);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    private static final AtomicBoolean sEarlyInitCalled = new AtomicBoolean(false);
+
+    /**
+     * Performs early initialization of connectivity-related features for the app process.
+     *
+     * <p>This method is intended to be called only once during app startup from {@code
+     * ActivityThread.handleBindApplication}. Keep implementation lightweight and return quickly to
+     * avoid impacting application launch times.
+     *
+     * <p>Currently, it only initializes the process-level HTTP proxy settings.
+     *
+     * @hide
+     */
+    @FlaggedApi(com.android.tethering.flags.Flags.FLAG_ENABLE_MULTI_PROXY_SYSTEM)
+    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
+    public void onEarlyInit() {
+        if (sEarlyInitCalled.getAndSet(true)) {
+            throw new IllegalStateException("onEarlyInit can only be called once per process.");
+        }
+        // Initial proxy setup
+        // TODO(476324244) This flow for setting and updating the proxy information in the app
+        // process relies on system broadcasts. Replace with a more targeted approach by leveraging
+        // NetworkCallback as a delivery mechanism.
+        updateProcessProxyConfigurationInternal();
+    }
+
+    /** @hide */
+    @VisibleForTesting
+    public static void resetEarlyInitCalledForTest() {
+        sEarlyInitCalled.set(false);
+    }
+
+    /**
+     * Updates the process-local proxy settings, including JVM system properties. This method is
+     * called when proxy changes are signaled to the application.
+     */
+    private void updateProcessProxyConfigurationInternal() {
+        Proxy.setHttpProxyConfiguration(getDefaultProxy());
+    }
+
+    /**
+     * Reports a change in the state of an OTT call.
+     * <p>
+     * This method is expected to be called only from {@code ConnectivityCallListenerService}
+     * running on the system server process.
+     *
+     * @param uid The UID of the application whose call state has changed.
+     * @param isAdded True if a call has been added, false if it has been removed.
+     * @throws SecurityException if the caller is not the system server.
+     * @hide
+     */
+    public void onOttCallStateChanged(int uid, boolean isAdded) {
+        try {
+            mService.onOttCallStateChanged(uid, isAdded);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Add entries to the UID/interface/addresses BPF map allowlist for local network access.
+     *
+     * @param uid The UID that should be allowed
+     * @param ifIndex The interface on which communication should be allowed
+     * @param addresses The destination addresses that should be allowed
+     * @hide
+     */
+    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+    public void allowLocalNetAccess(int uid, int ifIndex, List<InetAddress> addresses) {
+        if (addresses.isEmpty()) {
+            return;
+        }
+        final ArrayList<String> addrStrings = new ArrayList<>(addresses.size());
+        for (InetAddress addr : addresses) {
+            try {
+                // Address scope, lifetime etc. do not matter as they are unused in the BPF map.
+                // Ensure they are stripped out so getHostAddress does not include the scope.
+                addrStrings.add(InetAddress.getByAddress(addr.getAddress()).getHostAddress());
+            } catch (UnknownHostException e) {
+                // This should never happen since the bytes come from an InetAddress
+                Log.e(TAG, "Invalid address bytes", e);
+            }
+        }
+        try {
+            mService.allowLocalNetAccess(uid, ifIndex, addrStrings);
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }

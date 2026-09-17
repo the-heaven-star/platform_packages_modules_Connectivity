@@ -62,8 +62,35 @@ struct frag_hdr {
 #define TCP_HLEN sizeof(struct tcphdr)
 #define UDP_HLEN sizeof(struct udphdr)
 
+// copied from //bionic/libc/include/bits/tcphdr.h 'struct tcphdr' but with bitfield replaced with flags16
+struct tcphdr_with_flags16 {
+  __be16 source;
+  __be16 dest;
+  __be32 seq;
+  __be32 ack_seq;
+  __extension__ union {
+    __be16 flags16;
+    struct {
+      // copied from //external/iproute2/include/uapi/linux/tcp.h
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+      __u16 rsvd:4, doff:4, fin:1, syn:1, rst:1, psh:1, ack:1, urg:1, ece:1, cwr:1;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+      __u16 doff:4, rsvd:4, cwr:1, ece:1, urg:1, ack:1, psh:1, rst:1, syn:1, fin:1;
+#else
+#error "Adjust your <asm/byteorder.h> defines"
+#endif
+    };
+  };
+  __be16 window;
+  __sum16 check;
+  __be16 urg_ptr;
+};
+
+_Static_assert(offsetof(struct tcphdr_with_flags16, flags16) == 12, "?");
+_Static_assert(sizeof(struct tcphdr_with_flags16) == sizeof(struct tcphdr), "struct tcphdr_with_flags16 ?!?");
+
 // Offsets from beginning of L4 (TCP/UDP) header
-#define TCP_OFFSET(field) offsetof(struct tcphdr, field)
+#define TCP_OFFSET(field) offsetof(struct tcphdr_with_flags16, field)
 #define UDP_OFFSET(field) offsetof(struct udphdr, field)
 
 // Offsets from beginning of L3 (IPv4) header
@@ -123,20 +150,37 @@ static long (*bpf_skb_change_head)(struct __sk_buff* skb, __u32 head_room,
 static long (*bpf_skb_adjust_room)(struct __sk_buff* skb, __s32 len_diff, __u32 mode,
                                    __u64 flags) = (void*)BPF_FUNC_skb_adjust_room;
 
+static struct bpf_sock *(*bpf_sk_lookup_tcp)(
+    void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns,
+    __u64 flags) = (void *)BPF_FUNC_sk_lookup_tcp;
+static struct bpf_sock *(*bpf_sk_lookup_udp)(
+    void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns,
+    __u64 flags) = (void *)BPF_FUNC_sk_lookup_udp;
+static int (*bpf_sk_release)(void *sock) = (void *)BPF_FUNC_sk_release;
+
+static int (*bpf_set_retval)(int retval) = (void *)BPF_FUNC_set_retval;
+
+static long (*bpf_sock_ops_cb_flags_set)(struct bpf_sock_ops *skops, int argval)
+    = (void *)BPF_FUNC_sock_ops_cb_flags_set;
+static long (*bpf_reserve_hdr_opt)(struct bpf_sock_ops *skops, __u32 space, __u64 flags)
+    = (void *)BPF_FUNC_reserve_hdr_opt;
+static long (*bpf_store_hdr_opt)(struct bpf_sock_ops *skops, const void *from, __u32 len, __u64 flags)
+    = (void *)BPF_FUNC_store_hdr_opt;
+
 // Android only supports little endian architectures
 #define htons(x) (__builtin_constant_p(x) ? ___constant_swab16(x) : __builtin_bswap16(x))
 #define htonl(x) (__builtin_constant_p(x) ? ___constant_swab32(x) : __builtin_bswap32(x))
 #define ntohs(x) htons(x)
 #define ntohl(x) htonl(x)
 
-static inline __always_inline __unused bool is_received_skb(struct __sk_buff* skb) {
+function __unused bool is_received_skb(struct __sk_buff* skb) {
     return skb->pkt_type == PACKET_HOST || skb->pkt_type == PACKET_BROADCAST ||
            skb->pkt_type == PACKET_MULTICAST;
 }
 
 // try to make the first 'len' header bytes readable/writable via direct packet access
 // (note: AFAIK there is no way to ask for only direct packet read without also getting write)
-static inline __always_inline void try_make_writable(struct __sk_buff* skb, unsigned len) {
+function void try_make_writable(struct __sk_buff* skb, unsigned len) {
     if (len > skb->len) len = skb->len;
     if (skb->data_end - skb->data < len) bpf_skb_pull_data(skb, len);
 }
@@ -175,9 +219,21 @@ struct updatetime_bool { bool updatetime; };
 #define NO_UPDATETIME ((struct updatetime_bool){ .updatetime = false })
 #define UPDATETIME ((struct updatetime_bool){ .updatetime = true })
 
+struct undo_bool { bool undo; };
+#define ACCOUNT ((struct undo_bool){ .undo = false })
+#define UNDO ((struct undo_bool){ .undo = true })
+
 // Return value for xt_bpf (netfilter match extension) programs
 static const int XTBPF_NOMATCH = 0;
 static const int XTBPF_MATCH = 1;
 
 static const int BPF_DISALLOW = 0;
 static const int BPF_ALLOW = 1;
+
+// implicitly depends on 'kver' variable
+#define bpf_disallow(v) ({ \
+    _Static_assert((v) > 0, "bpf_disallow: error code " #v " must be positive"); \
+    _Static_assert((v) < 1000, "bpf_disallow: error code " #v " too large"); \
+    if (KVER_IS_AT_LEAST(kver, 6, 1)) bpf_set_retval(-(v)); \
+    BPF_DISALLOW; \
+})

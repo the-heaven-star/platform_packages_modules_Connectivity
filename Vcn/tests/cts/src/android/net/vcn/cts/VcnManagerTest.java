@@ -1373,7 +1373,7 @@ public class VcnManagerTest extends VcnTestBase {
 
     private void setSafeModeTimeoutForCarrier(int subId, int timeoutSeconds) {
         final PersistableBundle carrierConfig = new PersistableBundle();
-        carrierConfig.putInt(VcnManager.VCN_SAFE_MODE_TIMEOUT_SECONDS_KEY, timeoutSeconds);
+        carrierConfig.putInt(VcnManager.KEY_SAFE_MODE_TIMEOUT_SEC_INT, timeoutSeconds);
         mCarrierConfigManager.overrideConfig(subId, carrierConfig);
     }
 
@@ -1389,13 +1389,12 @@ public class VcnManagerTest extends VcnTestBase {
         final int safeModeTimeoutSeconds = 5;
         final int gracePeriod = 5;
 
-        final PersistableBundle oldCarrierConfig = mCarrierConfigManager.getConfigForSubId(subId);
         setSafeModeTimeoutForCarrier(subId, safeModeTimeoutSeconds);
 
         verifyVcnSafeModeTimeoutOnTestNetwork(
                 subId, TimeUnit.SECONDS.toMillis(safeModeTimeoutSeconds + gracePeriod));
 
-        mCarrierConfigManager.overrideConfig(subId, oldCarrierConfig);
+        mCarrierConfigManager.overrideConfig(subId, null);
     }
 
     private void verifyEnterSafeModeImmediately(VcnConfig vcnConfig, boolean isSafeModeExpected)
@@ -1404,7 +1403,6 @@ public class VcnManagerTest extends VcnTestBase {
         final TestVcnStatusCallback callback = new TestVcnStatusCallback();
 
         // Override the safe mode timeout to be zero
-        final PersistableBundle oldCarrierConfig = mCarrierConfigManager.getConfigForSubId(subId);
         setSafeModeTimeoutForCarrier(subId, 0);
 
         try (TestNetworkWrapper testNetworkWrapper =
@@ -1431,7 +1429,7 @@ public class VcnManagerTest extends VcnTestBase {
         }
 
         // Reset Carrier Config
-        mCarrierConfigManager.overrideConfig(subId, oldCarrierConfig);
+        mCarrierConfigManager.overrideConfig(subId, null);
     }
 
     private VcnConfig newVcnConfig(boolean isSafeModeEnabled) {

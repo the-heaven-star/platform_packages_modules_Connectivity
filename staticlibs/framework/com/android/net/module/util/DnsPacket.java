@@ -20,6 +20,7 @@ import static android.net.DnsResolver.TYPE_A;
 import static android.net.DnsResolver.TYPE_AAAA;
 
 import static com.android.internal.annotations.VisibleForTesting.Visibility.PRIVATE;
+import static com.android.net.module.util.DnsHttpsPacket.TYPE_HTTPS;
 import static com.android.net.module.util.DnsPacketUtils.DnsRecordParser.domainNameToLabels;
 
 import android.annotation.IntDef;
@@ -55,7 +56,8 @@ public class DnsPacket {
      * Type of the canonical name for an alias. Refer to RFC 1035 section 3.2.2.
      */
     // TODO: Define the constant as a public constant in DnsResolver since it can never change.
-    private static final int TYPE_CNAME = 5;
+    public static final int TYPE_CNAME = 5;
+    public static final int TYPE_SOA = 6;
     public static final int TYPE_SVCB = 64;
 
     /**
@@ -326,12 +328,16 @@ public class DnsPacket {
             buf.position(oldPos);
             // Return a DnsRecord instance by default for backward compatibility, this is useful
             // when a partner supports new type of DnsRecord but does not inherit DnsRecord.
-            switch (nsType) {
-                case TYPE_SVCB:
-                    return new DnsSvcbRecord(rType, buf);
-                default:
-                    return new DnsRecord(rType, buf);
-            }
+            // TODO(b/454544870): remove the need for passing in rType to construct the record
+            return switch (nsType) {
+                case TYPE_SVCB ->
+                    new DnsSvcbRecord(rType, buf);
+                case TYPE_HTTPS ->
+                    // There is no data to parse if the record is in the question section.
+                    rType == QDSECTION ? new DnsRecord(rType, buf) : new DnsHttpsRecord(rType, buf);
+                default ->
+                    new DnsRecord(rType, buf);
+            };
         }
 
         /**
@@ -514,6 +520,13 @@ public class DnsPacket {
 
     protected final DnsHeader mHeader;
     protected final List<DnsRecord>[] mRecords;
+
+    /**
+     * Returns the DNS header.
+     */
+    public DnsHeader getHeader() {
+        return mHeader;
+    }
 
     /**
      * Returns the list of DNS records for a given section.

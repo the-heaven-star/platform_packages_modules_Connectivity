@@ -15,6 +15,8 @@
  */
 package android.net.cts
 
+import android.Manifest.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS
+import android.Manifest.permission.CREATE_APP_SPECIFIC_NETWORK
 import android.Manifest.permission.NEARBY_WIFI_DEVICES
 import android.Manifest.permission.NETWORK_SETTINGS
 import android.Manifest.permission.READ_PRIVILEGED_PHONE_STATE
@@ -54,6 +56,7 @@ import android.net.NetworkCapabilities.TRANSPORT_ETHERNET
 import android.net.NetworkCapabilities.TRANSPORT_TEST
 import android.net.NetworkCapabilities.TRANSPORT_VPN
 import android.net.NetworkCapabilities.TRANSPORT_WIFI
+import android.net.NetworkCapabilities.TRANSPORT_WIFI_AWARE
 import android.net.NetworkInfo
 import android.net.NetworkProvider
 import android.net.NetworkReleasedException
@@ -99,6 +102,7 @@ import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.telephony.data.EpsBearerQosSessionAttributes
 import android.util.ArraySet
+import android.util.Range
 import androidx.test.InstrumentationRegistry
 import com.android.compatibility.common.util.SystemUtil.runShellCommand
 import com.android.compatibility.common.util.SystemUtil.runWithShellPermissionIdentity
@@ -109,6 +113,7 @@ import com.android.net.module.util.NetworkStackConstants.ETHER_MTU
 import com.android.net.module.util.NetworkStackConstants.IPV6_HEADER_LEN
 import com.android.net.module.util.NetworkStackConstants.IPV6_PROTOCOL_OFFSET
 import com.android.net.module.util.NetworkStackConstants.UDP_HEADER_LEN
+import com.android.net.module.util.SdkUtil
 import com.android.testutils.CompatUtil
 import com.android.testutils.ConnectivityModuleTest
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo
@@ -162,7 +167,6 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 import org.junit.After
-import org.junit.Assume.assumeFalse
 import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
@@ -232,7 +236,6 @@ private val NEXTHOP = InetAddresses.parseNumericAddress("fe80::abcd")
 @DevSdkIgnoreRunner.RestoreDefaultNetwork
 // NetworkAgent is not updatable in R-, so this test does not need to be compatible with older
 // versions. NetworkAgent was also based on AsyncChannel before S so cannot be tested the same way.
-@IgnoreUpTo(Build.VERSION_CODES.R)
 @RunWith(DevSdkIgnoreRunner::class)
 class NetworkAgentTest {
     @get:Rule
@@ -359,9 +362,7 @@ class NetworkAgentTest {
         addCapability(NET_CAPABILITY_NOT_SUSPENDED)
         addCapability(NET_CAPABILITY_NOT_ROAMING)
         if (!transports.contains(TRANSPORT_VPN)) addCapability(NET_CAPABILITY_NOT_VPN)
-        if (SdkLevel.isAtLeastS()) {
-            addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
-        }
+        addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
         if (null != specifier) {
             setNetworkSpecifier(CompatUtil.makeEthernetNetworkSpecifier(specifier))
         }
@@ -920,7 +921,6 @@ class NetworkAgentTest {
             this != null && transports.all { hasTransport(it) }
 
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     fun testSetUnderlyingNetworksAndVpnSpecifier() {
         val mySessionId = "MySession12345"
         val request = NetworkRequest.Builder()
@@ -937,9 +937,7 @@ class NetworkAgentTest {
             addTransportType(TRANSPORT_VPN)
             removeCapability(NET_CAPABILITY_NOT_VPN)
             setTransportInfo(VpnTransportInfo(VpnManager.TYPE_VPN_SERVICE, mySessionId))
-            if (SdkLevel.isAtLeastS()) {
-                addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
-            }
+            addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
         }
         val defaultNetwork = mCM.activeNetwork
         assertNotNull(defaultNetwork)
@@ -1052,7 +1050,6 @@ class NetworkAgentTest {
     }
 
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     fun testAgentStartsInConnecting() {
         val mockContext = mock(Context::class.java)
         val mockCm = mock(ConnectivityManager::class.java)
@@ -1177,7 +1174,6 @@ class NetworkAgentTest {
     }
 
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     fun testSetLingerDuration() {
         // This test will create two networks and check that the one with the stronger
         // score wins out for a request that matches them both. And the weaker agent will
@@ -1255,7 +1251,6 @@ class NetworkAgentTest {
     }
 
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     fun testSetSubscriberId() {
         val imsi = UUID.randomUUID().toString()
         val config = NetworkAgentConfig.Builder().setSubscriberId(imsi).build()
@@ -1270,7 +1265,6 @@ class NetworkAgentTest {
     // TODO: Refactor helper functions to util class and move this test case to
     //  {@link android.net.cts.ConnectivityManagerTest}.
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     fun testRegisterBestMatchingNetworkCallback() {
         // Register best matching network callback with additional condition that will be
         // exercised later. This assumes the test network agent has NOT_VCN_MANAGED in it and
@@ -2300,5 +2294,77 @@ class NetworkAgentTest {
             vpnType = VpnManager.TYPE_VPN_LEGACY,
             expectFiltering = false
         )
+    }
+
+    fun doTestAppSpecificNetworkPermission(permission: String?) {
+        // TODO: Remove adoptShellPermissionIdentity() in setUp
+        instrumentation.getUiAutomation().dropShellPermissionIdentity()
+
+        val nc = NetworkCapabilities.Builder()
+                .addTransportType(TRANSPORT_WIFI_AWARE)
+                .addCapability(NET_CAPABILITY_NOT_RESTRICTED)
+                .setUids(null)
+                .build()
+        val agent = createNetworkAgent(initialNc = nc)
+
+        if (permission != null) {
+            runAsShell(permission) {
+                agent.register()
+            }
+        } else {
+            assertThrows(SecurityException::class.java) { agent.register() }
+            return
+        }
+        agent.markConnected()
+
+        val myUid = Process.myUid()
+        val expectedUids = setOf(Range(myUid, myUid))
+        val cb = TestableNetworkCallback()
+
+        // Acquire NETWORK_SETTINGS permission to receive uids in CapabilitiesChanged callback
+        runAsShell(NETWORK_SETTINGS) {
+            mCM.registerNetworkCallback(NetworkRequest.Builder().clearCapabilities().build(), cb)
+
+            // Uid is set and NOT_RESTRICTED is removed
+            cb.eventuallyExpect<CapabilitiesChanged> {
+                it.network == agent.network &&
+                        it.caps.uids!!.equals(expectedUids) &&
+                        !it.caps.hasCapability(NET_CAPABILITY_NOT_RESTRICTED)
+            }
+
+            // Attempt to change uid and make network non-restricted is ignored
+            nc.setSingleUid(myUid + 1)
+            nc.addCapability(NET_CAPABILITY_NOT_RESTRICTED)
+            agent.sendNetworkCapabilities(nc)
+            cb.assertNoCallback() {
+                it is CapabilitiesChanged && it.network == agent.network && (
+                        !it.caps.uids!!.equals(expectedUids) ||
+                        it.caps.hasCapability(NET_CAPABILITY_NOT_RESTRICTED))
+            }
+        }
+    }
+
+    @Test
+    fun testAppSpecificNetworkPermission_WithCreateAppSpecificNetworkPermission() {
+        // The CREATE_APP_SPECIFIC_NETWORK permission was introduced in the 25Q4 release. However,
+        // this was granted to the SHELL only in the 26Q2 release, so this test runs on 26Q2+.
+        // Testing in this way on 25Q4 would require adding the permission to the manifest,
+        // which would make it more difficult to test that the operation fails if the app does
+        // not have any of the necessary permissions.
+        assumeTrue(SdkUtil.isAtLeast26Q2())
+        doTestAppSpecificNetworkPermission(CREATE_APP_SPECIFIC_NETWORK)
+    }
+
+    @Test
+    fun testAppSpecificNetworkPermission_WithUseRestrictedNetworksPermission() {
+        // The USE_RESTRICTED_NETWORKS permission allowed creating app-specific networks only on
+        // 25Q2.
+        assumeTrue(!SdkUtil.isAtLeast25Q4() && SdkLevel.isAtLeastB())
+        doTestAppSpecificNetworkPermission(CONNECTIVITY_USE_RESTRICTED_NETWORKS)
+    }
+
+    @Test
+    fun testAppSpecificNetworkPermission_WithoutPermission() {
+        doTestAppSpecificNetworkPermission(permission = null)
     }
 }

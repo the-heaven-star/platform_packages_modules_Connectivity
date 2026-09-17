@@ -19,9 +19,12 @@ package com.android.server.vcn;
 import static android.net.IpSecManager.IpSecTunnelInterface;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_DUN;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_CONGESTED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED;
 import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
 import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
 import static android.net.vcn.VcnGatewayConnectionConfig.VCN_GATEWAY_OPTION_ENABLE_DATA_STALL_RECOVERY_WITH_MOBILITY;
@@ -135,6 +138,9 @@ public class VcnGatewayConnectionTest extends VcnGatewayConnectionTestBase {
         capBuilder.addCapability(NET_CAPABILITY_NOT_VCN_MANAGED);
         capBuilder.addCapability(NET_CAPABILITY_NOT_METERED);
         capBuilder.addCapability(NET_CAPABILITY_NOT_ROAMING);
+        capBuilder.addCapability(NET_CAPABILITY_NOT_CONGESTED);
+        capBuilder.addCapability(NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED);
+        capBuilder.addCapability(NET_CAPABILITY_TEMPORARILY_NOT_METERED);
 
         if (transportType == TRANSPORT_WIFI) {
             capBuilder.setTransportInfo(mWifiInfo);
@@ -379,7 +385,7 @@ public class VcnGatewayConnectionTest extends VcnGatewayConnectionTestBase {
         final PersistableBundleWrapper carrierConfig = mock(PersistableBundleWrapper.class);
         doReturn(carrierConfigTimeoutSeconds)
                 .when(carrierConfig)
-                .getInt(eq(VcnManager.VCN_SAFE_MODE_TIMEOUT_SECONDS_KEY), anyInt());
+                .getInt(eq(VcnManager.KEY_SAFE_MODE_TIMEOUT_SEC_INT), anyInt());
 
         verifyGetSafeModeTimeoutMs(
                 false /* isInTestMode */,
@@ -401,7 +407,7 @@ public class VcnGatewayConnectionTest extends VcnGatewayConnectionTestBase {
         final PersistableBundleWrapper carrierConfig = mock(PersistableBundleWrapper.class);
         doReturn(carrierConfigTimeoutSeconds)
                 .when(carrierConfig)
-                .getInt(eq(VcnManager.VCN_SAFE_MODE_TIMEOUT_SECONDS_KEY), anyInt());
+                .getInt(eq(VcnManager.KEY_SAFE_MODE_TIMEOUT_SEC_INT), anyInt());
 
         verifyGetSafeModeTimeoutMs(
                 true /* isInTestMode */,

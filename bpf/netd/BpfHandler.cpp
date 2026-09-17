@@ -21,17 +21,21 @@
 #include <linux/bpf.h>
 #include <inttypes.h>
 
+#include <android-base/result.h>
 #include <android-base/unique_fd.h>
 #include <bpf/WaitForProgsLoaded.h>
 #include <log/log.h>
-#include <netdutils/UidConstants.h>
 #include <private/android_filesystem_config.h>
 
 #include "BpfSyscallWrappers.h"
+#include "bpf/BpfUtils.h"
+#include "internal_net_api.h"
 
 namespace android {
 namespace net {
 
+using base::Error;
+using base::Result;
 using base::unique_fd;
 using base::WaitForProperty;
 using bpf::getSocketCookie;
@@ -40,10 +44,12 @@ using bpf::isAtLeastT;
 using bpf::isAtLeastU;
 using bpf::isAtLeastV;
 using bpf::isAtLeast25Q2;
+using bpf::isAtLeast26Q2;
+using bpf::isKernel64Bit;
+using bpf::isUser;
+using bpf::isUserspace64bit;
 using bpf::queryProgram;
 using bpf::retrieveProgram;
-using netdutils::Status;
-using netdutils::statusFromErrno;
 
 constexpr int PER_UID_STATS_ENTRIES_LIMIT = 500;
 // At most 90% of the stats map may be used by tagged traffic entries. This ensures
@@ -55,39 +61,66 @@ constexpr int TOTAL_UID_STATS_ENTRIES_LIMIT = STATS_MAP_SIZE * 0.9;
 static_assert(STATS_MAP_SIZE - TOTAL_UID_STATS_ENTRIES_LIMIT > 100,
               "The limit for stats map is to high, stats data may be lost due to overflow");
 
-static Status attachProgramToCgroup(const char* programPath, const unique_fd& cgroupFd,
-                                    bpf_attach_type type) {
+#define RETURN_IF_NOT_OK(expr) \
+    if (auto _res = (expr); !_res.ok()) return _res.error();
+
+static Result<void> attachProgramToCgroup(const char* programPath, const unique_fd& cgroupFd,
+                                          bpf_attach_type type) {
     unique_fd cgroupProg(retrieveProgram(programPath));
     if (!cgroupProg.ok()) {
-        return statusFromErrno(errno, fmt::format("Failed to get program from {}", programPath));
+        return Error(errno) << "Failed to get program from " << programPath;
     }
     if (bpf::attachProgram(type, cgroupProg, cgroupFd)) {
-        return statusFromErrno(errno, fmt::format("Program {} attach failed", programPath));
+        return Error(errno) << "Program " << programPath << " attach failed";
     }
-    return netdutils::status::ok;
+    return {};
 }
 
-static Status checkProgramAccessible(const char* programPath) {
+static Result<void> checkProgramAccessible(const char* programPath) {
     unique_fd prog(retrieveProgram(programPath));
     if (!prog.ok()) {
-        return statusFromErrno(errno, fmt::format("Failed to get program from {}", programPath));
+        return Error(errno) << "Failed to get program from " << programPath;
     }
-    return netdutils::status::ok;
+    return {};
 }
 
-static Status initPrograms(const char* cg2_path) {
-    if (!cg2_path) return Status("cg2_path is NULL");
+static void getsockoptTest() {
+    // getsockopt bpf hook is not called if the device is running in compat mode.
+    if (isKernel64Bit() != isUserspace64bit() && !isAtLeastKernelVersion(6, 13)) return;
+
+    // SO_ANDROID_DROP_REASON option is only supported on 5.10+.
+    if (!isAtLeastKernelVersion(5, 10)) return;
+
+    base::unique_fd sock(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    if (!sock.ok()) abort();
+
+    uint64_t reason = 0xDEADC0DEDEADBEEFuLL; // should be overwritten by getsockopt()
+    socklen_t len = sizeof(reason);
+    if (getsockopt(sock, SOL_SOCKET, SO_ANDROID_DROP_REASON, &reason, &len) != 0) abort();
+    if (reason != DROP_REASON_NONE) abort();
+
+    // This option expects an 8 byte buffer. Passing a smaller buffer (7 bytes)
+    // should trigger a size check failure in the eBPF program (netd.c).
+    len = sizeof(reason) - 1;
+    int expected = isAtLeastKernelVersion(6, 1) ? EINVAL : EPERM;
+    errno = 0;
+    if (getsockopt(sock, SOL_SOCKET, SO_ANDROID_DROP_REASON, &reason, &len) == 0) abort();
+    if (errno != expected) abort();
+}
+
+static Result<void> initPrograms(const char* cg2_path) {
+    if (!cg2_path) return Error() << "cg2_path is NULL";
 
     // This code was mainlined in T, so this should be trivially satisfied.
-    if (!isAtLeastT) return Status("S- platform is unsupported");
+    if (!isAtLeastT) return Error() << "S- platform is unsupported";
 
     // U mandates this mount point (though it should also be the case on T)
     if (isAtLeastU && !!strcmp(cg2_path, "/sys/fs/cgroup")) {
-        return Status("U+ platform with cg2_path != /sys/fs/cgroup is unsupported");
+        return Error() << "U+ platform with cg2_path != /sys/fs/cgroup is unsupported";
     }
 
     unique_fd cg_fd(open(cg2_path, O_DIRECTORY | O_RDONLY | O_CLOEXEC));
-    if (!cg_fd.ok()) return statusFromErrno(errno, "Opening cgroup dir failed");
+    if (!cg_fd.ok()) return Error(errno) << "Opening cgroup dir failed";
 
     RETURN_IF_NOT_OK(checkProgramAccessible(XT_BPF_ALLOWLIST_PROG_PATH));
     RETURN_IF_NOT_OK(checkProgramAccessible(XT_BPF_DENYLIST_PROG_PATH));
@@ -134,6 +167,14 @@ static Status initPrograms(const char* cg2_path) {
                                         cg_fd, BPF_CGROUP_GETSOCKOPT));
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_SETSOCKOPT_PROG_PATH,
                                         cg_fd, BPF_CGROUP_SETSOCKOPT));
+            getsockoptTest();
+        }
+    }
+
+    if (isAtLeast26Q2) {
+        if (isAtLeastKernelVersion(6, 1) && !isAtLeastKernelVersion(6, 18)) {
+            RETURN_IF_NOT_OK(attachProgramToCgroup(L4S_OPTIONS_SOCKOPS_PROG_PATH,
+                                        cg_fd, BPF_CGROUP_SOCK_OPS));
         }
     }
 
@@ -174,7 +215,13 @@ static Status initPrograms(const char* cg2_path) {
         }
     }
 
-    return netdutils::status::ok;
+    if (isAtLeast26Q2) {
+        if (isAtLeastKernelVersion(6, 1) && !isAtLeastKernelVersion(6, 18)) {
+            if (queryProgram(cg_fd, BPF_CGROUP_SOCK_OPS) <= 0) abort();
+        }
+    }
+
+    return {};
 }
 
 BpfHandler::BpfHandler()
@@ -237,7 +284,7 @@ static inline void waitForBpf() {
     ALOGI("BPF programs are loaded");
 }
 
-Status BpfHandler::init(const char* cg2_path) {
+Result<void> BpfHandler::init(const char* cg2_path) {
     // This wait is effectively a no-op on U QPR3+ devices (as netd starts
     // *after* the synchronous 'exec_start bpfloader' which calls NetBpfLoad)
     // but checking for U QPR3 is hard.
@@ -262,18 +309,137 @@ Status BpfHandler::init(const char* cg2_path) {
         // so this should be a no-op, and thus just succeed.
         // make sure it isn't lowered in platform netd.rc...
         if (setrlimit(RLIMIT_MEMLOCK, &limit))
-            return statusFromErrno(errno, "Failed to set 1GiB RLIMIT_MEMLOCK");
+            return Error(errno) << "Failed to set 1GiB RLIMIT_MEMLOCK";
 
         // Make sure netd can create & write maps.  sepolicy is V+, but enough to enforce on 25Q2+
         int key = 1;
         int value = 123;
         unique_fd map(bpf::createMap(BPF_MAP_TYPE_ARRAY, sizeof(key), sizeof(value), 2, 0));
-        if (!map.ok()) return statusFromErrno(errno, fmt::format("map create failed"));
+        if (!map.ok()) return Error(errno) << "map create failed";
         int rv = bpf::writeToMapEntry(map, &key, &value, BPF_ANY);
-        if (rv) return statusFromErrno(errno, fmt::format("map write failed (rv={})", rv));
+        if (rv) return Error(errno) << "map write failed (rv=" << rv << ")";
     }
 
-    return netdutils::status::ok;
+    if (isAtLeast26Q2) {
+        // Bring up loopback interface first
+        unique_fd sock(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+        if (!sock.ok()) return Error(errno) << "socket6udp";
+
+        struct ifreq ifr = {
+            .ifr_name = "lo",
+        };
+        // due to sepolicy this cannot be a unix/dgram nor ipv6/tcp socket
+        if (ioctl(sock.get(), SIOCGIFFLAGS, &ifr)) return Error(errno) << "SIOCGIFFLAGS";
+
+        if (ifr.ifr_flags & IFF_UP) {
+            // Nothing to be done, already up.
+        } else {
+            ifr.ifr_flags |= IFF_UP;
+            if (ioctl(sock.get(), SIOCSIFFLAGS, &ifr)) return Error(errno) << "SIOCSIFFLAGS";
+        }
+    }
+
+    if (isAtLeast26Q2) {
+        // Simple boot time self test that verifies that loopback ip/tcp works
+        // (this triggers at least bpf cgroup inet_create/ingress/egress/inet_release hooks)
+
+        unique_fd server(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        if (!server.ok()) return Error(errno) << "socket6tcp";
+
+        struct sockaddr_in6 addr6 = {
+            .sin6_family = AF_INET6,
+        };
+        if (bind(server.get(), (struct sockaddr*)&addr6, sizeof(addr6)))
+            return Error(errno) << "bind";
+
+        if (listen(server.get(), 1)) return Error(errno) << "listen";
+
+        socklen_t addr6_len = sizeof(addr6);
+        if (getsockname(server.get(), (struct sockaddr*)&addr6, &addr6_len))
+            return Error(errno) << "getsockname";
+        if (addr6_len != sizeof(addr6)) return Error() << "addr6_len";
+
+        unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        if (!client.ok()) return Error(errno) << "socket4tcp";
+
+        if (isKernel64Bit() == isUserspace64bit()
+            && isAtLeastKernelVersion(6, 1) && !isAtLeastKernelVersion(6, 18)) {
+            {
+                bool b = false;
+                socklen_t len = sizeof(b);
+                if (getsockopt(server.get(), SOL_TCP, TCP_ANDROID_L4S, &b, &len)) return Error(errno) << "gs-s1";
+                if (len != sizeof(b)) return Error(errno) << "gs-s-len1";
+                if (!b) return Error(errno) << "gs-s-off1";
+            }
+            {
+                bool b = false;
+                socklen_t len = sizeof(b);
+                if (getsockopt(client.get(), SOL_TCP, TCP_ANDROID_L4S, &b, &len)) return Error(errno) << "gs-c1";
+                if (len != sizeof(b)) return Error(errno) << "gs-c-len1";
+                if (!b) return Error(errno) << "gs-c-off1";
+            }
+            {
+                const bool off = false;
+                if (setsockopt(server.get(), SOL_TCP, TCP_ANDROID_L4S, &off, sizeof(off))) return Error(errno) << "ss-s2";
+                if (setsockopt(client.get(), SOL_TCP, TCP_ANDROID_L4S, &off, sizeof(off))) return Error(errno) << "ss-c2";
+            }
+            {
+                bool b = true;
+                socklen_t len = sizeof(b);
+                if (getsockopt(server.get(), SOL_TCP, TCP_ANDROID_L4S, &b, &len)) return Error(errno) << "gs-s3";
+                if (len != sizeof(b)) return Error(errno) << "gs-s-len3";
+                if (b) return Error(errno) << "gs-s-on3";
+            }
+            {
+                bool b = true;
+                socklen_t len = sizeof(b);
+                if (getsockopt(client.get(), SOL_TCP, TCP_ANDROID_L4S, &b, &len)) return Error(errno) << "gs-c3";
+                if (len != sizeof(b)) return Error(errno) << "gs-c-len3";
+                if (b) return Error(errno) << "gs-c-on3";
+            }
+            {
+                const bool on = true;
+                if (setsockopt(server.get(), SOL_TCP, TCP_ANDROID_L4S, &on, sizeof(on))) return Error(errno) << "ss-s4";
+                if (setsockopt(client.get(), SOL_TCP, TCP_ANDROID_L4S, &on, sizeof(on))) return Error(errno) << "ss-c4";
+            }
+            {
+                bool b = false;
+                socklen_t len = sizeof(b);
+                if (getsockopt(server.get(), SOL_TCP, TCP_ANDROID_L4S, &b, &len)) return Error(errno) << "gs-s5";
+                if (len != sizeof(b)) return Error(errno) << "gs-s-len5";
+                if (!b) return Error(errno) << "gs-s-off5";
+            }
+            {
+                bool b = false;
+                socklen_t len = sizeof(b);
+                if (getsockopt(client.get(), SOL_TCP, TCP_ANDROID_L4S, &b, &len)) return Error(errno) << "gs-c5";
+                if (len != sizeof(b)) return Error(errno) << "gs-c-len5";
+                if (!b) return Error(errno) << "gs-c-off5";
+            }
+        }
+
+        struct sockaddr_in addr4 = {
+            .sin_family = AF_INET,
+            .sin_port = addr6.sin6_port,
+        };
+        if (connect(client.get(), (struct sockaddr*)&addr4, sizeof(addr4)))
+            return Error(errno) << "connect";  // fails with ENETUNREACH if 'lo' is down
+
+        unique_fd peer(accept4(server.get(), NULL, NULL, SOCK_CLOEXEC));
+        if (!peer.ok()) return Error(errno) << "accept";
+
+        char snd = '@';
+        if (write(client.get(), &snd, sizeof(snd)) != 1) return Error(errno) << "write";
+
+        char rcv = 0;
+        if (read(peer.get(), &rcv, sizeof(rcv)) != 1) return Error(errno) << "read";
+
+        if (rcv != snd) return Error() << "wrong";
+
+        // all 3 sockets are closed automatically
+    }
+
+    return {};
 }
 
 static void mapLockTest(void) {
@@ -297,29 +463,48 @@ static void mapLockTest(void) {
     unique_fd fd9(bpf::mapRetrieveWO(m1));          if (!fd9.ok()) abort();  // grabs exclusive lock
 }
 
-Status BpfHandler::initMaps() {
+Result<void> BpfHandler::initMaps() {
     // bpfLock() requires bpfGetFdMapId which is only available on 4.14+ kernels.
-    if (isAtLeastKernelVersion(4, 14)) {
-        mapLockTest();
-    }
+    if (bpf::lockingEnabled && isAtLeastKernelVersion(4, 14)) mapLockTest();
 
     RETURN_IF_NOT_OK(mStatsMapA.init(STATS_MAP_A_PATH));
     RETURN_IF_NOT_OK(mStatsMapB.init(STATS_MAP_B_PATH));
     RETURN_IF_NOT_OK(mConfigurationMap.init(CONFIGURATION_MAP_PATH));
+    RETURN_IF_NOT_OK(mUidMigrationEnabledMap.init(UID_MIGRATION_ENABLED_MAP_PATH));
+    RETURN_IF_NOT_OK(mUidPermissionChunkMap.init(UID_PERMISSION_CHUNK_MAP_PATH));
     RETURN_IF_NOT_OK(mUidPermissionMap.init(UID_PERMISSION_MAP_PATH));
+    RETURN_IF_NOT_OK(mNetdPidMap.init(NETD_PID_MAP_PATH));
     // initialized last so mCookieTagMap.isValid() implies everything else is valid too
     RETURN_IF_NOT_OK(mCookieTagMap.init(COOKIE_TAG_MAP_PATH));
 
-    return netdutils::status::ok;
+    const uint32_t zero = 0;
+    const uint32_t my_pid = getpid();
+    RETURN_IF_NOT_OK(mNetdPidMap.writeValue(zero, my_pid, BPF_ANY));
+
+    return {};
 }
 
 bool BpfHandler::hasUpdateDeviceStatsPermission(uid_t uid) {
     // This implementation is the same logic as method ActivityManager#checkComponentPermission.
-    // It implies that the real uid can never be the same as PER_USER_RANGE.
-    uint32_t appId = uid % PER_USER_RANGE;
-    auto permission = mUidPermissionMap.readValue(appId);
-    if (permission.ok() && (permission.value() & BPF_PERMISSION_UPDATE_DEVICE_STATS)) {
-        return true;
+    // It implies that real uid can never be same as AID_USER_OFFSET == PER_USER_RANGE == 100000
+    uint32_t appId = uid % AID_USER_OFFSET;
+    uint32_t mapKey = 0;
+    auto isUidMigrationEnabled = mUidMigrationEnabledMap.readValue(mapKey);
+    if (isUidMigrationEnabled.ok() && isUidMigrationEnabled.value()) {
+        uint32_t chunkId = uid / CHUNK_UID_COUNT;
+        uint32_t index = uid / UIDS_PER_INT64 % CHUNK_INT64_COUNT;
+        int shift = (uid % UIDS_PER_INT64 * PERMISSION_COUNT) & 63;
+        auto chunk = mUidPermissionChunkMap.readValue(chunkId);
+        if (chunk.ok() && (chunk.value().block[index] >> shift) &
+                              PERMISSION_BIT_UPDATE_DEVICE_STATS) {
+            return true;
+        }
+    } else {
+        auto permission = mUidPermissionMap.readValue(appId);
+        if (permission.ok() &&
+            (permission.value() & BPF_PERMISSION_UPDATE_DEVICE_STATS)) {
+            return true;
+        }
     }
     return ((appId == AID_ROOT) || (appId == AID_SYSTEM) || (appId == AID_DNS));
 }
@@ -377,7 +562,7 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
     auto configuration = mConfigurationMap.readValue(CURRENT_STATS_MAP_CONFIGURATION_KEY);
     if (!configuration.ok()) {
         ALOGE("Failed to get current configuration: %s",
-              strerror(configuration.error().code()));
+              configuration.error().message().c_str());
         return -configuration.error().code();
     }
     if (configuration.value() != SELECT_MAP_A && configuration.value() != SELECT_MAP_B) {
@@ -395,7 +580,7 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
     // the request to prevent the map from overflow. Note though that it isn't really
     // safe here to iterate over the map since it might be modified by the system server,
     // which might toggle the live stats map and clean it.
-    base::Result<void> res = currentMap.forAll(
+    Result<void> res = currentMap.forAll(
         [chargeUid, &totalEntryCount, &perUidEntryCount](const StatsKey& key) {
             if (key.uid == chargeUid) perUidEntryCount++;
             totalEntryCount++;
@@ -403,7 +588,7 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
     );
     if (!res.ok()) {
         ALOGE("Failed to count the stats entry in map: %s",
-              strerror(res.error().code()));
+              res.error().message().c_str());
         return -res.error().code();
     }
 
@@ -422,7 +607,7 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
     UidTagValue newKey = {.uid = (uint32_t)chargeUid, .tag = tag};
     res = mCookieTagMap.writeValue(sock_cookie, newKey, BPF_ANY);
     if (!res.ok()) {
-        ALOGE("Failed to tag the socket: %s", strerror(res.error().code()));
+        ALOGE("Failed to tag the socket: %s", res.error().message().c_str());
         return -res.error().code();
     }
     ALOGV("Socket with cookie %" PRIu64 " tagged successfully with tag %" PRIu32 " uid %u "
@@ -435,10 +620,10 @@ int BpfHandler::untagSocket(int sockFd) {
     if (!sock_cookie) return -errno;
 
     if (!mCookieTagMap.isValid()) return -EPERM;
-    base::Result<void> res = mCookieTagMap.deleteValue(sock_cookie);
+    Result<void> res = mCookieTagMap.deleteValue(sock_cookie);
     if (!res.ok()) {
         const int err = res.error().code();
-        if (err != ENOENT) ALOGE("Failed to untag socket: %s", strerror(err));
+        if (err != ENOENT) ALOGE("Failed to untag socket: %s", res.error().message().c_str());
         return -err;
     }
     ALOGV("Socket with cookie %" PRIu64 " untagged successfully.", sock_cookie);

@@ -29,7 +29,7 @@ android_test {
         "mts-tethering",
     ],
     static_libs: [
-        "android.net.vcn.flags-aconfig-java-export",
+        "android.net.vcn.flags-aconfig-java",
         "androidx.test.rules",
         "frameworks-base-testutils",
         "framework-protos",
@@ -41,6 +41,7 @@ android_test {
         "service-connectivity-tiramisu-pre-jarjar",
         "flag-junit",
     ],
+    jarjar_rules: "jarjar-rules.txt",
     libs: [
         "android.test.runner.stubs",
         "android.test.base.stubs",

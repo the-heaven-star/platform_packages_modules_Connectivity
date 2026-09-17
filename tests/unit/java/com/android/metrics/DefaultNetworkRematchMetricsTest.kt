@@ -21,6 +21,7 @@ import android.net.NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL
 import android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED
 import android.net.NetworkCapabilities.NET_CAPABILITY_PARTIAL_CONNECTIVITY
 import android.net.NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED
+import android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS
 import android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED
 import android.net.NetworkCapabilities.TRANSPORT_SATELLITE
 import android.net.UidRange
@@ -35,7 +36,7 @@ import android.stats.connectivity.ValidatedState.VS_VALID
 import com.android.metrics.DefaultNetworkRematchMetrics.Dependencies
 import com.android.server.ConnectivityService
 import com.android.server.ConnectivityService.PREFERENCE_ORDER_NONE
-import com.android.server.ConnectivityService.PREFERENCE_ORDER_SATELLITE_FALLBACK
+import com.android.server.ConnectivityService.PREFERENCE_ORDER_APP_OPT_IN
 import com.android.server.connectivity.FullScore
 import com.android.server.connectivity.NetworkAgentInfo
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo
@@ -82,7 +83,7 @@ class DefaultNetworkRematchMetricsTest {
     }
 
     private val nri = mock(ConnectivityService.NetworkRequestInfo::class.java).also {
-                doReturn(PREFERENCE_ORDER_SATELLITE_FALLBACK).`when`(it).preferenceOrderForNetd
+                doReturn(PREFERENCE_ORDER_APP_OPT_IN).`when`(it).preferenceOrderForNetd
                 doReturn(emptySet<UidRange>()).`when`(it).uids
             }
 
@@ -248,5 +249,19 @@ class DefaultNetworkRematchMetricsTest {
         assertEquals(capsInternal, description.capabilities)
         assertEquals(scorePoliciesInternal, description.scorePolicies)
         assertEquals(enterpriseIds, description.enterpriseId)
+    }
+
+    @Test
+    fun testAddEvent_fromUnifiedCommunications_isAdded() {
+        val unifiedCommsCaps = mock(NetworkCapabilities::class.java)
+        doReturn(false).`when`(unifiedCommsCaps).hasTransport(TRANSPORT_SATELLITE)
+        doReturn(true).`when`(unifiedCommsCaps).hasCapability(
+                NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS)
+        doReturn(unifiedCommsCaps).`when`(oldNai).capsNoCopy
+
+        metrics.addEvent(nri, oldNai, newNai, 0L)
+        metrics.writeStatsAndClear()
+
+        verify(deps, times(1)).writeStats(anyLong(), anyInt(), any())
     }
 }

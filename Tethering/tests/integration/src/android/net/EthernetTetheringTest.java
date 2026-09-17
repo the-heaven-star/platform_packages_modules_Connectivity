@@ -629,9 +629,7 @@ public class EthernetTetheringTest extends EthernetTetheringTestBase {
         // TODO: test CLAT bpf maps.
     }
 
-    // TODO: support R device. See b/234727688.
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     public void testTetherClatUdp() throws Exception {
         runClatUdpTest();
     }
@@ -665,9 +663,7 @@ public class EthernetTetheringTest extends EthernetTetheringTestBase {
         });
     }
 
-    // TODO: support R device. See b/234727688.
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     public void testTetherClatIcmp() throws Exception {
         // CLAT only starts on IPv6 only network.
         final TetheringTester tester = initTetheringTester(toList(TEST_IP6_ADDR),
@@ -816,9 +812,7 @@ public class EthernetTetheringTest extends EthernetTetheringTestBase {
                 tester, false /* isClat */);
     }
 
-    // TODO: support R device. See b/234727688.
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     public void testTetherClatTcp() throws Exception {
         // CLAT only starts on IPv6 only network.
         final TetheringTester tester = initTetheringTester(toList(TEST_IP6_ADDR),
@@ -940,9 +934,15 @@ public class EthernetTetheringTest extends EthernetTetheringTestBase {
         final HashMap<K, V> map = new HashMap<>();
 
         for (final String line : rawMapStr.split(LINE_DELIMITER)) {
-            final Pair<K, V> rule =
-                    BpfDump.fromBase64EncodedString(keyClass, valueClass, line.trim());
-            map.put(rule.first, rule.second);
+            String trimmedLine = line.trim();
+
+            try {
+                final Pair<K, V> rule =
+                        BpfDump.fromBase64EncodedString(keyClass, valueClass, trimmedLine);
+                map.put(rule.first, rule.second);
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "Failed to parse line: " + trimmedLine, e);
+            }
         }
         return map;
     }
@@ -1069,16 +1069,6 @@ public class EthernetTetheringTest extends EthernetTetheringTestBase {
         assertEquals(0, statsValue.txErrors);
     }
 
-    // on S/Sv2 without a new enough DnsResolver apex, NetBpfLoad does not
-    // get triggered, and thus no mainline programs get loaded.
-    private boolean isNetBpfLoadEnabled() {
-        if (SdkLevel.isAtLeastT()) return true;
-        if (!SdkLevel.isAtLeastS()) return false;
-
-        File f = new File("/apex/com.android.resolv/NetBpfLoad-S.flag");
-        return f.isFile();
-    }
-
     /**
      * BPF offload IPv4 UDP tethering test. Verify that UDP tethered packets are offloaded by BPF.
      * Minimum test requirement:
@@ -1089,11 +1079,9 @@ public class EthernetTetheringTest extends EthernetTetheringTestBase {
      * TODO: consider enabling the test even tethering config disables BPF offload. See b/238288883
      */
     @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     public void testTetherBpfOffloadUdpV4() throws Exception {
         assumeTrue("Tethering config disabled BPF offload", isTetherConfigBpfOffloadEnabled());
         assumeKernelSupportBpfOffloadUdpV4();
-        assumeTrue("Mainline NetBpfLoad not available", isNetBpfLoadEnabled());
 
         runUdp4Test();
     }

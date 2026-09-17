@@ -269,4 +269,6 @@ interface IConnectivityManager
 
     oneway void registerQuicConnectionClosePayload(in ParcelFileDescriptor pfd, in byte[] payload);
     oneway void unregisterQuicConnectionClosePayload(in ParcelFileDescriptor pfd);
+    void onOttCallStateChanged(int uid, boolean isAdded);
+    void allowLocalNetAccess(int uid, int ifIndex, in List<String> addresses);
 }

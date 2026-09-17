@@ -19,11 +19,15 @@ package com.android.server.connectivity.mdns;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.nsd.DiscoveryRequest;
 import android.os.Parcel;
 import android.os.Parcelable;
+import android.os.PatternMatcher;
 import android.text.TextUtils;
 
 import com.android.net.module.util.ByteUtils;
+import com.android.net.module.util.HexDump;
 
 import java.nio.charset.Charset;
 import java.time.Instant;
@@ -42,6 +46,7 @@ import java.util.TreeMap;
 public class MdnsServiceInfo implements Parcelable {
     private static final Charset US_ASCII = Charset.forName("us-ascii");
     private static final Charset UTF_8 = Charset.forName("utf-8");
+    private static final String ATTRIBUTE_MATCHER_HEX_PREFIX = "0x";
 
     /** @hide */
     public static final Parcelable.Creator<MdnsServiceInfo> CREATOR =
@@ -60,7 +65,8 @@ public class MdnsServiceInfo implements Parcelable {
                             source.createTypedArrayList(TextEntry.CREATOR),
                             source.readInt(),
                             source.readParcelable(Network.class.getClassLoader()),
-                            Instant.ofEpochSecond(source.readLong()));
+                            Instant.ofEpochSecond(source.readLong()),
+                            source.readLong());
                 }
 
                 @Override
@@ -89,6 +95,8 @@ public class MdnsServiceInfo implements Parcelable {
     @NonNull
     private final Instant expirationTime;
 
+    private final long mCreationCapabilitiesBits;
+
     /**
      * Constructs a {@link MdnsServiceInfo} object with default values.
      *
@@ -115,7 +123,8 @@ public class MdnsServiceInfo implements Parcelable {
                 textEntries,
                 interfaceIndex,
                 /* network= */ null,
-                /* expirationTime= */ Instant.MAX);
+                /* expirationTime= */ Instant.MAX,
+                0L /* cachedCapabilitiesBits */);
     }
 
     /**
@@ -134,7 +143,8 @@ public class MdnsServiceInfo implements Parcelable {
             @Nullable List<TextEntry> textEntries,
             int interfaceIndex,
             @Nullable Network network,
-            @NonNull Instant expirationTime) {
+            @NonNull Instant expirationTime,
+            long creationCapabilitiesBits) {
         this.serviceInstanceName = serviceInstanceName;
         this.serviceType = serviceType;
         this.subtypes = new ArrayList<>();
@@ -162,6 +172,7 @@ public class MdnsServiceInfo implements Parcelable {
         this.interfaceIndex = interfaceIndex;
         this.network = network;
         this.expirationTime = Instant.ofEpochSecond(expirationTime.getEpochSecond());
+        this.mCreationCapabilitiesBits = creationCapabilitiesBits;
     }
 
     /** Returns the name of this service instance. */
@@ -259,6 +270,16 @@ public class MdnsServiceInfo implements Parcelable {
     }
 
     /**
+     * Returns a snapshot of the NetworkCapabilities bits at creation time. This value is not
+     * updated, so mutable capabilities (e.g., VALIDATED) may become stale.
+     *
+     * @see NetworkCapabilities
+     */
+    public long getCreationCapabilitiesBits() {
+        return mCreationCapabilitiesBits;
+    }
+
+    /**
      * Returns attribute value for {@code key} as a UTF-8 string. It's the caller who must make sure
      * that the value of {@code key} is indeed a UTF-8 string. {@code null} will be returned if no
      * attribute value exists for {@code key}.
@@ -291,6 +312,35 @@ public class MdnsServiceInfo implements Parcelable {
         return Collections.unmodifiableMap(map);
     }
 
+    /**
+     * Check if an attribute matches a filter as per {@link DiscoveryRequest#getAttributeFilters()}.
+     */
+    public boolean attributeMatches(@Nullable String key, @Nullable PatternMatcher matcher) {
+        if (key == null) {
+            // Filtering on null keys does not make sense; just fail to match.
+            return false;
+        }
+        if (matcher == null) {
+            // As per DiscoveryRequest.Builder#setAttributeFilters, if the matcher is null, the
+            // corresponding attribute is expected to be a boolean attribute with no value as per
+            // RFC6763 6.4.
+            return attributes.containsKey(key) && attributes.get(key) == null;
+        }
+        final byte[] attr = attributes.get(key);
+        if (attr == null) {
+            return false;
+        }
+        // As per DiscoveryRequest.Builder#setAttributeFilters, if the pattern starts with the
+        // hex prefix, matching is done on uppercase hexadecimal.
+        if (matcher.getPath().startsWith(ATTRIBUTE_MATCHER_HEX_PREFIX)) {
+            final PatternMatcher hexMatcher = new PatternMatcher(
+                    matcher.getPath().substring(ATTRIBUTE_MATCHER_HEX_PREFIX.length()),
+                    matcher.getType());
+            return hexMatcher.match(HexDump.toHexString(attr, /* upperCase= */true));
+        }
+        return matcher.match(new String(attr, UTF_8));
+    }
+
     @Override
     public int describeContents() {
         return 0;
@@ -309,6 +359,7 @@ public class MdnsServiceInfo implements Parcelable {
         out.writeInt(interfaceIndex);
         out.writeParcelable(network, 0);
         out.writeLong(expirationTime.getEpochSecond());
+        out.writeLong(mCreationCapabilitiesBits);
     }
 
     @Override
@@ -322,7 +373,23 @@ public class MdnsServiceInfo implements Parcelable {
                 + ", interfaceIndex: " + interfaceIndex
                 + ", network: " + network
                 + ", textEntries: " + textEntries
-                + ", expirationTime: " + expirationTime;
+                + ", expirationTime: " + expirationTime
+                + ", capabilities: " + mCreationCapabilitiesBits;
+    }
+
+    /**
+     * Shorter toString method to use for logging in ServiceTypeClient.
+     *
+     * <p>Per-ServiceTypeClient attributes (service type, network, interface,
+     * creation capabilities of the socket) are not logged, and TXT entries are omitted.
+     */
+    public String toShortString() {
+        return serviceInstanceName
+                + ", sub: " + TextUtils.join(",", subtypes)
+                + ", ip4: " + ipv4Addresses
+                + ", ip6: " + ipv6Addresses
+                + ", port: " + port
+                + ", exp: " + expirationTime;
     }
 
 

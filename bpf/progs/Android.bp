@@ -40,8 +40,8 @@ cc_library_headers {
         "-Werror",
         "-Wextra",
     ],
-    sdk_version: "30",
-    min_sdk_version: "30",
+    sdk_version: "current",
+    min_sdk_version: "apex_inherit",
     apex_available: [
         "//apex_available:platform",
         "com.android.tethering",
@@ -51,6 +51,8 @@ cc_library_headers {
         "//packages/modules/Connectivity/bpf/netd",
         "//packages/modules/Connectivity/service",
         "//packages/modules/Connectivity/service/native/libs/libclat",
+        "//packages/modules/Connectivity/service/native/libs/libeventpolling",
+        "//packages/modules/Connectivity/service/native/libs/libeventpolling_test",
         "//packages/modules/Connectivity/Tethering",
         "//packages/modules/Connectivity/service/native",
         "//packages/modules/Connectivity/tests/native/connectivity_native_test",
@@ -68,12 +70,12 @@ cc_library_headers {
         "-Wall",
         "-Werror",
     ],
-    sdk_version: "30",
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
     // This header is for internal use within the tethering module.
     // Platform code should use bpf_prog_platform_headers instead.
     visibility: [
         "//packages/modules/Connectivity/bpf:__subpackages__",
+        "//packages/modules/Connectivity/service/libconnectivity",
     ],
     apex_available: [
         "com.android.tethering",
@@ -98,10 +100,26 @@ bpf {
 }
 
 bpf {
+    name: "dscpPolicy@funcs.o",
+    srcs: ["dscpPolicy@funcs.c"],
+    include_dirs: ["packages/modules/Connectivity/bpf/progs/include"],
+    sub_dir: "mainline",
+    cflags: ["-DBPF_USE_FUNCS"],
+}
+
+bpf {
     name: "netd.o",
     srcs: ["netd.c"],
     include_dirs: ["packages/modules/Connectivity/bpf/progs/include"],
     sub_dir: "mainline",
+}
+
+bpf {
+    name: "netd@funcs.o",
+    srcs: ["netd@funcs.c"],
+    include_dirs: ["packages/modules/Connectivity/bpf/progs/include"],
+    sub_dir: "mainline",
+    cflags: ["-DBPF_USE_FUNCS"],
 }
 
 bpf {

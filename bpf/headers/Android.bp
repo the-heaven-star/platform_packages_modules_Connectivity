@@ -30,14 +30,14 @@ cc_library_headers {
         "-Wall",
         "-Werror",
     ],
-    sdk_version: "30",
-    min_sdk_version: "30",
+    sdk_version: "current",
+    min_sdk_version: "apex_inherit",
     apex_available: [
         "//apex_available:platform",
         "com.android.art.debug",
         "com.android.os.statsd",
-        "com.android.resolv",
         "com.android.tethering",
+        "com.android.uprobestats",
     ],
 }
 
@@ -47,6 +47,8 @@ cc_test {
     srcs: [
         "BpfMapTest.cpp",
         "BpfRingbufTest.cpp",
+        "RingbufEventPollerTest.cpp",
+        "UeventSkfilterTest.cpp",
     ],
     defaults: ["bpf_cc_defaults"],
     cflags: [
@@ -62,5 +64,5 @@ cc_test {
     ],
     require_root: true,
     test_suites: ["general-tests"],
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
 }

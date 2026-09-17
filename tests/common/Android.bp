@@ -71,16 +71,19 @@ java_genrule {
         ":TetheringTestsJarJarRules",
         ":NetworkStackJarJarRules",
     ],
-    out: ["jarjar-rules-connectivity-coverage.txt"],
+    out: ["jarjar-rules-ConnectivityCoverageTests.txt"],
+    // Export the generated jarjar rules output file to the build artifacts when building targets with
+    // 'coverage-artifacts' goal, so that the coverage server can use them to map the class names and
+    // generate correct presubmit coverage.
+    dist: {
+        targets: ["coverage-artifacts"],
+    },
     visibility: ["//visibility:private"],
 }
 
 android_library {
     name: "ConnectivityCoverageTestsLib",
-    min_sdk_version: select(release_flag("RELEASE_DEPRECATE_MAINLINE_R_SUPPORT"), {
-        true: "31",
-        default: "30",
-    }),
+    min_sdk_version: "31",
     static_libs: [
         "ConnectivityUnitTestsLib",
         "NetdStaticLibTestsLib",
@@ -96,10 +99,7 @@ android_library {
 
 android_test {
     name: "ConnectivityCoverageTests",
-    min_sdk_version: select(release_flag("RELEASE_DEPRECATE_MAINLINE_R_SUPPORT"), {
-        true: "31",
-        default: "30",
-    }),
+    min_sdk_version: "31",
     test_suites: [
         "general-tests",
         "mts-tethering",
@@ -119,7 +119,9 @@ android_test {
         "mockito-target-extended-minus-junit4",
         "modules-utils-native-coverage-listener",
         "ConnectivityCoverageTestsLib",
-        "com.android.tethering.mainline.beta.flags-aconfig-java",
+        "android.permission.flags-aconfig-java-export",
+        "com.android.tethering.flags-aconfig-java",
+        "com.android.tethering.mainline.beta.flags-aconfig-java-deprecated",
         "flag-junit",
     ],
     jni_libs: [
@@ -155,7 +157,7 @@ java_defaults {
         // order matters: classes in framework-connectivity are resolved before framework,
         // meaning @hide APIs in framework-connectivity are resolved before @SystemApi
         // stubs in framework
-        "framework-connectivity.impl",
+        "framework-connectivity-post-jarjar",
         "framework-connectivity-b.impl",
         "framework-connectivity-t.impl",
         "framework-tethering.impl",

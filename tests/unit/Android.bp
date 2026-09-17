@@ -74,16 +74,18 @@ filegroup {
 
 android_library {
     name: "ConnectivityUnitTestsLib",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     defaults: [
         "framework-connectivity-internal-test-defaults",
     ],
+    manifest: "AndroidManifest_ConnectivityUnitTestsLib.xml",
     srcs: [
         "java/**/*.java",
         "java/**/*.kt",
     ],
     exclude_srcs: [":non-connectivity-module-test"],
     static_libs: [
+        "android.permission.flags-aconfig-java-export",
         "androidx.test.rules",
         "androidx.test.uiautomator_uiautomator",
         "bouncycastle-repackaged-unbundled",
@@ -153,6 +155,7 @@ android_test {
         "framework-connectivity-internal-test-defaults",
         "FrameworksNetTests-jni-defaults",
     ],
+    manifest: "AndroidManifest_FrameworksNetTests.xml",
     jarjar_rules: ":frameworks-net-tests-jarjar-rules",
     srcs: [":non-connectivity-module-test"],
     test_suites: ["device-tests"],
@@ -175,4 +178,5 @@ android_test {
         "libandroid_net_connectivity_com_android_net_module_util_jni_CommonConnectivityJni",
         "libservice-connectivity",
     ],
+    platform_apis: true,
 }

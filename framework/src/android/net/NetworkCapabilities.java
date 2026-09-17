@@ -474,6 +474,7 @@ public final class NetworkCapabilities implements Parcelable {
             NET_CAPABILITY_PRIORITIZE_BANDWIDTH,
             NET_CAPABILITY_LOCAL_NETWORK,
             NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED,
+            NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS,
     })
     public @interface NetCapability { }
 
@@ -720,18 +721,20 @@ public final class NetworkCapabilities implements Parcelable {
     /**
      * Indicates that this network should be able to prioritize latency for the internet.
      *
-     * Starting with {@link Build.VERSION_CODES#UPSIDE_DOWN_CAKE}, requesting this capability with
-     * {@link ConnectivityManager#requestNetwork} requires declaration in the self-certified
-     * network capabilities. See {@link NetworkRequest} for the self-certification documentation.
+     * Apps targeting {@link Build.VERSION_CODES#UPSIDE_DOWN_CAKE} or higher, requesting
+     * this capability with {@link ConnectivityManager#requestNetwork} requires declaration in the
+     * self-certified network capabilities. See {@link NetworkRequest} for the self-certification
+     * documentation.
      */
     public static final int NET_CAPABILITY_PRIORITIZE_LATENCY = 34;
 
     /**
      * Indicates that this network should be able to prioritize bandwidth for the internet.
      *
-     * Starting with {@link Build.VERSION_CODES#UPSIDE_DOWN_CAKE}, requesting this capability with
-     * {@link ConnectivityManager#requestNetwork} requires declaration in the self-certified
-     * network capabilities. See {@link NetworkRequest} for the self-certification documentation.
+     * Apps targeting {@link Build.VERSION_CODES#UPSIDE_DOWN_CAKE} or higher, requesting
+     * this capability with {@link ConnectivityManager#requestNetwork} requires declaration in the
+     * self-certified network capabilities. See {@link NetworkRequest} for the self-certification
+     * documentation.
      */
     public static final int NET_CAPABILITY_PRIORITIZE_BANDWIDTH = 35;
 
@@ -749,7 +752,7 @@ public final class NetworkCapabilities implements Parcelable {
      *
      * Networks used to obtain Internet access are never local networks.
      *
-     * Apps that target an SDK before {@link Build.VERSION_CODES.VANILLA_ICE_CREAM} will not see
+     * Apps that target an SDK before {@link Build.VERSION_CODES#VANILLA_ICE_CREAM} will not see
      * networks with this capability unless they explicitly set the NET_CAPABILITY_LOCAL_NETWORK
      * in their NetworkRequests.
      */
@@ -759,7 +762,7 @@ public final class NetworkCapabilities implements Parcelable {
     /**
      * Indicates that this is not a bandwidth-constrained network.
      *
-     * Starting from {@link Build.VERSION_CODES.VANILLA_ICE_CREAM}, this capability is by default
+     * Starting from {@link Build.VERSION_CODES#VANILLA_ICE_CREAM}, this capability is by default
      * set in {@link NetworkRequest}s and true for most networks.
      *
      * If a network lacks this capability, it is bandwidth-constrained. Bandwidth constrained
@@ -775,7 +778,35 @@ public final class NetworkCapabilities implements Parcelable {
     @FlaggedApi(Flags.FLAG_NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED)
     public static final int NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED = 37;
 
-    private static final int MAX_NET_CAPABILITY = NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED;
+    /**
+     * Indicates that this network is optimized for real-time unified communications,
+     * such as Over-the-Top (OTT) voice and video calls.
+     *
+     * <p>This capability is intended specifically for applications that handle Over-the-Top (OTT)
+     * voice and video calls. It is not intended for non ott applications.
+     *
+     * <p>This capability signals to the system that the network may offer a dedicated slice for
+     * high-priority, low-latency data paths. It can be used in two ways:
+     * <ul>
+     *     <li>The system can request a network with this capability on behalf of an eligible
+     *     application when it detects an active OTT call to improve Quality of Service (QoS).</li>
+     *     <li>An ott application can request a network with this capability directly using
+     *     {@link android.net.ConnectivityManager#requestNetwork}.</li>
+     * </ul>
+     *
+     * <p>This capability is a hint from the network and does not guarantee that it will
+     * be used for any given call.
+     *
+     * Apps targeting {@link Build.VERSION_CODES#UPSIDE_DOWN_CAKE} or higher, requesting
+     * this capability with {@link ConnectivityManager#requestNetwork} requires declaration in the
+     * self-certified network capabilities. See {@link NetworkRequest} for the self-certification
+     * documentation.
+     */
+    @FlaggedApi(com.android.tethering.flags.Flags
+            .FLAG_NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS)
+    public static final int NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS = 38;
+
+    private static final int MAX_NET_CAPABILITY = NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS;
 
     // Set all bits up to the MAX_NET_CAPABILITY-th bit
     private static final long ALL_VALID_CAPABILITIES = (2L << MAX_NET_CAPABILITY) - 1;
@@ -1082,9 +1113,9 @@ public final class NetworkCapabilities implements Parcelable {
 
     /**
      * Get the underlying networks of this network. If the caller doesn't have one of
-     * {@link android.Manifest.permission.NETWORK_FACTORY},
-     * {@link android.Manifest.permission.NETWORK_SETTINGS} and
-     * {@link NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK}, this is always redacted to null and
+     * {@link android.Manifest.permission#NETWORK_FACTORY},
+     * {@link android.Manifest.permission#NETWORK_SETTINGS} and
+     * {@link NetworkStack#PERMISSION_MAINLINE_NETWORK_STACK}, this is always redacted to null and
      * it will be never useful to the caller.
      *
      * @return <li>If the list is null, this network hasn't declared underlying networks.</li>
@@ -2669,6 +2700,8 @@ public final class NetworkCapabilities implements Parcelable {
             case NET_CAPABILITY_PRIORITIZE_BANDWIDTH:        return "PRIORITIZE_BANDWIDTH";
             case NET_CAPABILITY_LOCAL_NETWORK:        return "LOCAL_NETWORK";
             case NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED:    return "NOT_BANDWIDTH_CONSTRAINED";
+            case NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS:
+                return "PRIORITIZE_UNIFIED_COMMUNICATIONS";
             default:                                  return Integer.toString(capability);
         }
     }
@@ -3047,7 +3080,7 @@ public final class NetworkCapabilities implements Parcelable {
      *
      * This class is mainly for {@link NetworkAgent} instances to use. Many fields in
      * the built class require holding a signature permission to use - mostly
-     * {@link android.Manifest.permission.NETWORK_FACTORY}, but refer to the specific
+     * {@link android.Manifest.permission#NETWORK_FACTORY}, but refer to the specific
      * description of each setter. As this class lives entirely in app space it does not
      * enforce these restrictions itself but the system server clears out the relevant
      * fields when receiving a NetworkCapabilities object from a caller without the
@@ -3354,7 +3387,7 @@ public final class NetworkCapabilities implements Parcelable {
          *
          * Note: for security the system will throw if it receives a NetworkRequest where
          * the underlying NetworkCapabilities has this member set from a source that does
-         * not hold the {@link android.Manifest.permission.NETWORK_SIGNAL_STRENGTH_WAKEUP}
+         * not hold the {@link android.Manifest.permission#NETWORK_SIGNAL_STRENGTH_WAKEUP}
          * permission. Apps with this permission can use this indirectly through
          * {@link android.net.NetworkRequest}.
          *
@@ -3455,11 +3488,11 @@ public final class NetworkCapabilities implements Parcelable {
          * <p>
          * Provide a list of UIDs that can access this network even if the network doesn't have the
          * {@link #NET_CAPABILITY_NOT_RESTRICTED} capability and the UID does not hold the
-         * {@link android.Manifest.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS} permission.
+         * {@link android.Manifest.permission#CONNECTIVITY_USE_RESTRICTED_NETWORKS} permission.
          * <p>
          * This is disallowed in {@link NetworkRequest}, and can only be set by
          * {@link NetworkAgent}s, who hold the
-         * {@link android.Manifest.permission.NETWORK_FACTORY} permission.
+         * {@link android.Manifest.permission#NETWORK_FACTORY} permission.
          * Network agents also have restrictions on how they can set these ; they can only back
          * a public Android API. As such, Ethernet agents can set this when backing the per-UID
          * access API, and Telephony can set exactly one UID which has to match the manager app for
@@ -3468,11 +3501,11 @@ public final class NetworkCapabilities implements Parcelable {
          * <p>
          * These UIDs are only visible to network factories and the system server, since the system
          * server makes sure to redact them before sending a {@link NetworkCapabilities} instance
-         * to a process that doesn't hold the {@link android.Manifest.permission.NETWORK_FACTORY}
+         * to a process that doesn't hold the {@link android.Manifest.permission#NETWORK_FACTORY}
          * permission.
          * <p>
          * This list cannot be null, but it can be empty to mean that no UID without the
-         * {@link android.Manifest.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS} permission
+         * {@link android.Manifest.permission#CONNECTIVITY_USE_RESTRICTED_NETWORKS} permission
          * can access this network.
          *
          * @param uids the list of UIDs that can always access this network
@@ -3492,12 +3525,12 @@ public final class NetworkCapabilities implements Parcelable {
          * Set the underlying networks of this network.
          *
          * <p>This API is mainly for {@link NetworkAgent}s who hold
-         * {@link android.Manifest.permission.NETWORK_FACTORY} to set its underlying networks.
+         * {@link android.Manifest.permission#NETWORK_FACTORY} to set its underlying networks.
          *
          * <p>The underlying networks are only visible for the receiver who has one of
-         * {@link android.Manifest.permission.NETWORK_FACTORY},
-         * {@link android.Manifest.permission.NETWORK_SETTINGS} and
-         * {@link NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK}.
+         * {@link android.Manifest.permission#NETWORK_FACTORY},
+         * {@link android.Manifest.permission#NETWORK_SETTINGS} and
+         * {@link NetworkStack#PERMISSION_MAINLINE_NETWORK_STACK}.
          * If the receiver doesn't have required permissions, the field will be cleared before
          * sending to the caller.</p>
          *

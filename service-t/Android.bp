@@ -29,7 +29,6 @@ filegroup {
     name: "service-connectivity-tiramisu-sources",
     srcs: [
         "src/**/*.java",
-        ":vcn-location-sources",
     ],
     visibility: ["//visibility:private"],
 }
@@ -45,8 +44,8 @@ filegroup {
 java_library {
     name: "service-connectivity-tiramisu-pre-jarjar",
     sdk_version: "system_server_current",
-    // TODO(b/210962470): Bump this to at least S, and then T.
-    min_sdk_version: "30",
+    // TODO(b/210962470): Bump this to T.
+    min_sdk_version: "31",
     srcs: [
         ":service-connectivity-tiramisu-sources",
     ],
@@ -122,7 +121,7 @@ java_library {
 java_library {
     name: "service-connectivity-mdns-standalone-build-test",
     sdk_version: "core_platform",
-    min_sdk_version: "21",
+    min_sdk_version: "23",
     lint: {
         error_checks: ["NewApi"],
         baseline_filename: "lint-baseline-service-connectivity-mdns-standalone-build-test.xml",
@@ -133,6 +132,8 @@ java_library {
     ],
     exclude_srcs: [
         "src/com/android/server/connectivity/mdns/internal/MdnsRealtimeScheduler.java",
+        "src/com/android/server/connectivity/mdns/internal/ServiceAccessDb.java",
+        "src/com/android/server/connectivity/mdns/internal/ServiceAccessRepository.java",
         "src/com/android/server/connectivity/mdns/internal/SocketNetlinkMonitor.java",
         "src/com/android/server/connectivity/mdns/MdnsAdvertiser.java",
         "src/com/android/server/connectivity/mdns/MdnsAnnouncer.java",

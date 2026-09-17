@@ -32,55 +32,6 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
-// This library shouldn't be used anymore (no class should be added), and per-user libraries like
-// net-utils-service-connectivity or net-utils-framework-wifi should be used instead.
-java_library {
-    name: "net-utils-device-common",
-    srcs: [
-        "device/com/android/net/module/util/arp/ArpPacket.java",
-        "device/com/android/net/module/util/DeviceConfigUtils.java",
-        "device/com/android/net/module/util/DomainUtils.java",
-        "device/com/android/net/module/util/FdEventsReader.java",
-        "device/com/android/net/module/util/FeatureVersions.java",
-        "device/com/android/net/module/util/HandlerUtils.java",
-        "device/com/android/net/module/util/NetworkMonitorUtils.java",
-        "device/com/android/net/module/util/PacketReader.java",
-        "device/com/android/net/module/util/SharedLog.java",
-        "device/com/android/net/module/util/SocketUtils.java",
-        "device/com/android/net/module/util/SyncStateMachine.java",
-        // This library is used by system modules, for which the system health impact of Kotlin
-        // has not yet been evaluated. Annotations may need jarjar'ing.
-        // "src_devicecommon/**/*.kt",
-    ],
-    sdk_version: "module_current",
-    min_sdk_version: "30",
-    target_sdk_version: "30",
-    apex_available: [
-        "//apex_available:anyapex",
-        "//apex_available:platform",
-    ],
-    visibility: [
-        "//packages/modules/Connectivity:__subpackages__",
-        "//packages/modules/Connectivity/framework:__subpackages__",
-        "//packages/modules/NetworkStack:__subpackages__",
-        "//packages/modules/CaptivePortalLogin",
-    ],
-    static_libs: [
-        "modules-utils-statemachine",
-        "net-utils-framework-common",
-    ],
-    libs: [
-        "androidx.annotation_annotation",
-        "framework-annotations-lib",
-        "framework-configinfrastructure.stubs.module_lib",
-        "framework-connectivity.stubs.module_lib",
-    ],
-    lint: {
-        strict_updatability_linting: true,
-        error_checks: ["NewApi"],
-    },
-}
-
 // Contains staticlibs classes for use by NetworkStack
 java_library {
     name: "net-utils-networkstack",
@@ -94,8 +45,7 @@ java_library {
         "framework/com/android/net/module/util/HexDump.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
-    target_sdk_version: "30",
+    min_sdk_version: "31",
     visibility: [
         "//packages/modules/Connectivity/tests:__subpackages__",
         "//packages/modules/NetworkStack:__subpackages__",
@@ -106,27 +56,6 @@ java_library {
         "framework-connectivity.stubs.module_lib",
         "net-utils-device-common-struct",
         "net-utils-device-common-struct-base",
-    ],
-}
-
-java_library {
-    name: "net-utils-dnspacket-common",
-    srcs: [
-        "framework/**/DnsPacket.java",
-        "framework/**/DnsPacketUtils.java",
-        "framework/**/DnsSvcbPacket.java",
-        "framework/**/DnsSvcbRecord.java",
-        "framework/**/HexDump.java",
-        "framework/**/NetworkStackConstants.java",
-    ],
-    sdk_version: "module_current",
-    visibility: [
-        "//packages/services/Iwlan:__subpackages__",
-    ],
-    libs: [
-        "androidx.annotation_annotation",
-        "framework-annotations-lib",
-        "framework-connectivity.stubs.module_lib",
     ],
 }
 
@@ -155,7 +84,7 @@ java_library {
         "device/com/android/net/module/util/TcUtils.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
     visibility: [
         "//packages/modules/Connectivity:__subpackages__",
         "//packages/modules/NetworkStack:__subpackages__",
@@ -182,7 +111,7 @@ java_library {
         "device/com/android/net/module/util/Struct.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     visibility: [
         "//packages/modules/Connectivity:__subpackages__",
         "//packages/modules/NetworkStack:__subpackages__",
@@ -215,7 +144,7 @@ java_library {
         "device/com/android/net/module/util/structs/*.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     visibility: [
         "//packages/modules/Connectivity:__subpackages__",
         "//packages/modules/NetworkStack:__subpackages__",
@@ -242,9 +171,10 @@ java_library {
     name: "net-utils-device-common-netlink",
     srcs: [
         "device/com/android/net/module/util/netlink/**/*.java",
+        "device/com/android/net/module/util/ModuleFlagProvider.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     visibility: [
         "//packages/modules/Connectivity:__subpackages__",
         "//packages/modules/NetworkStack:__subpackages__",
@@ -280,9 +210,9 @@ java_library {
         "device/com/android/net/module/util/ip/*.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     visibility: [
-        "//packages/modules/Connectivity:__subpackages__",
+        "//packages/modules/Connectivity/staticlibs/tests/unit",
         "//packages/modules/NetworkStack:__subpackages__",
     ],
     libs: [
@@ -290,7 +220,7 @@ java_library {
         "framework-connectivity.stubs.module_lib",
     ],
     static_libs: [
-        "net-utils-device-common",
+        "net-utils-connectivity-apks",
         "net-utils-device-common-netlink",
         "net-utils-framework-common",
         "netd-client",
@@ -305,13 +235,16 @@ java_library {
     },
 }
 
+// DO NOT try to add any static_libs to the below target, as it is used widely,
+// would require extensive jarjar'ing, and result in places like telephony
+// having duplicate copies of the included static_libs classes.
 java_library {
     name: "net-utils-framework-common",
     srcs: [
         ":net-utils-framework-common-srcs",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     libs: [
         "androidx.annotation_annotation",
         "framework-annotations-lib",
@@ -362,7 +295,7 @@ java_library {
         "device/android/net/NetworkFactoryShim.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     libs: [
         "framework-annotations-lib",
         "framework-connectivity.stubs.module_lib",
@@ -395,7 +328,7 @@ java_library {
         "device/com/android/net/module/util/async/*.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
     visibility: [
         "//packages/modules/Connectivity:__subpackages__",
     ],
@@ -420,7 +353,7 @@ java_library {
         "device/com/android/net/module/util/wear/*.java",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
     visibility: [
         "//packages/modules/Connectivity:__subpackages__",
     ],
@@ -460,6 +393,7 @@ java_library {
         "device/com/android/net/module/util/FdEventsReader.java",
         "device/com/android/net/module/util/HandlerUtils.java",
         "device/com/android/net/module/util/SharedLog.java",
+        "framework/com/android/net/module/util/BitUtils.java",
         "framework/com/android/net/module/util/ByteUtils.java",
         "framework/com/android/net/module/util/CollectionUtils.java",
         "framework/com/android/net/module/util/DnsUtils.java",
@@ -481,7 +415,7 @@ java_library {
         ":net-utils-framework-connectivity-srcs",
     ],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     apex_available: [
         "com.android.tethering",
         "//apex_available:platform",
@@ -507,7 +441,7 @@ java_library {
 java_defaults {
     name: "net-utils-non-bootclasspath-defaults",
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     libs: [
         "androidx.annotation_annotation",
         "framework-annotations-lib",
@@ -548,13 +482,15 @@ java_library {
     ],
     libs: [
         "net-utils-framework-connectivity",
-        "framework-connectivity.impl",
+        "framework-connectivity-post-jarjar",
         "framework-tethering.impl",
     ],
     defaults: ["net-utils-non-bootclasspath-defaults"],
     jarjar_rules: "jarjar-rules-shared.txt",
     visibility: [
         "//packages/modules/Connectivity/service",
+        "//packages/modules/Connectivity/thread/service",
+        "//packages/modules/Connectivity/thread/tests/integration",
         "//packages/modules/Connectivity/staticlibs/tests/unit",
     ],
 }
@@ -583,6 +519,9 @@ java_library {
     visibility: [
         "//packages/modules/CaptivePortalLogin:__subpackages__",
         "//packages/modules/Connectivity/Tethering",
+        "//packages/modules/Connectivity/Tethering/tests/integration",
+        "//packages/modules/Connectivity/staticlibs/testutils",
+        "//packages/modules/NetworkStack",
     ],
 }
 
@@ -595,7 +534,7 @@ aidl_interface {
     backend: {
         java: {
             enabled: true,
-            min_sdk_version: "30",
+            min_sdk_version: "31",
             apex_available: [
                 "com.android.tethering",
                 "com.android.wifi",
@@ -669,7 +608,7 @@ filegroup {
 java_library {
     name: "net-utils-framework-ipsec",
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     srcs: [":net-utils-framework-ipsec-common-srcs"],
     libs: [
         "androidx.annotation_annotation",
@@ -743,7 +682,7 @@ java_library {
 java_library {
     name: "net-utils-framework-wifi",
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     srcs: [":net-utils-framework-wifi-common-srcs"],
     libs: [
         "framework-annotations-lib",
@@ -766,7 +705,7 @@ genrule {
 java_library {
     name: "net-utils-service-vcn",
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     srcs: [
         "device/com/android/net/module/util/HandlerUtils.java",
     ],
@@ -791,7 +730,7 @@ java_library {
 java_library {
     name: "net-utils-framework-vcn",
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
     srcs: [
         "framework/com/android/net/module/util/HexDump.java",
     ],

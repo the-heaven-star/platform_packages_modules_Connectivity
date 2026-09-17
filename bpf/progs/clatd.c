@@ -15,7 +15,7 @@
  */
 
 // The resulting .o needs to load on Android T+
-#define BPFLOADER_MIN_VER BPFLOADER_MAINLINE_T_VERSION
+#define NETBPFLOAD_MINAPI_VER NETBPFLOAD_T_VER
 #define BPF_OBJ_NAME "clatd"
 #define DEFAULT_BPF_PIN_SUBDIR "net_shared"
 
@@ -25,9 +25,9 @@
 
 DEFINE_BPF_MAP_GRW(clat_ingress6_map, HASH, ClatIngress6Key, ClatIngress6Value, 16, AID_SYSTEM)
 
-static inline __always_inline int nat64(struct __sk_buff* skb,
-                                        const struct rawip_bool rawip,
-                                        const struct kver_uint kver) {
+function int nat64(struct __sk_buff* skb,
+                   const struct rawip_bool rawip,
+                   const struct kver_uint kver) {
     const bool is_ethernet = !rawip.rawip;
 
     // Require ethernet dst mac address to be our unicast address.
@@ -88,7 +88,7 @@ static inline __always_inline int nat64(struct __sk_buff* skb,
 
     if (proto == IPPROTO_FRAGMENT) {
         // Fragment handling requires bpf_skb_adjust_room which is 4.14+
-        if (!KVER_IS_AT_LEAST(kver, 4, 14, 0)) return TC_ACT_PIPE;
+        if (!KVER_IS_AT_LEAST(kver, 4, 14)) return TC_ACT_PIPE;
 
         // Must have (ethernet and) ipv6 header and ipv6 fragment extension header
         if (data + l2_header_size + sizeof(*ip6) + sizeof(struct frag_hdr) > data_end)
@@ -206,7 +206,7 @@ static inline __always_inline int nat64(struct __sk_buff* skb,
     //
     // Note: we currently have no TreeHugger coverage for 4.9-T devices (there are no such
     // Pixel or cuttlefish devices), so likely you won't notice for months if this breaks...
-    if (KVER_IS_AT_LEAST(kver, 4, 14, 0) && frag_off != htons(IP_DF)) {
+    if (KVER_IS_AT_LEAST(kver, 4, 14) && frag_off != htons(IP_DF)) {
         // If we're converting an IPv6 Fragment, we need to trim off 8 more bytes
         // We're beyond recovery on error here... but hard to imagine how this could fail.
         if (bpf_skb_adjust_room(skb, -(__s32)sizeof(struct frag_hdr), BPF_ADJ_ROOM_NET, /*flags*/0))
@@ -247,29 +247,29 @@ static inline __always_inline int nat64(struct __sk_buff* skb,
     return TC_ACT_PIPE;
 }
 
-DEFINE_BPF_PROG_KVER(schedcls, ingress6_clat_ether, 4_14, AID_SYSTEM, 4_14)
+DEFINE_BPF_PROG_KVER(schedcls, ingress6_clat_ether, AID_SYSTEM, 4_14)
 (struct __sk_buff* skb) {
     return nat64(skb, ETHER, KVER_4_14);
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, ingress6_clat_ether, 4_9, AID_SYSTEM, 4_9, 4_14)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, ingress6_clat_ether, AID_SYSTEM, 4_9, 4_14)
 (struct __sk_buff* skb) {
     return nat64(skb, ETHER, KVER_4_9);
 }
 
-DEFINE_BPF_PROG_KVER(schedcls, ingress6_clat_rawip, 4_14, AID_SYSTEM, 4_14)
+DEFINE_BPF_PROG_KVER(schedcls, ingress6_clat_rawip, AID_SYSTEM, 4_14)
 (struct __sk_buff* skb) {
     return nat64(skb, RAWIP, KVER_4_14);
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, ingress6_clat_rawip, 4_9, AID_SYSTEM, 4_9, 4_14)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, ingress6_clat_rawip, AID_SYSTEM, 4_9, 4_14)
 (struct __sk_buff* skb) {
     return nat64(skb, RAWIP, KVER_4_9);
 }
 
 DEFINE_BPF_MAP_GRW(clat_egress4_map, HASH, ClatEgress4Key, ClatEgress4Value, 16, AID_SYSTEM)
 
-DEFINE_BPF_PROG(schedcls, egress4_clat_rawip, , AID_SYSTEM)
+DEFINE_BPF_PROG(schedcls, egress4_clat_rawip, AID_SYSTEM)
 (struct __sk_buff* skb) {
     // Must be meta-ethernet IPv4 frame
     if (skb->protocol != htons(ETH_P_IP)) return TC_ACT_PIPE;

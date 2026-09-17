@@ -24,12 +24,12 @@ import android.util.Log;
 
 import com.android.modules.utils.build.SdkLevel;
 import com.android.net.module.util.DeviceConfigUtils;
-import com.android.networkstack.apishim.ConstantsShim;
+import com.android.net.module.util.ModuleFlagProvider;
+import com.android.server.connectivity.ConnectivityModuleFlagProvider;
 import com.android.server.connectivity.ConnectivityNativeService;
 import com.android.server.nearby.NearbyService;
 import com.android.server.net.ct.CertificateTransparencyService;
 import com.android.server.thread.ThreadNetworkService;
-import com.android.server.vcn.VcnLocation;
 
 import java.lang.reflect.Constructor;
 
@@ -55,6 +55,7 @@ public final class ConnectivityServiceInitializer extends SystemService {
 
     public ConnectivityServiceInitializer(Context context) {
         super(context);
+        ModuleFlagProvider.setFlagProvider(new ConnectivityModuleFlagProvider());
         // Load JNI libraries used by ConnectivityService and its dependencies
         System.loadLibrary("service-connectivity");
         mEthernetServiceImpl = createEthernetService(context);
@@ -97,8 +98,8 @@ public final class ConnectivityServiceInitializer extends SystemService {
         }
 
         if (mNearbyService != null) {
-            Log.i(TAG, "Registering " + ConstantsShim.NEARBY_SERVICE);
-            publishBinderService(ConstantsShim.NEARBY_SERVICE, mNearbyService,
+            Log.i(TAG, "Registering " + Context.NEARBY_SERVICE);
+            publishBinderService(Context.NEARBY_SERVICE, mNearbyService,
                     /* allowIsolated= */ false);
         }
 
@@ -174,7 +175,7 @@ public final class ConnectivityServiceInitializer extends SystemService {
         } catch (UnsupportedOperationException e) {
             // Nearby is not yet supported in all branches
             // TODO: remove catch clause when it is available.
-            Log.i(TAG, "Skipping unsupported service " + ConstantsShim.NEARBY_SERVICE);
+            Log.i(TAG, "Skipping unsupported service " + Context.NEARBY_SERVICE);
             return null;
         }
     }
@@ -219,9 +220,7 @@ public final class ConnectivityServiceInitializer extends SystemService {
     @Nullable
     private CertificateTransparencyService createCertificateTransparencyService(
             final Context context) {
-        return SdkLevel.isAtLeastV() && CertificateTransparencyService.enabled(context)
-                ? new CertificateTransparencyService(context)
-                : null;
+        return SdkLevel.isAtLeastB() ? new CertificateTransparencyService(context) : null;
     }
 
     // TODO: b/374174952 After VCN code is moved to the Connectivity folder, merge
@@ -230,7 +229,7 @@ public final class ConnectivityServiceInitializer extends SystemService {
     /** Return ConnectivityServiceInitializerB instance if enable, otherwise null. */
     @Nullable
     private SystemService createConnectivityServiceInitializerB(Context context) {
-        if (!VcnLocation.IS_VCN_IN_MAINLINE || !SdkLevel.isAtLeastB()) {
+        if (!SdkLevel.isAtLeastB()) {
             return null;
         }
 

@@ -16,11 +16,27 @@
 
 package com.android.server.vcn.metrics;
 
+import static com.android.server.vcn.metrics.VcnStatsLog.IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_PACKETS_TOO_OLD;
+import static com.android.server.vcn.metrics.VcnStatsLog.IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_SEQ_DIFF_TOO_SMALL;
+import static com.android.server.vcn.metrics.VcnStatsLog.IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_UNEXPECTED_ERROR;
+import static com.android.server.vcn.metrics.VcnStatsLog.IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_UNSPECIFIED;
+import static com.android.server.vcn.metrics.VcnStatsLog.IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_UNUSUAL_SEQ_NUM_LEAP;
+import static com.android.server.vcn.metrics.VcnStatsLog.IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_VALID;
 import static com.android.server.vcn.metrics.VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_INTERNAL_ERROR;
 import static com.android.server.vcn.metrics.VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_NETWORK_AGENT_UNWANTED;
 import static com.android.server.vcn.metrics.VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_NONE;
 import static com.android.server.vcn.metrics.VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_REQUESTED;
 import static com.android.server.vcn.metrics.VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_UNSPECIFIED;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_NOT_VALID;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_PENDING;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_UNSPECIFIED;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_VALID;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_RECOVERY_IKE_MOBILITY_UPDATED__RECOVERY_REASON__VCN_RECOVERY_REASON_DATA_STALL;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_RECOVERY_IKE_MOBILITY_UPDATED__RECOVERY_REASON__VCN_RECOVERY_REASON_UNSPECIFIED;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_CELLULAR;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_NONE;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_UNSPECIFIED;
+import static com.android.server.vcn.metrics.VcnStatsLog.VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_WIFI;
 
 import android.annotation.IntDef;
 
@@ -29,6 +45,8 @@ import java.lang.annotation.RetentionPolicy;
 
 /** Utility class for logging VCN metrics. */
 public class VcnMetrics {
+    private final int mGatewayConnectionId;
+
     /** @hide */
     @Retention(RetentionPolicy.SOURCE)
     @IntDef(
@@ -41,6 +59,58 @@ public class VcnMetrics {
             })
     public @interface GatewayTeardownReason {}
 
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(
+            prefix = {"TRANSPORT_MASK_"},
+            value = {
+                TRANSPORT_MASK_UNSPECIFIED,
+                TRANSPORT_MASK_NONE,
+                TRANSPORT_MASK_CELLULAR,
+                TRANSPORT_MASK_WIFI
+            })
+    public @interface TransportMask {}
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(
+            prefix = {"VALIDATION_STATUS_"},
+            value = {
+                VALIDATION_STATUS_UNSPECIFIED,
+                VALIDATION_STATUS_PENDING,
+                VALIDATION_STATUS_VALID,
+                VALIDATION_STATUS_NOT_VALID
+            })
+    public @interface ValidationStatus {}
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(
+            prefix = {"IPSEC_PACKET_LOSS_RESULT_TYPE_"},
+            value = {
+                IPSEC_PACKET_LOSS_RESULT_TYPE_UNSPECIFIED,
+                IPSEC_PACKET_LOSS_RESULT_TYPE_VALID,
+                IPSEC_PACKET_LOSS_RESULT_TYPE_SEQ_DIFF_TOO_SMALL,
+                IPSEC_PACKET_LOSS_RESULT_TYPE_UNUSUAL_SEQ_NUM_LEAP,
+                IPSEC_PACKET_LOSS_RESULT_TYPE_UNEXPECTED_ERROR,
+                IPSEC_PACKET_LOSS_RESULT_TYPE_PACKETS_TOO_OLD
+            })
+    public @interface IpSecPacketLossResultType {}
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(
+            prefix = {"VCN_RECOVERY_REASON_"},
+            value = {
+                VCN_RECOVERY_REASON_UNSPECIFIED,
+                VCN_RECOVERY_REASON_DATA_STALL
+            })
+    public @interface VcnRecoveryReason {}
+
+    public VcnMetrics(int gatewayConnectionId) {
+        mGatewayConnectionId = gatewayConnectionId;
+    }
+
     public static final int GATEWAY_TEARDOWN_REASON_NONE =
             VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_NONE;
     public static final int GATEWAY_TEARDOWN_REASON_INTERNAL_ERROR =
@@ -51,21 +121,53 @@ public class VcnMetrics {
             VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_REQUESTED;
     public static final int GATEWAY_TEARDOWN_REASON_UNSPECIFIED =
             VCN_GATEWAY_CONNECTION_STATE_CHANGED__GW_TEARDOWN_REASON__GATEWAY_TEARDOWN_REASON_UNSPECIFIED;
+    public static final int TRANSPORT_MASK_UNSPECIFIED =
+            VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_UNSPECIFIED;
+    public static final int TRANSPORT_MASK_NONE =
+            VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_NONE;
+    public static final int TRANSPORT_MASK_CELLULAR =
+            VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_CELLULAR;
+    public static final int TRANSPORT_MASK_WIFI =
+            VCN_UNDERLYING_NETWORK_SWITCHED__OLD_NETWORK__TRANSPORT_MASK_WIFI;
+    public static final int VALIDATION_STATUS_UNSPECIFIED =
+            VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_UNSPECIFIED;
+    public static final int VALIDATION_STATUS_PENDING =
+            VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_PENDING;
+    public static final int VALIDATION_STATUS_VALID =
+            VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_VALID;
+    public static final int VALIDATION_STATUS_NOT_VALID =
+            VCN_NETWORK_VALIDATION_STATUS_REPORTED__NEW_VALIDATION_STATUS__VALIDATION_STATUS_NOT_VALID;
+    public static final int IPSEC_PACKET_LOSS_RESULT_TYPE_UNSPECIFIED =
+            IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_UNSPECIFIED;
+    public static final int IPSEC_PACKET_LOSS_RESULT_TYPE_VALID =
+            IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_VALID;
+    public static final int IPSEC_PACKET_LOSS_RESULT_TYPE_SEQ_DIFF_TOO_SMALL =
+            IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_SEQ_DIFF_TOO_SMALL;
+    public static final int IPSEC_PACKET_LOSS_RESULT_TYPE_UNUSUAL_SEQ_NUM_LEAP =
+            IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_UNUSUAL_SEQ_NUM_LEAP;
+    public static final int IPSEC_PACKET_LOSS_RESULT_TYPE_UNEXPECTED_ERROR =
+            IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_UNEXPECTED_ERROR;
+    public static final int IPSEC_PACKET_LOSS_RESULT_TYPE_PACKETS_TOO_OLD =
+            IP_SEC_PACKET_LOSS_DETECTOR_REPORTED__RESULT_TYPE__IPSEC_PACKET_LOSS_RESULT_TYPE_PACKETS_TOO_OLD;
+    public static final int VCN_RECOVERY_REASON_UNSPECIFIED =
+            VCN_RECOVERY_IKE_MOBILITY_UPDATED__RECOVERY_REASON__VCN_RECOVERY_REASON_UNSPECIFIED;
+    public static final int VCN_RECOVERY_REASON_DATA_STALL =
+            VCN_RECOVERY_IKE_MOBILITY_UPDATED__RECOVERY_REASON__VCN_RECOVERY_REASON_DATA_STALL;
 
     /** Log an atom when a VcnGatewayConnection has entered safe mode. */
-    public void logEnterSafeMode(int gatewayConnectionId) {
+    public void logEnterSafeMode() {
         VcnStatsLog.write(
                 VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED,
-                gatewayConnectionId,
+                mGatewayConnectionId,
                 GATEWAY_TEARDOWN_REASON_NONE,
                 true /* isInSafeMode */);
     }
 
     /** Log an atom when a VcnGatewayConnection has exited safe mode. */
-    public void logExitSafeMode(int gatewayConnectionId) {
+    public void logExitSafeMode() {
         VcnStatsLog.write(
                 VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED,
-                gatewayConnectionId,
+                mGatewayConnectionId,
                 GATEWAY_TEARDOWN_REASON_NONE,
                 false /* isInSafeMode */);
     }
@@ -74,19 +176,19 @@ public class VcnMetrics {
      * Log an atom when a VcnGatewayConnection has been torn down with reason. It will also reset
      * other VcnGatewayConnection related states i.e. safemode.
      */
-    public void logVcnGatewayTeardown(int gatewayConnectionId, @GatewayTeardownReason int reason) {
+    public void logVcnGatewayTeardown(@GatewayTeardownReason int reason) {
         VcnStatsLog.write(
                 VcnStatsLog.VCN_GATEWAY_CONNECTION_STATE_CHANGED,
-                gatewayConnectionId,
+                mGatewayConnectionId,
                 reason,
                 false /* isInSafeMode */);
     }
 
     /** Log an atom when VCN network is connected. */
-    public void logVcnNetworkConnected(int gatewayConnectionId, int networkId) {
+    public void logVcnNetworkConnected(int networkId) {
         VcnStatsLog.write(
                 VcnStatsLog.VCN_NETWORK_STATE_CHANGED,
-                gatewayConnectionId,
+                mGatewayConnectionId,
                 networkId,
                 true /* isConnected */,
                 false /* isValidated */);
@@ -96,40 +198,96 @@ public class VcnMetrics {
      * Log an atom when VCN network is being torn down. It will also reset other state related to
      * the network i.e. validated.
      */
-    public void logVcnNetworkNotConnected(int gatewayConnectionId, int networkId) {
+    public void logVcnNetworkNotConnected(int networkId) {
         VcnStatsLog.write(
                 VcnStatsLog.VCN_NETWORK_STATE_CHANGED,
-                gatewayConnectionId,
+                mGatewayConnectionId,
                 networkId,
                 false /* isConnected */,
                 false /* isValidated */);
     }
 
     /** Log an atom when VCN network has been validated. */
-    public void logVcnNetworkValidated(int gatewayConnectionId, int networkId) {
+    public void logVcnNetworkValidated(int networkId) {
         VcnStatsLog.write(
                 VcnStatsLog.VCN_NETWORK_STATE_CHANGED,
-                gatewayConnectionId,
+                mGatewayConnectionId,
                 networkId,
                 true /* isConnected */,
                 true /* isValidated */);
     }
 
     /** Log an atom when VCN network has been not validated. */
-    public void logVcnNetworkNotValidated(int gatewayConnectionId, int networkId) {
+    public void logVcnNetworkNotValidated(int networkId) {
         VcnStatsLog.write(
                 VcnStatsLog.VCN_NETWORK_STATE_CHANGED,
-                gatewayConnectionId,
+                mGatewayConnectionId,
                 networkId,
                 true /* isConnected */,
                 false /* isValidated */);
     }
 
+    /** Log an atom when VCN network validation status changes. */
+    public void logVcnNetworkValidationStatus(
+            int networkId,
+            @ValidationStatus int oldStatus,
+            @ValidationStatus int newStatus) {
+        VcnStatsLog.write(
+                VcnStatsLog.VCN_NETWORK_VALIDATION_STATUS_REPORTED,
+                mGatewayConnectionId,
+                networkId,
+                oldStatus,
+                newStatus);
+    }
+
     /**
      * Log an atom about number of validated underlying network available for VCN network selection.
      */
-    public void logValidatedUnderlyingNetworkCount(int gatewayConnectionId, int count) {
+    public void logValidatedUnderlyingNetworkCount(int count) {
         VcnStatsLog.write(
-                VcnStatsLog.VCN_UNDERLYING_NETWORKS_STATE_CHANGED, gatewayConnectionId, count);
+                VcnStatsLog.VCN_UNDERLYING_NETWORKS_STATE_CHANGED, mGatewayConnectionId, count);
+    }
+
+    /** Log an atom whenever we switch VCN's underlying network. */
+    public void logUnderlyingNetworkSwitched(
+            @TransportMask int oldNetworkType,
+            @TransportMask int newNetworkType,
+            int handoffLatencyMs) {
+        VcnStatsLog.write(
+                VcnStatsLog.VCN_UNDERLYING_NETWORK_SWITCHED,
+                mGatewayConnectionId,
+                oldNetworkType,
+                newNetworkType,
+                handoffLatencyMs);
+    }
+
+    /** Log an atom IKE mobility is updated for data stall recovery. */
+    public void logVcnRecoveryIkeMobilityUpdated(
+            @TransportMask int underlyingNetwork,
+            @VcnRecoveryReason int recoveryReason,
+            int handoffLatencyMs) {
+        VcnStatsLog.write(
+                VcnStatsLog.VCN_RECOVERY_IKE_MOBILITY_UPDATED,
+                mGatewayConnectionId,
+                underlyingNetwork,
+                handoffLatencyMs,
+                recoveryReason);
+    }
+
+    /** Log an atom when IpSecPacketLossDetector reports a result. */
+    public void logIpSecPacketLossDetectorReported(
+            @TransportMask int transport,
+            int signalStrength,
+            int packetLossPercent,
+            @IpSecPacketLossResultType int resultType,
+            int configuredPacketLossThreshold) {
+        VcnStatsLog.write(
+                VcnStatsLog.IP_SEC_PACKET_LOSS_DETECTOR_REPORTED,
+                mGatewayConnectionId,
+                transport,
+                signalStrength,
+                packetLossPercent,
+                resultType,
+                configuredPacketLossThreshold);
     }
 }

@@ -18,6 +18,7 @@ package com.android.networkstack.tethering.metrics;
 
 import static android.app.usage.NetworkStats.Bucket.STATE_ALL;
 import static android.app.usage.NetworkStats.Bucket.TAG_NONE;
+import static android.app.usage.NetworkStatsManager.FLAG_POLL_ON_OPEN;
 import static android.net.NetworkCapabilities.TRANSPORT_BLUETOOTH;
 import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
 import static android.net.NetworkCapabilities.TRANSPORT_ETHERNET;
@@ -158,6 +159,7 @@ public class TetheringMetrics {
             return SdkLevel.isAtLeastT() && DeviceConfigUtils.isTetheringFeatureNotChickenedOut(
                     context, TETHER_UPSTREAM_DATA_USAGE_METRICS);
         }
+
 
         /**
          * @see Handler
@@ -489,9 +491,17 @@ public class TetheringMetrics {
      */
     @NonNull
     private DataUsage getCurrentDataUsageForUpstreamType(@NonNull UpstreamType type) {
-        final NetworkStats stats = mNetworkStatsManager.queryDetailsForUidTagState(
-                buildNetworkTemplateForUpstreamType(type), Long.MIN_VALUE, Long.MAX_VALUE,
-                UID_TETHERING, TAG_NONE, STATE_ALL);
+        final NetworkTemplate template = buildNetworkTemplateForUpstreamType(type);
+        final NetworkStats stats;
+        if (SdkLevel.isAtLeastT()) {
+            stats = mNetworkStatsManager.queryDetailsForUidTagState(
+                    template, Long.MIN_VALUE, Long.MAX_VALUE, UID_TETHERING,
+                    TAG_NONE, STATE_ALL, FLAG_POLL_ON_OPEN);
+        } else {
+            stats = mNetworkStatsManager.queryDetailsForUidTagState(
+                    template, Long.MIN_VALUE, Long.MAX_VALUE, UID_TETHERING,
+                    TAG_NONE, STATE_ALL);
+        }
 
         final NetworkStats.Bucket bucket = new NetworkStats.Bucket();
         Long totalTxBytes = 0L;
@@ -642,24 +652,21 @@ public class TetheringMetrics {
 
         switch (type) {
             case UT_CELLULAR:
-                // TODO: Handle the DUN connection, which is not a default network.
+                // Default network status is not set to cover both default and DUN connections,
+                // as the query conditions are already limited by the tethering UID.
                 return new NetworkTemplate.Builder(MATCH_MOBILE)
                         .setMeteredness(METERED_YES)
-                        .setDefaultNetworkStatus(DEFAULT_NETWORK_YES)
                         .build();
             case UT_WIFI:
                 return new NetworkTemplate.Builder(MATCH_WIFI)
-                        .setMeteredness(METERED_YES)
                         .setDefaultNetworkStatus(DEFAULT_NETWORK_YES)
                         .build();
             case UT_BLUETOOTH:
                 return new NetworkTemplate.Builder(MATCH_BLUETOOTH)
-                        .setMeteredness(METERED_YES)
                         .setDefaultNetworkStatus(DEFAULT_NETWORK_YES)
                         .build();
             case UT_ETHERNET:
                 return new NetworkTemplate.Builder(MATCH_ETHERNET)
-                        .setMeteredness(METERED_YES)
                         .setDefaultNetworkStatus(DEFAULT_NETWORK_YES)
                         .build();
             default:

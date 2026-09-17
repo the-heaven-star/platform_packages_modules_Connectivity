@@ -18,10 +18,12 @@
 
 #include <android-base/unique_fd.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <linux/bpf.h>
 #include <linux/unistd.h>
 #include <sys/file.h>
+#include <sys/system_properties.h>
 
 
 namespace android {
@@ -29,6 +31,30 @@ namespace bpf {
 
 using ::android::base::borrowed_fd;
 using ::android::base::unique_fd;
+
+enum class BuildType {
+    UNKNOWN,
+    USER,
+    USERDEBUG,
+    ENG,
+};
+
+static inline BuildType getBuildType() {
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("ro.build.type", value) < 1)
+        return BuildType::UNKNOWN;
+    if (!strcmp(value, "eng")) return BuildType::ENG;
+    if (!strcmp(value, "user")) return BuildType::USER;
+    if (!strcmp(value, "userdebug")) return BuildType::USERDEBUG;
+    return BuildType::UNKNOWN;
+}
+
+const BuildType build_type = getBuildType();
+
+// The following classify the 3 Android build types.
+const bool isEng = (build_type == BuildType::ENG);
+const bool isUser = (build_type == BuildType::USER);
+const bool isUserdebug = (build_type == BuildType::USERDEBUG);
 
 inline uint64_t ptr_to_u64(const void * const x) {
     return (uint64_t)(uintptr_t)x;
@@ -183,11 +209,24 @@ inline int bpfFdGet(const char* pathname, uint32_t flag) {
 
 int bpfGetFdMapId(const borrowed_fd& map_fd);
 
+static inline bool is_cuttlefish() {
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("ro.product.board", value) < 1) return false;
+    return !strcmp(value, "cutf");
+}
+
+// enable use of bpf locking on:
+//   - all eng builds
+//   - cuttlefish userdebug builds
+// as it is only needed for correctness verification on dev/test builds
+const bool lockingEnabled = isEng || (isUserdebug && is_cuttlefish());
+
 inline int bpfLock(int fd, short type) {
-    if (fd < 0) return fd;  // pass any errors straight through
 #ifdef BPF_MAP_LOCKLESS_FOR_TEST
     return fd;
 #endif
+    if (!lockingEnabled) return fd;
+    if (fd < 0) return fd;  // pass any errors straight through
     int mapId = bpfGetFdMapId(fd);
     int saved_errno = errno;
     // 4.14+ required to fetch map id, but we don't want to call isAtLeastKernelVersion
@@ -288,20 +327,23 @@ inline int detachSingleProgram(bpf_attach_type type, const borrowed_fd& prog_fd,
 }
 
 // Available in 4.12 and later kernels.
-inline int runProgram(const borrowed_fd &prog_fd, const void *data,
-                      const uint32_t data_size, const void *ctx = nullptr,
-                      const uint32_t ctx_size = 0) {
-    return bpf(BPF_PROG_RUN,
-               {
-                   .test =
-                       {
-                           .prog_fd = static_cast<__u32>(prog_fd.get()),
-                           .data_size_in = data_size,
-                           .data_in = ptr_to_u64(data),
-                           .ctx_size_in = ctx_size,
-                           .ctx_in = ptr_to_u64(ctx),
-                       },
-               });
+inline int runProgram(const borrowed_fd &prog_fd,
+                      const void *data, const uint32_t data_size,
+                      const void *ctx = nullptr, const uint32_t ctx_size = 0,
+                      uint32_t *retval = nullptr) {
+    bpf_attr attr = {
+        .test =
+            {
+                .prog_fd = static_cast<__u32>(prog_fd.get()),
+                .data_size_in = data_size,
+                .data_in = ptr_to_u64(data),
+                .ctx_size_in = ctx_size,
+                .ctx_in = ptr_to_u64(ctx),
+            },
+    };
+    int ret = bpf(BPF_PROG_RUN, &attr);
+    if (retval) *retval = attr.test.retval;
+    return ret;
 }
 
 // 4.14+: returns next id > prog_id, or 0 (and sets errno)

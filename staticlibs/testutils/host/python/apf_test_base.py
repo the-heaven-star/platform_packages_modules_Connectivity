@@ -22,6 +22,22 @@ APF_ACTIVATION_WAIT_TIME_SEC = 5
 
 class ApfTestBase(multi_devices_test_base.MultiDevicesTestBase):
 
+  def _start_tcpdump(self, ad, iface_name, output_file):
+    if ad.is_rootable:
+      apf_utils.start_tcpdump_capture(ad, iface_name, output_file)
+
+  def _stop_tcpdump(self, ad, iface_name, file_name, src_path):
+    if ad.is_rootable:
+      apf_utils.stop_tcpdump_capture(ad, iface_name)
+      apf_utils.pull_file_from_device(
+          ad=ad,
+          file_name=file_name,
+          extension_name='pcap',
+          src_path=src_path,
+          dst_path=self.current_test_info.output_path,
+      )
+      adb_utils.adb_shell(ad, f'rm -f {src_path}')
+
   def setup_class(self):
     super().setup_class()
 
@@ -46,6 +62,13 @@ class ApfTestBase(multi_devices_test_base.MultiDevicesTestBase):
         'APF GMS-VSR requirements do not apply to automotive devices, skip'
         ' test.',
     )
+
+    # TODO(b/450670091): Run APF tests on desktop devices once the feature is ready.
+    asserts.abort_class_if(
+        self.client.hasPCFeature(),
+        'APF is not implemented on desktop devices, skip test.',
+    )
+
     # Fetch device properties and storing them locally for later use.
     # TODO: refactor to separate instances to store client and server device
     self.server_iface_name, client_network = (
@@ -66,7 +89,30 @@ class ApfTestBase(multi_devices_test_base.MultiDevicesTestBase):
     # Enable doze mode to activate APF.
     adb_utils.set_doze_mode(self.clientDevice, True)
 
+    self._start_tcpdump(
+        self.clientDevice,
+        self.client_iface_name,
+        '/data/local/tmp/client_capture.pcap',
+    )
+    self._start_tcpdump(
+        self.serverDevice,
+        self.server_iface_name,
+        '/data/local/tmp/server_capture.pcap',
+    )
+
   def teardown_class(self):
+    self._stop_tcpdump(
+        self.clientDevice,
+        self.client_iface_name,
+        'client_capture',
+        '/data/local/tmp/client_capture.pcap',
+    )
+    self._stop_tcpdump(
+        self.serverDevice,
+        self.server_iface_name,
+        'server_capture',
+        '/data/local/tmp/server_capture.pcap',
+    )
     adb_utils.set_doze_mode(self.clientDevice, False)
     tether_utils.cleanup_tethering_for_upstream_type(
         self.serverDevice, UpstreamType.NONE
@@ -108,73 +154,103 @@ class ApfTestBase(multi_devices_test_base.MultiDevicesTestBase):
         'Client does not have IPv6 address, fail the test.',
     )
 
+  def _check_counter_and_packet(
+      self,
+      counter_name: str,
+      count_before: int,
+      expected_reply_packet: str,
+      results: dict[str, int],
+  ) -> bool:
+    results['last_apf_counter_value'] = apf_utils.get_apf_counter(
+        self.clientDevice, self.client_iface_name, counter_name
+    )
+    if expected_reply_packet:
+      results['last_matched_receive_pkt_count'] = (
+          apf_utils.get_matched_packet_counts(
+              self.serverDevice, self.server_iface_name, expected_reply_packet
+          )
+      )
+
+    is_counter_increased = results['last_apf_counter_value'] > count_before
+    is_reply_packet_received = not expected_reply_packet or (
+        results['last_matched_receive_pkt_count'] > 0
+    )
+    return is_counter_increased and is_reply_packet_received
+
   def send_packet_and_expect_counter_increased(
-      self, packet: str, counter_name: str
+      self,
+      packet: str,
+      counter_name: str,
+      expected_reply_packet: str = None,
+      test_case_name: str = '',
+      max_retries: int = 10,
+      retry_interval_sec: int = 3,
   ) -> None:
-    count_before_test = apf_utils.get_apf_counter(
-        self.clientDevice,
-        self.client_iface_name,
-        counter_name,
-    )
-    apf_utils.send_raw_packet_downstream(
-        self.serverDevice, self.server_iface_name, packet
-    )
+    """Sends a packet and expects the APF counter to increase.
 
-    assert_utils.expect_with_retry(
-        lambda: apf_utils.get_apf_counter(
-            self.clientDevice,
-            self.client_iface_name,
-            counter_name,
-        )
-        > count_before_test
-    )
+    If expected_reply_packet is not None, the method will also check if the
+    reply
+    packet is received along with checking the counter.
+    """
+    results = {'last_apf_counter_value': 0, 'last_matched_receive_pkt_count': 0}
+    count_before_test = 0
 
-  def send_packet_and_expect_reply_received(
-      self, send_packet: str, counter_name: str, receive_packet: str
-  ) -> None:
     try:
-      apf_utils.start_capture_packets(self.serverDevice, self.server_iface_name)
+      if expected_reply_packet:
+        apf_utils.start_capture_packets(
+            self.serverDevice, self.server_iface_name
+        )
 
       count_before_test = apf_utils.get_apf_counter(
-          self.clientDevice,
-          self.client_iface_name,
-          counter_name,
+          self.clientDevice, self.client_iface_name, counter_name
       )
+      results['last_apf_counter_value'] = count_before_test
 
-      matched_pkt_count_before_test = apf_utils.get_matched_packet_counts(
-          self.serverDevice, self.server_iface_name, receive_packet
+      apf_utils.send_raw_packet_downstream(
+          self.serverDevice, self.server_iface_name, packet
       )
-
-      # send 3 packets to prevent flaky test result
-      for _ in range(3):
-        # Sleep for 3 seconds to give the firmware a time buffer to turn on the APF.
-        time.sleep(3)
-        apf_utils.send_raw_packet_downstream(
-            self.serverDevice, self.server_iface_name, send_packet
-        )
 
       assert_utils.expect_with_retry(
-          lambda: apf_utils.get_matched_packet_counts(
-              self.serverDevice, self.server_iface_name, receive_packet
-          )
-          > matched_pkt_count_before_test,
-          # ensure the server device capturing the offload packet on the handler thread
-          retry_interval_sec=3,
+          predicate=lambda: self._check_counter_and_packet(
+              counter_name,
+              count_before_test,
+              expected_reply_packet,
+              results,
+          ),
+          retry_action=lambda: apf_utils.send_raw_packet_downstream(
+              self.serverDevice, self.server_iface_name, packet
+          ),
+          max_retries=max_retries,
+          retry_interval_sec=retry_interval_sec,
       )
 
-      # TODO: re-enable once the test passes reliably.
-      if False:
-        assert_utils.expect_with_retry(
-            lambda: apf_utils.get_apf_counter(
-                self.clientDevice,
-                self.client_iface_name,
-                counter_name,
-            )
-            > count_before_test
+    except (assert_utils.UnexpectedBehaviorError, Exception) as e:
+      is_counter_increased = (
+          results['last_apf_counter_value'] > count_before_test
+      )
+      is_reply_packet_received = not expected_reply_packet or (
+          results['last_matched_receive_pkt_count'] > 0
+      )
+      errors = []
+      if not is_counter_increased:
+        errors.append(
+            f'APF counter "{counter_name}" did not increase.'
+            f' (before: {count_before_test}, last: {results["last_count"]})'
+        )
+      if expected_reply_packet and not is_reply_packet_received:
+        errors.append(
+            f'Expected reply packet not received: {expected_reply_packet}.'
+            f' (last: {results["last_matched_receive_pkt_count"]})'
         )
 
+      msg = f'{test_case_name} failed: {" ".join(errors)}'
+      asserts.fail(f'{msg} Original error: {e}')
+
     finally:
-      apf_utils.stop_capture_packets(self.serverDevice, self.server_iface_name)
+      if expected_reply_packet:
+        apf_utils.stop_capture_packets(
+            self.serverDevice, self.server_iface_name
+        )
 
   def expect_apf_offload_enabled(self, offload: str):
     assert_utils.expect_with_retry(

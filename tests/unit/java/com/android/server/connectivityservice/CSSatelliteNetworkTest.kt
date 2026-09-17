@@ -18,6 +18,7 @@ package com.android.server
 
 import android.Manifest.permission.NETWORK_SETTINGS
 import android.annotation.SuppressLint
+import android.net.ConnectivitySettingsManager
 import android.net.INetd
 import android.net.NativeNetworkConfig
 import android.net.NativeNetworkType
@@ -29,6 +30,9 @@ import android.net.NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING
 import android.net.NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED
 import android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED
 import android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN
+import android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED
+import android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS
+import android.net.NetworkCapabilities.TRANSPORT_CELLULAR
 import android.net.NetworkCapabilities.TRANSPORT_SATELLITE
 import android.net.NetworkCapabilities.TRANSPORT_WIFI
 import android.net.NetworkRequest
@@ -43,7 +47,11 @@ import android.os.Process
 import android.os.UserHandle
 import android.util.ArraySet
 import com.android.net.module.util.CollectionUtils
-import com.android.server.ConnectivityService.PREFERENCE_ORDER_SATELLITE_FALLBACK
+import com.android.server.ConnectivityService.PREFERENCE_ORDER_APP_OPT_IN
+import com.android.server.connectivity.AppOptInDefaultNetworkPolicy
+import com.android.server.connectivity.AppOptInDefaultNetworkPolicy.POLICY_OTT
+import com.android.server.connectivity.AppOptInDefaultNetworkPolicy.POLICY_SATELLITE_OPT_IN
+import com.android.server.connectivity.AppOptInDefaultNetworkPolicy.POLICY_SATELLITE_ROLE_SMS
 import com.android.testutils.DevSdkIgnoreRule
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo
 import com.android.testutils.DevSdkIgnoreRunner
@@ -55,6 +63,7 @@ import com.android.testutils.TestableNetworkCallback.Event.Resumed
 import com.android.testutils.TestableNetworkCallback.Event.Suspended
 import com.android.testutils.runAsShell
 import com.android.testutils.visibleOnHandlerThread
+import kotlin.test.assertFalse
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import org.junit.Assert
@@ -65,6 +74,7 @@ import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.inOrder
 import org.mockito.Mockito.never
 import org.mockito.Mockito.verify
+import java.util.Collections.emptyList
 
 private const val SECONDARY_USER = 10
 private val SECONDARY_USER_HANDLE = UserHandle(SECONDARY_USER)
@@ -80,30 +90,26 @@ class CSSatelliteNetworkTest : CSTest() {
     val ignoreRule = DevSdkIgnoreRule()
 
     /**
-     * Test createMultiLayerNrisFromSatelliteNetworkPreferredUids returns correct
-     * NetworkRequestInfo.
+     * Test createNrisFromAppOptInPolicies returns correct NetworkRequestInfo.
      */
     @Test
-    fun testCreateMultiLayerNrisFromSatelliteNetworkPreferredUids() {
+    fun testCreateMultiLayerNrisFromAppOptInSmsRoleSatelliteUids() {
         // Verify that empty uid set should not create any NRI for it.
-        val nrisNoUid = service.createMultiLayerNrisFromSatelliteNetworkFallbackUids(
-            emptySet(),
-            emptySet()
-        )
+        val nrisNoUid = service.createNrisFromAppOptInPolicies(emptyList())
         Assert.assertEquals(0, nrisNoUid.size.toLong())
         val uid1 = PRIMARY_USER_HANDLE.getUid(TEST_PACKAGE_UID)
         val uid2 = PRIMARY_USER_HANDLE.getUid(TEST_PACKAGE_UID2)
         val uid3 = SECONDARY_USER_HANDLE.getUid(TEST_PACKAGE_UID)
-        assertCreateMultiLayerNrisFromSatelliteNetworkPreferredUids(mutableSetOf(uid1))
-        assertCreateMultiLayerNrisFromSatelliteNetworkPreferredUids(mutableSetOf(uid1, uid3))
-        assertCreateMultiLayerNrisFromSatelliteNetworkPreferredUids(mutableSetOf(uid1, uid2))
+        assertNrisForAppOptInSmsRoleSatelliteUids(mutableSetOf(uid1))
+        assertNrisForAppOptInSmsRoleSatelliteUids(mutableSetOf(uid1, uid3))
+        assertNrisForAppOptInSmsRoleSatelliteUids(mutableSetOf(uid1, uid2))
     }
 
     /**
-     * Test that satellite network satisfies satellite fallback per-app default network request and
-     * send correct net id and uid ranges to netd.
+     * Test App Opt-In default network request satisfies satellite network and send correct net id
+     * and uid ranges to netd.
      */
-    private fun doTestSatelliteNetworkFallbackUids(restricted: Boolean) {
+    private fun doTestAppOptInSatelliteNetworkUids(restricted: Boolean) {
         val netdInOrder = inOrder(netd)
 
         val satelliteAgent = createSatelliteAgent("satellite0", restricted)
@@ -120,7 +126,7 @@ class CSSatelliteNetworkTest : CSTest() {
         val uid3 = SECONDARY_USER_HANDLE.getUid(TEST_PACKAGE_UID)
 
         // Initial satellite network fallback uids status.
-        updateSatelliteNetworkFallbackUids(emptySet(), emptySet())
+        updateAppOptInDefaultNetworkPolicies(emptyList())
         netdInOrder.verify(netd, never()).networkAddUidRangesParcel(any())
         netdInOrder.verify(netd, never()).networkRemoveUidRangesParcel(any())
 
@@ -130,9 +136,11 @@ class CSSatelliteNetworkTest : CSTest() {
         val config1 = NativeUidRangeConfig(
             satelliteNetId,
             uidRanges1,
-            PREFERENCE_ORDER_SATELLITE_FALLBACK
+            PREFERENCE_ORDER_APP_OPT_IN
         )
-        updateSatelliteNetworkFallbackUids(uids, emptySet())
+        // Construct the policy object for UIDs with the SMS role.
+        var policy = AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, uids)
+        updateAppOptInDefaultNetworkPolicies(listOf(policy))
         netdInOrder.verify(netd).networkAddUidRangesParcel(config1)
         netdInOrder.verify(netd, never()).networkRemoveUidRangesParcel(any())
 
@@ -142,21 +150,23 @@ class CSSatelliteNetworkTest : CSTest() {
         val config2 = NativeUidRangeConfig(
             satelliteNetId,
             uidRanges2,
-            PREFERENCE_ORDER_SATELLITE_FALLBACK
+            PREFERENCE_ORDER_APP_OPT_IN
         )
-        updateSatelliteNetworkFallbackUids(uids, emptySet())
+        // Construct the updated policy object with the smaller UID set.
+        policy = AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, uids)
+        updateAppOptInDefaultNetworkPolicies(listOf(policy))
         netdInOrder.verify(netd).networkRemoveUidRangesParcel(config1)
         netdInOrder.verify(netd).networkAddUidRangesParcel(config2)
     }
 
     @Test
-    fun testSatelliteNetworkFallbackUids_restricted() {
-        doTestSatelliteNetworkFallbackUids(restricted = true)
+    fun testUpdateAppOptInDefaultNetworkPolicies_SmsPolicyWithRestrictedSatellite() {
+        doTestAppOptInSatelliteNetworkUids(restricted = true)
     }
 
     @Test @IgnoreUpTo(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    fun testSatelliteNetworkFallbackUids_nonRestricted() {
-        doTestSatelliteNetworkFallbackUids(restricted = false)
+    fun testUpdateAppOptInDefaultNetworkPolicies_SmsPolicyWithNonRestricted() {
+        doTestAppOptInSatelliteNetworkUids(restricted = false)
     }
 
     private fun doTestSatelliteNeverBecomeDefaultNetwork(restricted: Boolean) {
@@ -190,7 +200,10 @@ class CSSatelliteNetworkTest : CSTest() {
         }
 
         val uids = setOf(TEST_PACKAGE_UID)
-        updateSatelliteNetworkFallbackUids(uids, emptySet())
+        // Create the policy info object for UIDs with the SMS role.
+        val policy = AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, uids)
+        // Call the updated callback method with the list of policy info objects.
+        updateAppOptInDefaultNetworkPolicies(listOf(policy))
 
         if (destroyBeforeRequest) {
             verify(netd, never()).networkAddUidRangesParcel(any())
@@ -199,7 +212,7 @@ class CSSatelliteNetworkTest : CSTest() {
                 NativeUidRangeConfig(
                     satelliteAgent.network.netId,
                     toUidRangeStableParcels(uidRangesForUids(uids)),
-                    PREFERENCE_ORDER_SATELLITE_FALLBACK
+                    PREFERENCE_ORDER_APP_OPT_IN
                 )
             )
         }
@@ -208,7 +221,7 @@ class CSSatelliteNetworkTest : CSTest() {
             satelliteAgent.unregisterAfterReplacement(timeoutMs = 5000)
         }
 
-        updateSatelliteNetworkFallbackUids(setOf(), emptySet())
+        updateAppOptInDefaultNetworkPolicies(emptyList())
         if (destroyBeforeRequest || destroyAfterRequest) {
             // If the network is already destroyed, networkRemoveUidRangesParcel should not be
             // called.
@@ -218,7 +231,7 @@ class CSSatelliteNetworkTest : CSTest() {
                     NativeUidRangeConfig(
                             satelliteAgent.network.netId,
                             toUidRangeStableParcels(uidRangesForUids(uids)),
-                            PREFERENCE_ORDER_SATELLITE_FALLBACK
+                            PREFERENCE_ORDER_APP_OPT_IN
                     )
             )
         }
@@ -241,7 +254,7 @@ class CSSatelliteNetworkTest : CSTest() {
 
     @SuppressLint("MissingPermission")
     @Test @IgnoreUpTo(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    fun testFallbackNetworkCallbacks() {
+    fun testAppOptInDefaultNetworkPoliciesCallbacks() {
         val handler = Handler(Looper.getMainLooper())
         val myUid = Process.myUid()
         val otherUid = Process.myUid() + 1
@@ -255,7 +268,10 @@ class CSSatelliteNetworkTest : CSTest() {
             cm.registerNetworkCallback(NetworkRequest.Builder().clearCapabilities().build(), it)
         }
 
-        updateSatelliteNetworkFallbackUids(setOf(myUid), emptySet())
+        // Create the policy info object for myUid with the SMS role.
+        val policy = AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, setOf(myUid))
+        // Call the updated callback method with the list of policy info objects.
+        updateAppOptInDefaultNetworkPolicies(listOf(policy))
         defaultCb.assertNoCallback()
 
         val satelliteAgent = createSatelliteAgent(
@@ -297,11 +313,92 @@ class CSSatelliteNetworkTest : CSTest() {
         allNetworksCb.expectAvailableCallbacks(satelliteNetwork2, validated = false)
         defaultCb.expectAvailableCallbacks(satelliteNetwork2, validated = false)
 
-        updateSatelliteNetworkFallbackUids(emptySet(), emptySet())
+        updateAppOptInDefaultNetworkPolicies(emptyList())
 
         allNetworksCb.expect<Lost>(satelliteNetwork2)
         defaultCb.expect<Lost>(satelliteNetwork2)
         otherUidCb.assertNoCallback()
+    }
+
+    @Test @IgnoreUpTo(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    fun testSystemUidSatelliteOptInWithMobileDataPreferred() {
+        val handler = Handler(Looper.getMainLooper())
+        val myUid = Process.myUid()
+        val systemUid = Process.SYSTEM_UID
+        val defaultCb = TestableNetworkCallback().also { cm.registerDefaultNetworkCallback(it) }
+        val systemUidCb = TestableNetworkCallback().also {
+            runAsShell(NETWORK_SETTINGS) {
+                cm.registerDefaultNetworkCallbackForUid(systemUid, it, handler)
+            }
+        }
+
+        // Opt-in the system uid to the satellite fallback
+        updateAppOptInDefaultNetworkPolicies(
+                listOf(AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_OPT_IN, setOf(systemUid)))
+        )
+
+        val satelliteAgent = createSatelliteAgent(
+                "satellite0",
+                restricted = false,
+                keepConnected = false
+        ).apply { connect() }
+        val satelliteNetwork = satelliteAgent.network
+
+        // The default network for the system uid is the satellite network
+        defaultCb.assertNoCallback()
+        systemUidCb.expectAvailableCallbacks(satelliteNetwork, validated = false)
+
+        satelliteAgent.disconnect()
+        systemUidCb.expect<Lost>(satelliteNetwork)
+
+        val wifiAgent = Agent(
+                lp = defaultLp().apply { interfaceName = "wlan0" },
+                nc = ncForTransport(TRANSPORT_WIFI)
+        ).apply { connect() }
+        val wifiNetwork = wifiAgent.network
+
+        defaultCb.expectAvailableCallbacks(wifiNetwork, validated = false)
+        systemUidCb.expectAvailableCallbacks(wifiNetwork, validated = false)
+
+        // Enable the mobile data preferred feature for myUid
+        ConnectivitySettingsManager.setMobileDataPreferredUids(context, setOf(myUid))
+
+        val cellAgent = Agent(
+                lp = defaultLp().apply { interfaceName = "rmnet0" },
+                nc = ncForTransport(TRANSPORT_CELLULAR)
+        ).apply { connect() }
+        val cellNetwork = cellAgent.network
+
+        // The default network for myUid is the mobile network
+        defaultCb.expectAvailableCallbacks(cellNetwork, validated = false)
+        systemUidCb.assertNoCallback()
+
+        // Disable the mobile data preferred feature for myUid
+        ConnectivitySettingsManager.setMobileDataPreferredUids(context, setOf())
+        defaultCb.expectAvailableCallbacks(wifiNetwork, validated = false)
+
+        cellAgent.disconnect()
+        wifiAgent.disconnect()
+        defaultCb.expect<Lost>(wifiNetwork)
+        systemUidCb.expect<Lost>(wifiNetwork)
+
+        val satelliteAgent2 = createSatelliteAgent(
+                "satellite0",
+                restricted = false,
+                keepConnected = false
+        )
+        satelliteAgent2.connect()
+        val satelliteNetwork2 = satelliteAgent2.network
+
+        systemUidCb.expectAvailableCallbacks(satelliteNetwork2, validated = false)
+
+        // Remove the system uid from the satellite Opt-in
+        updateAppOptInDefaultNetworkPolicies(emptyList())
+
+        systemUidCb.expect<Lost>(satelliteNetwork2)
+
+        systemUidCb.assertNoCallback()
+        defaultCb.assertNoCallback()
     }
 
     @Test
@@ -344,21 +441,24 @@ class CSSatelliteNetworkTest : CSTest() {
         cb.expect<Resumed>(agent)
     }
 
-    private fun assertCreateMultiLayerNrisFromSatelliteNetworkPreferredUids(uids: Set<Int>) {
-        val nris =
-            service.createMultiLayerNrisFromSatelliteNetworkFallbackUids(uids, emptySet())
+    private fun assertNrisForAppOptInSmsRoleSatelliteUids(uids: Set<Int>) {
+        val policies = listOf(
+                AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, uids)
+        )
+        val nris = service.createNrisFromAppOptInPolicies(policies)
         val nri = nris.iterator().next()
         // Verify that one NRI is created with multilayer requests. Because one NRI can contain
         // multiple uid ranges, so it only need create one NRI here.
         assertEquals(1, nris.size.toLong())
         assertTrue(nri.isMultilayerRequest)
         assertEquals(nri.uids, uidRangesForUids(uids))
-        assertEquals(PREFERENCE_ORDER_SATELLITE_FALLBACK, nri.mPreferenceOrder)
+        assertEquals(PREFERENCE_ORDER_APP_OPT_IN, nri.mPreferenceOrder)
     }
 
-    private fun updateSatelliteNetworkFallbackUids(messagingUids: Set<Int>, optinUids: Set<Int>) {
+    private fun updateAppOptInDefaultNetworkPolicies(
+            policies: List<AppOptInDefaultNetworkPolicy>) {
         visibleOnHandlerThread(csHandler) {
-            deps.satelliteNetworkFallbackUidUpdate!!.accept(messagingUids, optinUids)
+            deps.appOptInDefaultNetworkPoliciesUpdate!!.accept(policies)
         }
     }
 
@@ -422,5 +522,315 @@ class CSSatelliteNetworkTest : CSTest() {
             nc.removeCapability(NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED)
         }
         return nc
+    }
+
+    // Helpers to assert the content of NetworkRequest layers
+    private fun assertTrackDefaultRequest(request: NetworkRequest) {
+        assertEquals(NetworkRequest.Type.TRACK_DEFAULT, request.type)
+    }
+
+    private fun assertSmsRequest(request: NetworkRequest) {
+        val caps = request.networkCapabilities
+        assertTrue(caps.hasTransport(TRANSPORT_SATELLITE))
+        assertFalse(caps.hasCapability(NET_CAPABILITY_NOT_RESTRICTED))
+        assertFalse(caps.hasCapability(NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_INTERNET))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_NOT_VCN_MANAGED))
+    }
+
+    private fun assertOptInRequest(request: NetworkRequest) {
+        val caps = request.networkCapabilities
+        assertTrue(caps.hasTransport(TRANSPORT_SATELLITE))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_NOT_RESTRICTED))
+        assertFalse(caps.hasCapability(NET_CAPABILITY_NOT_BANDWIDTH_CONSTRAINED))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_INTERNET))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_NOT_VCN_MANAGED))
+    }
+
+    @Test
+    fun testCreateNrisFromAppOptInPolicies_emptyList_producesNoNris() {
+        val nris = service.createNrisFromAppOptInPolicies(emptyList())
+        assertEquals(0, nris.size.toLong())
+    }
+
+    @Test
+    fun testCreateNrisFromAppOptInPolicies_smsOnly_createsSmsRequest() {
+        val uid1 = PRIMARY_USER_HANDLE.getUid(TEST_PACKAGE_UID)
+        val uid2 = PRIMARY_USER_HANDLE.getUid(TEST_PACKAGE_UID2)
+        val smsPolicies = listOf(
+                AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, setOf(uid1, uid2)))
+
+        val nris = service.createNrisFromAppOptInPolicies(smsPolicies)
+
+        assertEquals(1, nris.size)
+        val requests = nris.valueAt(0).mRequests
+        assertEquals(2, requests.size)
+        assertTrackDefaultRequest(requests[0])
+        assertSmsRequest(requests[1])
+    }
+
+    @Test
+    fun testCreateNrisFromAppOptInPolicies_optInOnly_createsOptInRequest() {
+        val uid = SECONDARY_USER_HANDLE.getUid(TEST_PACKAGE_UID)
+        val optInPolicies = listOf(
+                AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_OPT_IN, setOf(uid))
+        )
+
+        val nris = service.createNrisFromAppOptInPolicies(optInPolicies)
+
+        assertEquals(1, nris.size)
+        val requests = nris.valueAt(0).mRequests
+        assertEquals(2, requests.size)
+        assertTrackDefaultRequest(requests[0])
+        assertOptInRequest(requests[1])
+    }
+
+    /**
+     * Test that ConnectivityService correctly handles a mixed list of policies, including
+     * overlapping policies for a single UID.
+     */
+    @Test
+    fun testCreateAppOptInNris_MixedAndOverlappingPolicies() {
+        val uidSms = 1001
+        val uidOptIn = 1002
+        val uidBoth = 1003
+        val policyFlags = POLICY_SATELLITE_OPT_IN or POLICY_SATELLITE_ROLE_SMS
+
+        val mixedPolicies = listOf(
+                AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, setOf(uidSms)),
+                AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_OPT_IN, setOf(uidOptIn)),
+                AppOptInDefaultNetworkPolicy(policyFlags, setOf(uidBoth))
+        )
+
+        val nris = service.createNrisFromAppOptInPolicies(mixedPolicies)
+        assertEquals(3, nris.size)
+
+        // Find and verify the NRI for the SMS-only UID
+        val smsNri = nris.first { it.uids == uidRangesForUids(setOf(uidSms)) }
+        assertEquals(2, smsNri.mRequests.size)
+        assertTrackDefaultRequest(smsNri.mRequests[0])
+        assertSmsRequest(smsNri.mRequests[1])
+
+        // Find and verify the NRI for the Opt-in only UID
+        val optInNri = nris.first { it.uids == uidRangesForUids(setOf(uidOptIn)) }
+        assertEquals(2, optInNri.mRequests.size)
+        assertTrackDefaultRequest(optInNri.mRequests[0])
+        assertOptInRequest(optInNri.mRequests[1])
+
+        // Find and verify the NRI for the UID with both flags set
+        val bothNri = nris.first { it.uids == uidRangesForUids(setOf(uidBoth)) }
+        // Expect 3 layers now: TRACK_DEFAULT + SMS + Opt-in
+        assertEquals(3, bothNri.mRequests.size)
+        assertTrackDefaultRequest(bothNri.mRequests[0])
+        assertSmsRequest(bothNri.mRequests[1])
+        assertOptInRequest(bothNri.mRequests[2])
+    }
+
+    /**
+     * Test createAppOptInNrisFromPolicyList returns correct NetworkRequestInfo for OTT UIDs.
+     */
+    @Test
+    fun testCreateAppOptInNrisFromPolicyList_forOnlyOttUids() {
+        val ottUid = PRIMARY_USER_HANDLE.getUid(TEST_PACKAGE_UID)
+        val ottPolicy = listOf(AppOptInDefaultNetworkPolicy(POLICY_OTT, setOf(ottUid)))
+        val nris = service.createNrisFromAppOptInPolicies(ottPolicy)
+        assertEquals(1, nris.size)
+        val nri = nris.valueAt(0)
+        assertTrue(nri.isMultilayerRequest)
+        assertEquals(PREFERENCE_ORDER_APP_OPT_IN, nri.mPreferenceOrder)
+        // Verify the layers: Unmetered, ufc and TRACK_DEFAULT
+        assertEquals(3, nri.mRequests.size)
+        assertUnmeteredRequest(nri.mRequests[0])
+        assertUfcRequest(nri.mRequests[1])
+        assertTrackDefaultRequest(nri.mRequests[2])
+    }
+
+    /**
+     * Test createAppOptInNrisFromPolicyList returns correct NetworkRequestInfo for a mixed
+     * list of OTT, SMS, and Opt-In UIDs.
+     */
+    @Test
+    fun testCreateAppOptInNrisFromPolicyList_differentPolicies_ForOttSmsAndOptInPolicy() {
+        val ottUid = 1001
+        val smsUid = 1002
+        val optInUid = 1003
+        val mixedPolicyList = listOf(
+                AppOptInDefaultNetworkPolicy(POLICY_OTT, setOf(ottUid)),
+                AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_ROLE_SMS, setOf(smsUid)),
+                AppOptInDefaultNetworkPolicy(POLICY_SATELLITE_OPT_IN, setOf(optInUid))
+        )
+
+        val nris = service.createNrisFromAppOptInPolicies(mixedPolicyList)
+        assertEquals(3, nris.size)
+
+        // Find and verify the NRI for the OTT UID
+        val ottNri = nris.first { it.uids == uidRangesForUids(setOf(ottUid)) }
+        assertTrue(ottNri.isMultilayerRequest)
+        assertEquals(3, ottNri.mRequests.size)
+        assertUnmeteredRequest(ottNri.mRequests[0])
+        assertUfcRequest(ottNri.mRequests[1])
+        assertTrackDefaultRequest(ottNri.mRequests[2])
+
+        // Find and verify the NRI for the SMS UID
+        val smsNri = nris.first { it.uids == uidRangesForUids(setOf(smsUid)) }
+        // This test now correctly expects 2 layers for the SMS fallback request.
+        assertEquals(2, smsNri.mRequests.size)
+        assertTrackDefaultRequest(smsNri.mRequests[0])
+        assertSmsRequest(smsNri.mRequests[1])
+
+        // Find and verify the NRI for the Opt-in UID
+        val optInNri = nris.first { it.uids == uidRangesForUids(setOf(optInUid)) }
+        // This test now correctly expects 2 layers for the Opt-In fallback request.
+        assertEquals(2, optInNri.mRequests.size)
+        assertTrackDefaultRequest(optInNri.mRequests[0])
+        assertOptInRequest(optInNri.mRequests[1])
+    }
+
+    /**
+     * Test that a single AppOptInDefaultNetworkInfo with both OTT and SMS role flags set
+     * to true creates a single NRI with all the corresponding request layers.
+     */
+    @Test
+    fun testCreateAppOptInNrisFromPolicyList_forCombinedOttAndSmsPolicy() {
+        val commonUid = 1006
+        val combinedPolicyFlags = POLICY_SATELLITE_ROLE_SMS or POLICY_OTT
+        val combinedPolicy = listOf(
+                AppOptInDefaultNetworkPolicy(combinedPolicyFlags, setOf(commonUid)))
+
+        val nris = service.createNrisFromAppOptInPolicies(combinedPolicy)
+        // A single policy object should result in a single NRI.
+        assertEquals(1, nris.size)
+
+        val nri = nris.valueAt(0)
+        assertTrue(nri.isMultilayerRequest)
+        // Expect 4 layers: OTT (2) + TRACK_DEFAULT (1) + SMS (1)
+        assertEquals(4, nri.mRequests.size)
+
+        // Verify the layers are created in the correct order.
+        assertUnmeteredRequest(nri.mRequests[0]) // OTT Layer 1
+        assertUfcRequest(nri.mRequests[1])   // OTT Layer 2
+        // Default Layer is always added
+        assertTrackDefaultRequest(nri.mRequests[2])
+
+        // Verify the Satellite SMS layer
+        assertSmsRequest(nri.mRequests[3])
+    }
+
+    /**
+     * Test that a single AppOptInDefaultNetworkInfo with isOtt, isSatelliteRoleSms, and
+     * isSatelliteOptIn all set to true creates a single NRI with OTT and SMS layers.
+     */
+    @Test
+    fun testCreateAppOptInNrisFromPolicyList_forCombinedOttSmsAndOptInPolicy() {
+        val commonUid = 1007
+        val combinedPolicyFlags = POLICY_SATELLITE_OPT_IN or POLICY_SATELLITE_ROLE_SMS or POLICY_OTT
+        val combinedPolicy = listOf(
+                AppOptInDefaultNetworkPolicy(combinedPolicyFlags, setOf(commonUid))
+        )
+
+        val nris = service.createNrisFromAppOptInPolicies(combinedPolicy)
+        // A single policy object results in a single NRI.
+        assertEquals(1, nris.size)
+
+        val nri = nris.valueAt(0)
+        assertTrue(nri.isMultilayerRequest)
+        // Expect 5 layers: OTT (2) + TRACK_DEFAULT (1) + SMS (1) + OPT-IN (1)
+        assertEquals(5, nri.mRequests.size)
+
+        // Verify the layers are created in the correct order.
+        assertUnmeteredRequest(nri.mRequests[0]) // OTT Layer 1
+        assertUfcRequest(nri.mRequests[1])   // OTT Layer 2
+        assertTrackDefaultRequest(nri.mRequests[2])
+
+        // Verify the Satellite SMS layer is present
+        assertSmsRequest(nri.mRequests[3])
+
+        // Verify the Opt-in request layer
+        assertOptInRequest(nri.mRequests[4])
+    }
+
+    /**
+     * Helper to assert the content of an Unmetered request layer for OTT.
+     */
+    private fun assertUnmeteredRequest(request: NetworkRequest) {
+        assertEquals(NetworkRequest.Type.REQUEST, request.type)
+        val caps = request.networkCapabilities
+        assertTrue(caps.hasCapability(NET_CAPABILITY_INTERNET))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_NOT_VCN_MANAGED))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_NOT_METERED))
+    }
+
+    /**
+     * Helper to assert the content of a ufc request layer for OTT.
+     */
+    private fun assertUfcRequest(request: NetworkRequest) {
+        assertEquals(NetworkRequest.Type.REQUEST, request.type)
+        val caps = request.networkCapabilities
+        assertTrue(caps.hasTransport(TRANSPORT_CELLULAR))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS))
+        assertTrue(caps.hasCapability(NET_CAPABILITY_NOT_VCN_MANAGED))
+    }
+
+    private fun ufcNc(): NetworkCapabilities {
+        return ncForTransport(TRANSPORT_CELLULAR).apply {
+            removeCapability(NET_CAPABILITY_INTERNET)
+            addCapability(NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS)
+        }
+    }
+
+    @Test
+    fun testUfcSliceIsReleased_whenWifiConnects() {
+        val myUid = Process.myUid()
+
+        // Register callbacks
+        val defaultCb = TestableNetworkCallback().also { cm.registerDefaultNetworkCallback(it) }
+        val allNetworksCb = TestableNetworkCallback().also {
+            cm.registerNetworkCallback(NetworkRequest.Builder().clearCapabilities().build(), it)
+        }
+
+        // Initial setup: standard cellular network is the default.
+        val cellAgent = Agent(
+                lp = defaultLp().apply { interfaceName = "rmnet_data1" },
+                nc = ncForTransport(TRANSPORT_CELLULAR)
+        ).apply { connect() }
+        val cellNetwork = cellAgent.network
+        defaultCb.expectAvailableCallbacks (cellNetwork, validated = false)
+        allNetworksCb.expectAvailableCallbacks (cellNetwork, validated = false)
+
+        // Create the policy for an OTT UID to request a UFC slice.
+        val policy = AppOptInDefaultNetworkPolicy(POLICY_OTT, setOf(myUid))
+        updateAppOptInDefaultNetworkPolicies(listOf(policy))
+
+        val ufcCellAgent = Agent(
+                lp = defaultLp().apply { interfaceName = "rmnet_data0" },
+                nc = ufcNc()
+        ).apply { connect() }
+        val ufcCellNetwork = ufcCellAgent.network
+
+        // The app's default network should switch to the UFC slice.
+        defaultCb.expectAvailableCallbacks (ufcCellNetwork , validated = false)
+        allNetworksCb.expectAvailableCallbacks(ufcCellNetwork , validated = false)
+
+        // Turn on Wi-Fi.
+        val wifiNc = ncForTransport(TRANSPORT_WIFI).apply {
+            addCapability(NET_CAPABILITY_NOT_METERED)
+        }
+        val wifiAgent = Agent(
+                lp = defaultLp().apply { interfaceName = "wlan0" },
+                nc = wifiNc
+        ).apply { connect() }
+        val wifiNetwork = wifiAgent.network
+
+        // The app's default network should switch to Wi-Fi.
+        defaultCb.expectAvailableCallbacks(wifiNetwork , validated = false)
+
+       // UFC network is released.
+        allNetworksCb.eventuallyExpect<Losing> { it.network == ufcCellNetwork }
+        allNetworksCb.eventuallyExpect<Lost> { it.network == ufcCellNetwork }
+
+        // Now Cleanup
+        updateAppOptInDefaultNetworkPolicies(emptyList())
+        wifiAgent.disconnect()
+        cellAgent.disconnect()
     }
 }

@@ -38,12 +38,6 @@ public final class ConnectivityFlags {
     public static final String NO_REMATCH_ALL_REQUESTS_ON_REGISTER =
             "no_rematch_all_requests_on_register";
 
-    public static final String CARRIER_SERVICE_CHANGED_USE_CALLBACK =
-            "carrier_service_changed_use_callback_version";
-
-    public static final String REQUEST_RESTRICTED_WIFI =
-            "request_restricted_wifi";
-
     public static final String INGRESS_TO_VPN_ADDRESS_FILTERING =
             "ingress_to_vpn_address_filtering";
 
@@ -66,9 +60,6 @@ public final class ConnectivityFlags {
             "queue_network_agent_events_in_system_server";
 
     public static final String CLOSE_QUIC_CONNECTION = "close_quic_connection";
-
-    public static final String CONSTRAINED_DATA_SATELLITE_OPTIN =
-            "constrained_data_satellite_optin";
 
     public static final String CONSTRAINED_DATA_SATELLITE_METRICS =
             "constrained_data_satellite_metrics";
@@ -100,6 +91,8 @@ public final class ConnectivityFlags {
      */
     public static final String USE_BROADCAST_RECEIVE_HELPER_FOR_PERMISSION_MONITOR =
             "use_broadcast_receive_helper_for_permission_monitor";
+
+    public static final String OTT_NETWORK_SLICING = "ott_network_slicing";
 
     private boolean mNoRematchAllRequestsOnRegister;
 

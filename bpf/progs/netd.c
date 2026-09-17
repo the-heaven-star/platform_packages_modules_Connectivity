@@ -15,11 +15,12 @@
  */
 
 // The resulting .o needs to load on Android T+
-#define BPFLOADER_MIN_VER BPFLOADER_MAINLINE_T_VERSION
+#define NETBPFLOAD_MINAPI_VER NETBPFLOAD_T_VER
 #define BPF_OBJ_NAME "netd"
 #define DEFAULT_BPF_PIN_SUBDIR "netd_shared"
 
 #include "bpf_net_helpers.h"
+#include "internal_net_api.h"
 #include "netd.h"
 
 // This is defined for cgroup bpf filter only.
@@ -30,26 +31,39 @@ static const int DROP_UNLESS_DNS = 2;  // internal to our program
 // offsetof(struct iphdr, ihl) -- but that's a bitfield
 #define IPPROTO_IHL_OFF 0
 
-// This is offsetof(struct tcphdr, "32 bit tcp flag field")
-// The tcp flags are after be16 source, dest & be32 seq, ack_seq, hence 12 bytes in.
-//
 // Note that TCP_FLAG_{ACK,PSH,RST,SYN,FIN} are htonl(0x00{10,08,04,02,01}0000)
-// see include/uapi/linux/tcp.h
-#define TCP_FLAG32_OFF 12
+// see include/uapi/linux/tcp.h.
+//
+// Since we only support little endian, that effectively
+// means they're 0x0000{10,08,04,02,01}00 which is the same as 0x{10,08,04,02,01}00,
+// which in turn is the same as htons(0x{10,08,04,02,01})
+//
+// This means they can *also* be used to match against __be16 flags16 field.
 
-#define TCP_FLAG8_OFF (TCP_FLAG32_OFF + 1)
+// This is the offset of the 2nd byte of tcp flags
+#define TCP_FLAG8_OFF (TCP_OFFSET(flags16) + 1)
+#define TCP_FLAG8_FIN 0x01
+#define TCP_FLAG8_SYN 0x02
+#define TCP_FLAG8_RST 0x04
+
+#define EPERM 1
+#define EINVAL  22
+#define EUNATCH 49
 
 // For maps netd does not need to access
-#define DEFINE_BPF_MAP_NO_NETD(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries) \
-    DEFINE_BPF_MAP_EXT(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries,         \
+#define DEFINE_BPF_MAP_NO_NETD_API(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries, minApi) \
+    DEFINE_BPF_MAP_EXT(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries, \
                        AID_ROOT, AID_NET_BW_ACCT, 0060, "net_shared", DEFAULT_BPF_PIN_SUBDIR, \
-                       BPFLOADER_MIN_VER, BPFLOADER_MAX_VER, 0)
+                       minApi, MAXAPI, 0)
+
+#define DEFINE_BPF_MAP_NO_NETD(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries) \
+    DEFINE_BPF_MAP_NO_NETD_API(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries, MINAPI)
 
 // For maps netd only needs read only access to
-#define DEFINE_BPF_MAP_RO_NETD(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries)  \
-    DEFINE_BPF_MAP_EXT(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries,          \
+#define DEFINE_BPF_MAP_RO_NETD(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries) \
+    DEFINE_BPF_MAP_EXT(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries, \
                        AID_ROOT, AID_NET_BW_ACCT, 0460, "netd_readonly", DEFAULT_BPF_PIN_SUBDIR, \
-                       BPFLOADER_MIN_VER, BPFLOADER_MAX_VER, 0)
+                       MINAPI, MAXAPI, 0)
 
 // For maps netd needs to be able to read and write
 #define DEFINE_BPF_MAP_RW_NETD(the_map, TYPE, TypeOfKey, TypeOfValue, num_entries) \
@@ -75,8 +89,12 @@ DEFINE_BPF_MAP_RO_NETD(stats_map_B, HASH, StatsKey, StatsValue, STATS_MAP_SIZE)
 DEFINE_BPF_MAP_NO_NETD(iface_stats_map, HASH, uint32_t, StatsValue, 1000)
 DEFINE_BPF_MAP_RO_NETD(uid_owner_map, HASH, uint32_t, UidOwnerValue, 20000)
 DEFINE_BPF_MAP_RO_NETD(uid_permission_map, HASH, uint32_t, uint8_t, 6000)
+// Support up to 1152 * 900 = 1,036,800 UIDs
+DEFINE_BPF_MAP_RO_NETD(uid_permission_chunk_map, HASH, uint32_t,
+                       UidPermissionChunk, -900)
 DEFINE_BPF_MAP_NO_NETD(ingress_discard_map, HASH, IngressDiscardKey, IngressDiscardValue, 100)
 
+DEFINE_BPF_MAP_RW_NETD(netd_pid_map, ARRAY, uint32_t, uint32_t, 1)
 DEFINE_BPF_MAP_RW_NETD(lock_array_test_map, ARRAY, uint32_t, bool, 1)
 DEFINE_BPF_MAP_RW_NETD(lock_hash_test_map, HASH, uint32_t, bool, 1)
 
@@ -88,23 +106,51 @@ DEFINE_BPF_MAP_NO_NETD(iface_index_name_map, HASH, uint32_t, IfaceValue, 1000)
 // A single-element configuration array, packet tracing is enabled when 'true'.
 DEFINE_BPF_MAP_EXT(packet_trace_enabled_map, ARRAY, uint32_t, bool, 1,
                    AID_ROOT, AID_SYSTEM, 0060, "net_shared", DEFAULT_BPF_PIN_SUBDIR,
-                   BPFLOADER_MAINLINE_U_VERSION, BPFLOADER_MAX_VER, 0)
+                   U, MAXAPI, 0)
 
 // A ring buffer on which packet information is pushed.
 DEFINE_BPF_RINGBUF_EXT(packet_trace_ringbuf, PacketTrace, 32 * 1024,
                        AID_ROOT, AID_SYSTEM, 0060, "net_shared", DEFAULT_BPF_PIN_SUBDIR,
-                       BPFLOADER_MAINLINE_U_VERSION, BPFLOADER_MAX_VER);
+                       U, MAXAPI);
 
 DEFINE_BPF_MAP_RO_NETD(data_saver_enabled_map, ARRAY, uint32_t, bool, 1)
 
-DEFINE_BPF_MAP_EXT(local_net_access_map, LPM_TRIE, LocalNetAccessKey, bool, 1000,
-                   AID_ROOT, AID_NET_BW_ACCT, 0060, "net_shared", DEFAULT_BPF_PIN_SUBDIR,
-                   BPFLOADER_MAINLINE_25Q2_VERSION, BPFLOADER_MAX_VER, 0)
+DEFINE_BPF_MAP_NO_NETD_API(local_net_access_map, LPM_TRIE, LocalNetAccessKey, bool, 1000, 25Q2)
 
 // not preallocated
-DEFINE_BPF_MAP_EXT(local_net_blocked_uid_map, HASH, uint32_t, bool, -1000,
-                   AID_ROOT, AID_NET_BW_ACCT, 0060, "net_shared", DEFAULT_BPF_PIN_SUBDIR,
-                   BPFLOADER_MAINLINE_25Q2_VERSION, BPFLOADER_MAX_VER, 0)
+DEFINE_BPF_MAP_NO_NETD_API(local_net_blocked_uid_map, HASH, uint32_t, bool, -1000, 25Q2)
+
+// This trie holds exceptions to blocked access listed in local_net_access_map.
+// Although it is a trie, it is only used as a map (all entries use the maximum
+// prefix length). A trie is used because map keys are preallocated, which would
+// be wasteful as the keys are much larger than the values.
+DEFINE_BPF_MAP_NO_NETD_API(local_net_uid_host_allowlist_map, LPM_TRIE,
+                           LocalNetUidHostAllowlistKey, bool, 1000, 25Q2)
+
+DEFINE_BPF_MAP_RO_NETD(uid_migration_enabled_map, ARRAY, uint32_t, bool, 1)
+
+DEFINE_BPF_MAP_NO_NETD(permission_propagation_enabled_map, ARRAY, uint32_t, bool, 1)
+// A ring buffer on which note op event of local network access is pushed.
+DEFINE_BPF_RINGBUF_EXT(local_net_note_op_ringbuf, LocalNetNoteOp, 8 * 512,
+                       AID_ROOT, AID_NET_BW_ACCT, 0060, "net_shared", DEFAULT_BPF_PIN_SUBDIR,
+                       25Q2, MAXAPI);
+DEFINE_BPF_MAP_NO_NETD_API(local_net_note_op_cache_map, LRU_HASH, uint32_t, uint32_t, 100, 25Q2)
+DEFINE_BPF_MAP_NO_NETD_API(local_net_note_op_enabled_map, ARRAY, uint32_t, bool, 1, 25Q2)
+
+// A single-element array holding the current generation ID of the local network
+// cache map. Updated by the system. Even IDs represent a stable cache state.
+// Odd IDs represent an unstable state, during which the cache should not be
+// used.
+DEFINE_BPF_MAP_NO_NETD_API(local_net_cache_generation_id_map, ARRAY, uint32_t, uint64_t, 1, 25Q2)
+
+// A ring buffer on which loopback access events are pushed.
+DEFINE_BPF_RINGBUF_EXT(loopback_access_ringbuf, LoopbackAccessEvent, 16 * 512,
+                       AID_ROOT, AID_SYSTEM, 0060, "net_shared", DEFAULT_BPF_PIN_SUBDIR,
+                       25Q4, MAXAPI);
+DEFINE_BPF_MAP_NO_NETD_API(loopback_access_cache_map, LRU_HASH, LoopbackAccessEvent, uint64_t, 100,
+                           25Q4)
+DEFINE_BPF_MAP_RO_NETD(loopback_access_metrics_enabled_map, ARRAY, uint32_t, bool, 1)
+DEFINE_BPF_MAP_RO_NETD(loopback_checks_enabled_map, ARRAY, uint32_t, bool, 1)
 
 // iptables xt_bpf programs need to be usable by both netd and netutils_wrappers
 // selinux contexts, because even non-xt_bpf iptables mutations are implemented as
@@ -113,36 +159,36 @@ DEFINE_BPF_MAP_EXT(local_net_blocked_uid_map, HASH, uint32_t, bool, -1000,
 // program (see XT_BPF_MODE_PATH_PINNED) and then the iptables binary (or rather
 // the kernel acting on behalf of it) must be able to retrieve the pinned program
 // for the reload to succeed
-#define DEFINE_XTBPF_PROG(TYPE, NAME, VER) \
-    DEFINE_BPF_PROG(TYPE, NAME, VER, AID_NET_ADMIN)
+#define DEFINE_XTBPF_PROG(TYPE, NAME) \
+    DEFINE_BPF_PROG(TYPE, NAME, AID_NET_ADMIN)
 
 // programs that need to be usable by netd, but not by netutils_wrappers
 // (this is because these are currently attached by the mainline provided libnetd_updatable .so
 // which is loaded into netd and thus runs as netd uid/gid/selinux context)
-#define DEFINE_NETD_BPF_PROG_RANGES(TYPE, NAME, VER, minKV, maxKV, min_loader, max_loader) \
-    DEFINE_BPF_PROG_EXT(TYPE, NAME, VER, AID_ROOT, AID_ROOT,                               \
-                        minKV, maxKV, min_loader, max_loader, MANDATORY,                   \
+#define DEFINE_NETD_BPF_PROG_RANGES(TYPE, NAME, minKV, maxKV, min_api, max_api) \
+    DEFINE_BPF_PROG_EXT(TYPE, NAME, AID_ROOT, AID_ROOT, minKV, maxKV, min_api, max_api, MANDATORY, \
                         "netd_readonly", DEFAULT_BPF_PIN_SUBDIR)
 
-#define DEFINE_NETD_BPF_PROG_KVER_RANGE(TYPE, NAME, VER, minKV, maxKV) \
-    DEFINE_NETD_BPF_PROG_RANGES(TYPE, NAME, VER, minKV, maxKV, BPFLOADER_MIN_VER, BPFLOADER_MAX_VER)
+#define DEFINE_NETD_T_BPF_PROG_KVER_RANGE(TYPE, NAME, minKV, maxKV) \
+    DEFINE_NETD_BPF_PROG_RANGES(TYPE, NAME, minKV, maxKV, T, MAXAPI)
 
-#define DEFINE_NETD_BPF_PROG_KVER(TYPE, NAME, VER, min_kv) \
-    DEFINE_NETD_BPF_PROG_KVER_RANGE(TYPE, NAME, VER, min_kv, INF)
-
-#define DEFINE_NETD_BPF_PROG(TYPE, NAME, VER) \
-    DEFINE_NETD_BPF_PROG_KVER(TYPE, NAME, VER, 4_9)
-
-#define DEFINE_NETD_V_BPF_PROG_KVER(TYPE, NAME, VER, minKV)                         \
-    DEFINE_BPF_PROG_EXT(TYPE, NAME, VER, AID_ROOT, AID_ROOT, minKV, INF,            \
-                        BPFLOADER_MAINLINE_V_VERSION, BPFLOADER_MAX_VER, MANDATORY, \
-                        "netd_readonly", DEFAULT_BPF_PIN_SUBDIR)
+#define DEFINE_NETD_T_BPF_PROG_KVER(TYPE, NAME, minKV) \
+    DEFINE_NETD_T_BPF_PROG_KVER_RANGE(TYPE, NAME, minKV, INF)
 
 // programs that only need to be usable by the system server
-#define DEFINE_SYS_BPF_PROG(TYPE, NAME, VER) \
-    DEFINE_BPF_PROG_EXT(TYPE, NAME, VER, AID_ROOT, AID_NET_ADMIN, 4_9, INF, \
-                        BPFLOADER_MIN_VER, BPFLOADER_MAX_VER, MANDATORY,    \
+#define DEFINE_SYS_BPF_PROG(TYPE, NAME) \
+    DEFINE_BPF_PROG_EXT(TYPE, NAME, AID_ROOT, AID_NET_ADMIN, 4_9, INF, MINAPI, MAXAPI, MANDATORY, \
                         "net_shared", DEFAULT_BPF_PIN_SUBDIR)
+
+// tcpAccECN maps/programs need to load only on Android 26Q2+
+#undef NETBPFLOAD_MINAPI_VER
+#define NETBPFLOAD_MINAPI_VER NETBPFLOAD_26Q2_VER
+
+#include "tcpAccECN.h"
+
+// reset back to T+ minimum for the rest of the file
+#undef NETBPFLOAD_MINAPI_VER
+#define NETBPFLOAD_MINAPI_VER NETBPFLOAD_T_VER
 
 /*
  * Note: this blindly assumes an MTU of 1500, and that packets > MTU are always TCP,
@@ -172,10 +218,11 @@ DEFINE_BPF_MAP_EXT(local_net_blocked_uid_map, HASH, uint32_t, bool, -1000,
  * (which adjusts upward by 20 bytes per packet to account for ipv4 -> ipv6 header conversion)
  */
 #define DEFINE_UPDATE_STATS(the_stats_map, TypeOfKey)                                            \
-    static __always_inline inline void update_##the_stats_map(const struct __sk_buff* const skb, \
-                                                              const TypeOfKey* const key,        \
-                                                              const struct egress_bool egress,   \
-                                                     __unused const struct kver_uint kver) {     \
+    function void update_##the_stats_map(const struct __sk_buff* const skb,                      \
+                                         const TypeOfKey* const key,                             \
+                                         const struct egress_bool egress,                        \
+                                         const struct kver_uint kver,                            \
+                                         const struct undo_bool undo) {                          \
         StatsValue* value = bpf_##the_stats_map##_lookup_elem(key);                              \
         if (!value) {                                                                            \
             StatsValue newValue = {};                                                            \
@@ -183,7 +230,7 @@ DEFINE_BPF_MAP_EXT(local_net_blocked_uid_map, HASH, uint32_t, bool, -1000,
             value = bpf_##the_stats_map##_lookup_elem(key);                                      \
         }                                                                                        \
         if (value) {                                                                             \
-            const bool is5_4 = KVER_IS_AT_LEAST(kver, 5, 4, 0);                                  \
+            const bool is5_4 = KVER_IS_AT_LEAST(kver, 5, 4);                                     \
             const int mtu = 1500;                                                                \
             uint64_t packets = 1;                                                                \
             uint64_t bytes = skb->len;                                                           \
@@ -202,6 +249,10 @@ DEFINE_BPF_MAP_EXT(local_net_blocked_uid_map, HASH, uint32_t, bool, -1000,
                 packets = is5_4 ? gso_segs : (payload + mss - 1) / mss;                          \
                 bytes = overhead * packets + payload;                                            \
             }                                                                                    \
+            if (undo.undo) {                                                                     \
+                packets = -packets;                                                              \
+                bytes = -bytes;                                                                  \
+            }                                                                                    \
             if (egress.egress) {                                                                 \
                 __sync_fetch_and_add(&value->txPackets, packets);                                \
                 __sync_fetch_and_add(&value->txBytes, bytes);                                    \
@@ -218,11 +269,11 @@ DEFINE_UPDATE_STATS(stats_map_A, StatsKey)
 DEFINE_UPDATE_STATS(stats_map_B, StatsKey)
 
 // both of these return 0 on success or -EFAULT on failure (and zero out the buffer)
-static __always_inline inline int bpf_skb_load_bytes_net(const struct __sk_buff* const skb,
-                                                         const int L3_off,
-                                                         void* const to,
-                                                         const int len,
-                                                         const struct kver_uint kver) {
+function long bpf_skb_load_bytes_net(const struct __sk_buff* const skb,
+                                     const int L3_off,
+                                     void* const to,
+                                     const int len,
+                                     const struct kver_uint kver) {
     // 'kver' (here and throughout) is the compile time guaranteed minimum kernel version,
     // ie. we're building (a version of) the bpf program for kver (or newer!) kernels.
     //
@@ -239,100 +290,271 @@ static __always_inline inline int bpf_skb_load_bytes_net(const struct __sk_buff*
     //
     // For similar reasons this will fail with non-offloaded VLAN tags on < 4.19 kernels,
     // since those extend the ethernet header from 14 to 18 bytes.
-    return KVER_IS_AT_LEAST(kver, 4, 19, 0)
+    return KVER_IS_AT_LEAST(kver, 4, 19)
         ? bpf_skb_load_bytes_relative(skb, L3_off, to, len, BPF_HDR_START_NET)
         : bpf_skb_load_bytes(skb, L3_off, to, len);
 }
 
-// False iff arguments are found with longest prefix match lookup and disallowed.
-static inline __always_inline bool is_local_net_access_allowed(const uint32_t if_index,
-        const struct in6_addr* remote_ip6, const uint16_t protocol, const __be16 remote_port) {
+// False iff arguments are found with longest prefix match lookup and
+// disallowed, and the allowlist does not contain an exception for the uid/host
+// on the interface.
+function bool is_local_net_access_allowed(const LocalNetAccessKey *query_key, const uint32_t uid) {
+    bool* v = bpf_local_net_access_map_lookup_elem(query_key);
+    if (!v || *v) {
+        return true;
+    }
+    LocalNetUidHostAllowlistKey allowlist_query_key = {
+        .lpm_bitlen =
+            8 * (sizeof(uid) + sizeof(query_key->if_index) + sizeof(query_key->remote_ip6)),
+        .uid = uid,
+        .if_index = query_key->if_index,
+        .remote_ip6 = query_key->remote_ip6,
+    };
+    v = bpf_local_net_uid_host_allowlist_map_lookup_elem(&allowlist_query_key);
+    return v && *v;
+}
+
+function bool is_local_net_access_allowed_cached(struct __sk_buff *skb,
+                                                 const uint32_t uid,
+                                                 const uint32_t if_index,
+                                                 const struct in6_addr *remote_ip6,
+                                                 const uint16_t protocol,
+                                                 const __be16 remote_port,
+                                                 const struct kver_uint kver) {
     LocalNetAccessKey query_key = {
         .lpm_bitlen = 8 * (sizeof(if_index) + sizeof(*remote_ip6) + sizeof(protocol)
-            + sizeof(remote_port)),
+                           + sizeof(remote_port)),
         .if_index = if_index,
         .remote_ip6 = *remote_ip6,
         .protocol = protocol,
         .remote_port = remote_port
     };
-    bool* v = bpf_local_net_access_map_lookup_elem(&query_key);
-    return v ? *v : true;
+
+    // Caching is enabled on kernel 5.10 and later, which supports BPF socket storage.
+    if (!KVER_IS_AT_LEAST(kver, 5, 10)) {
+        return is_local_net_access_allowed(&query_key, uid);
+    }
+
+    struct bpf_sock* sk = skb->sk;
+    if (!sk) return is_local_net_access_allowed(&query_key, uid);
+    SkStorageValue *sks = bpf_sk_storage_get(sk, 0, 0);
+    if (!sks) return is_local_net_access_allowed(&query_key, uid);
+
+    if (sks->lnp_cache.is_connected_tcp) return true;
+
+    uint32_t zero = 0;
+    uint64_t *gen_id = bpf_local_net_cache_generation_id_map_lookup_elem(&zero);
+    if (!gen_id) return false; // Should not happen
+    if (*gen_id == sks->lnp_cache.generation_id
+        && !__builtin_memcmp(&sks->lnp_cache.key, &query_key, sizeof(sks->lnp_cache.key))) {
+        return sks->lnp_cache.result;
+    }
+
+    bool isAllowed = is_local_net_access_allowed(&query_key, uid);
+
+    if (!(*gen_id & 1)) {
+        sks->lnp_cache.result = isAllowed;
+        sks->lnp_cache.generation_id = *gen_id;
+        sks->lnp_cache.key = query_key;
+    }
+    if (protocol == IPPROTO_TCP && isAllowed) sks->lnp_cache.is_connected_tcp = true;
+
+    return isAllowed;
 }
 
-static __always_inline inline bool should_block_local_network_packets(struct __sk_buff *skb,
-                                   const uint32_t uid, const struct egress_bool egress,
-                                   const struct kver_uint kver) {
-    if (is_system_uid(uid)) return false;
+function uint8_t get_chunk_permissions(const uint32_t uid) {
+    // All chunks has the same size CHUNK_INT64_COUNT
+    uint32_t chunkId = uid / CHUNK_UID_COUNT;
+    uint32_t index = uid / UIDS_PER_INT64 % CHUNK_INT64_COUNT;
+    int shift = (uid % UIDS_PER_INT64 * PERMISSION_COUNT) & 63;
 
-    bool* block_local_net = bpf_local_net_blocked_uid_map_lookup_elem(&uid);
-    if (!block_local_net) return false; // uid not found in map
-    if (!*block_local_net) return false; // lookup returned 'bool false'
+    UidPermissionChunk *chunk =
+        bpf_uid_permission_chunk_map_lookup_elem(&chunkId);
+    return chunk ? ((chunk->block[index] >> shift) & UID_PERMISSION_MASK)
+                 : PERMISSION_BIT_NONE;
+}
 
-    struct in6_addr remote_ip6;
-    uint8_t ip_proto;
-    uint8_t L4_off;
-    if (skb->protocol == htons(ETH_P_IP)) {
-        int remote_ip_ofs = egress.egress ? IP4_OFFSET(daddr) : IP4_OFFSET(saddr);
-        remote_ip6.s6_addr32[0] = 0;
-        remote_ip6.s6_addr32[1] = 0;
-        remote_ip6.s6_addr32[2] = htonl(0xFFFF);
-        (void)bpf_skb_load_bytes_net(skb, remote_ip_ofs, &remote_ip6.s6_addr32[3], 4, kver);
-        (void)bpf_skb_load_bytes_net(skb, IP4_OFFSET(protocol), &ip_proto, sizeof(ip_proto), kver);
-        uint8_t ihl;
-        (void)bpf_skb_load_bytes_net(skb, IPPROTO_IHL_OFF, &ihl, sizeof(ihl), kver);
-        L4_off = (ihl & 0x0F) * 4;  // IHL calculation.
-    } else if (skb->protocol == htons(ETH_P_IPV6)) {
-        int remote_ip_ofs = egress.egress ? IP6_OFFSET(daddr) : IP6_OFFSET(saddr);
-        (void)bpf_skb_load_bytes_net(skb, remote_ip_ofs, &remote_ip6, sizeof(remote_ip6), kver);
-        (void)bpf_skb_load_bytes_net(skb, IP6_OFFSET(nexthdr), &ip_proto, sizeof(ip_proto), kver);
-        L4_off = sizeof(struct ipv6hdr);
+#define NS_PER_MINUTE (60ULL * 1000ULL * 1000ULL * 1000ULL)
+
+function bool is_local_network_access_blocked(const uint32_t uid) {
+    uint32_t mapKey = 0;
+    bool *permissionPropagationEnabled =
+        bpf_permission_propagation_enabled_map_lookup_elem(&mapKey);
+    if (permissionPropagationEnabled && *permissionPropagationEnabled) {
+        if (is_system_or_root(uid)) return false;
+        if (get_chunk_permissions(uid) & PERMISSION_BIT_ACCESS_LOCAL_NETWORK)
+            return false;
     } else {
+        // Continue exempting system UIDs for the old map. This branch will be
+        // deprecated soon.
+        if (is_system_uid(uid)) return false;
+
+        // Uid that is not in the blocked uid map has access to restricted local network
+        bool* block_local_net = bpf_local_net_blocked_uid_map_lookup_elem(&uid);
+        if (!block_local_net) return false; // uid not found in map
+        if (!*block_local_net) return false; // lookup returned 'bool false'
+    }
+    return true;
+}
+
+function bool should_block_local_network_packets(const SkbIpPacketData *const packet,
+                                                 struct __sk_buff *skb,
+                                                 const uint32_t uid,
+                                                 const uint32_t if_index,
+                                                 const struct egress_bool egress,
+                                                 const struct kver_uint kver) {
+    bool reportLocalAccess = false;
+    if (KVER_IS_AT_LEAST(kver, 5, 10)) {
+        uint32_t key = 0;
+        bool *noteOpEnabled = bpf_local_net_note_op_enabled_map_lookup_elem(&key);
+        reportLocalAccess = noteOpEnabled && *noteOpEnabled;
+    }
+    bool isAllowed;
+    const struct in6_addr *remote_ip6 =
+        egress.egress ? &packet->daddr : &packet->saddr;
+    const __be16 remote_port = egress.egress ? packet->dport : packet->sport;
+    if (reportLocalAccess) {
+        isAllowed = is_local_net_access_allowed_cached(skb, uid, if_index, remote_ip6,
+                                                       packet->ip_proto, remote_port, kver);
+        // Currently, generate events for all local network access, regardless of the UID's
+        // permission status.
+        // This is to identify all UIDs that are accessing the local network.
+        if (!isAllowed) {
+            // Cache to report only once per minute per UID.
+            uint32_t* lastReportMinutes = bpf_local_net_note_op_cache_map_lookup_elem(&uid);
+            uint32_t bootMinutes = (uint32_t) (bpf_ktime_get_boot_ns() / NS_PER_MINUTE);
+            if (!lastReportMinutes || *lastReportMinutes < bootMinutes) {
+                LocalNetNoteOp *noteOp = bpf_local_net_note_op_ringbuf_reserve();
+                if (noteOp != NULL) {
+                    noteOp->uid = uid;
+                    bpf_local_net_note_op_ringbuf_submit(noteOp);
+                    bpf_local_net_note_op_cache_map_update_elem(&uid, &bootMinutes, BPF_ANY);
+                }
+            }
+        }
+    }
+
+    if (!is_local_network_access_blocked(uid)) {
         return false;
     }
 
-    __be16 remote_port = 0;
-    switch (ip_proto) {
-      case IPPROTO_TCP:
-      case IPPROTO_DCCP:
-      case IPPROTO_UDP:
-      case IPPROTO_UDPLITE:
-      case IPPROTO_SCTP:
-        (void)bpf_skb_load_bytes_net(skb, L4_off + (egress.egress ? 2 : 0), &remote_port, sizeof(remote_port), kver);
-        break;
+    if (!reportLocalAccess) {
+        isAllowed = is_local_net_access_allowed_cached(skb, uid, if_index, remote_ip6,
+                                                       packet->ip_proto, remote_port, kver);
     }
-
-    return !is_local_net_access_allowed(skb->ifindex, &remote_ip6, ip_proto, remote_port);
+    return !isAllowed;
 }
 
-static __always_inline inline void do_packet_tracing(
-        const struct __sk_buff* const skb, const struct egress_bool egress, const uint32_t uid,
-        const uint32_t tag, const struct kver_uint kver) {
-    if (!KVER_IS_AT_LEAST(kver, 5, 10, 0)) return;
+function void add_loopback_access_event(const uint32_t src_uid,
+                                        const uint32_t dst_uid,
+                                        const enum LoopbackAccessResult result) {
+    LoopbackAccessEvent key = {
+        .src_uid = src_uid,
+        .dst_uid = dst_uid,
+        .result = result,
+    };
+    uint64_t *lastReportNs = bpf_loopback_access_cache_map_lookup_elem(&key);
+    uint64_t currentBootNs = bpf_ktime_get_boot_ns();
+    if (lastReportNs && (currentBootNs - *lastReportNs) < NS_PER_MINUTE) return;
 
-    uint32_t mapKey = 0;
-    bool* traceConfig = bpf_packet_trace_enabled_map_lookup_elem(&mapKey);
-    if (traceConfig == NULL) return;
-    if (*traceConfig == false) return;
+    LoopbackAccessEvent *event = bpf_loopback_access_ringbuf_reserve();
+    if (!event) return;
 
-    PacketTrace* pkt = bpf_packet_trace_ringbuf_reserve();
-    if (pkt == NULL) return;
+    if (lastReportNs) {
+        *lastReportNs = currentBootNs;
+    } else {
+        if (bpf_loopback_access_cache_map_update_elem(&key, &currentBootNs,
+                                                      BPF_NOEXIST) != 0) {
+            bpf_loopback_access_ringbuf_discard(event);
+            return;
+        }
+    }
 
-    // Errors from bpf_skb_load_bytes_net are ignored to favor returning something
-    // over returning nothing. In the event of an error, the kernel will fill in
-    // zero for the destination memory. Do not change the default '= 0' below.
+    event->src_uid = src_uid;
+    event->dst_uid = dst_uid;
+    event->result = result;
+    bpf_loopback_access_ringbuf_submit(event);
+}
 
+function bool loopback_metrics_enabled() {
+    const uint32_t zero = 0;
+    bool *enabled = bpf_loopback_access_metrics_enabled_map_lookup_elem(&zero);
+    return enabled && *enabled;
+}
+
+function bool loopback_checks_enabled() {
+    const uint32_t zero = 0;
+    bool *enabled = bpf_loopback_checks_enabled_map_lookup_elem(&zero);
+    return enabled && *enabled;
+}
+
+function bool can_force_loopback(const uint32_t permissions) {
+    return (permissions & PERMISSION_BIT_FORCE_USE_LOOPBACK_INTERFACE)
+        && (permissions & PERMISSION_BIT_INTERACT_ACROSS_USERS_FULL);
+}
+
+function bool uids_have_loopback_permissions(const uint32_t sender_uid,
+                                             const uint32_t receiver_uid) {
+    // TODO: be more specific about which system uids we should exempt
+    if (is_system_uid(sender_uid) || is_system_uid(receiver_uid)) return true;
+
+    bool same_profile =
+        sender_uid / AID_USER_OFFSET == receiver_uid / AID_USER_OFFSET;
+    if (same_profile) return true;
+
+    uint32_t sender_perms = get_chunk_permissions(sender_uid);
+    uint32_t receiver_perms = get_chunk_permissions(receiver_uid);
+    if (can_force_loopback(sender_perms)
+        || can_force_loopback(receiver_perms)) return true;
+
+    // TODO: check loopback interface permissions for both sender and receiver
+    bool same_app_id =
+        sender_uid % AID_USER_OFFSET == receiver_uid % AID_USER_OFFSET;
+    if (same_app_id) {
+        return
+            (sender_perms & PERMISSION_BIT_INTERACT_ACROSS_USERS_OR_PROFILES) ||
+            (sender_perms & PERMISSION_BIT_INTERACT_ACROSS_USERS_FULL);
+    } else {
+        return sender_perms & PERMISSION_BIT_INTERACT_ACROSS_USERS_FULL;
+    }
+}
+
+function bool parse_skb(SkbIpPacketData *const packet,
+                        const struct __sk_buff *const skb,
+                        const struct kver_uint kver) {
+    // Errors from bpf_skb_load_bytes_net are ignored to favor returning
+    // something over returning nothing. In the event of an error, the kernel
+    // will fill in zero for the destination memory.
     uint8_t proto = 0;
     uint8_t L4_off = 0;
-    uint8_t ipVersion = 0;
     if (skb->protocol == htons(ETH_P_IP)) {
-        (void)bpf_skb_load_bytes_net(skb, IP4_OFFSET(protocol), &proto, sizeof(proto), kver);
-        (void)bpf_skb_load_bytes_net(skb, IPPROTO_IHL_OFF, &L4_off, sizeof(L4_off), kver);
-        L4_off = (L4_off & 0x0F) * 4;  // IHL calculation.
-        ipVersion = 4;
+        packet->ip_version = 4;
+        packet->saddr.s6_addr32[2] = htonl(0xFFFF);
+        (void)bpf_skb_load_bytes_net(skb, IP4_OFFSET(saddr),
+                                     &packet->saddr.s6_addr32[3],
+                                     sizeof(__be32), kver);
+
+        packet->daddr.s6_addr32[2] = htonl(0xFFFF);
+        (void)bpf_skb_load_bytes_net(skb, IP4_OFFSET(daddr),
+                                     &packet->daddr.s6_addr32[3],
+                                     sizeof(__be32), kver);
+
+        (void)bpf_skb_load_bytes_net(skb, IP4_OFFSET(protocol), &proto,
+                                     sizeof(proto), kver);
+        // IHL calculation
+        (void)bpf_skb_load_bytes_net(skb, IPPROTO_IHL_OFF, &L4_off,
+                                     sizeof(L4_off), kver);
+        if (L4_off < 0x45 || L4_off > 0x4F) return false;
+        L4_off = (L4_off & 0x0F) * 4;
     } else if (skb->protocol == htons(ETH_P_IPV6)) {
-        (void)bpf_skb_load_bytes_net(skb, IP6_OFFSET(nexthdr), &proto, sizeof(proto), kver);
+        packet->ip_version = 6;
+        (void)bpf_skb_load_bytes_net(skb, IP6_OFFSET(saddr), &packet->saddr,
+                                     sizeof(packet->saddr), kver);
+        (void)bpf_skb_load_bytes_net(skb, IP6_OFFSET(daddr), &packet->daddr,
+                                     sizeof(packet->daddr), kver);
+        (void)bpf_skb_load_bytes_net(skb, IP6_OFFSET(nexthdr), &proto,
+                                     sizeof(proto), kver);
         L4_off = sizeof(struct ipv6hdr);
-        ipVersion = 6;
         // skip over a *single* HOPOPTS or DSTOPTS extension header (if present)
         if (proto == IPPROTO_HOPOPTS || proto == IPPROTO_DSTOPTS) {
             struct {
@@ -343,32 +565,160 @@ static __always_inline inline void do_packet_tracing(
                 L4_off += (ext_hdr.len + 1) * 8;
             }
         }
+    } else {
+        // Not an IP packet. Don't continue parsing.
+        return false;
     }
+    packet->ip_proto = proto;
 
-    uint8_t flags = 0;
-    __be16 sport = 0, dport = 0;
-    if (L4_off >= 20) {
-      switch (proto) {
+    switch (proto) {
         case IPPROTO_TCP:
-          (void)bpf_skb_load_bytes_net(skb, L4_off + TCP_FLAG8_OFF, &flags, sizeof(flags), kver);
-          // fallthrough
+            (void)bpf_skb_load_bytes_net(skb, L4_off + TCP_FLAG8_OFF,
+                                         &packet->tcp_flags,
+                                         sizeof(packet->tcp_flags), kver);
+            // fallthrough
         case IPPROTO_DCCP:
         case IPPROTO_UDP:
         case IPPROTO_UDPLITE:
         case IPPROTO_SCTP:
-          // all of these L4 protocols start with be16 src & dst port
-          (void)bpf_skb_load_bytes_net(skb, L4_off + 0, &sport, sizeof(sport), kver);
-          (void)bpf_skb_load_bytes_net(skb, L4_off + 2, &dport, sizeof(dport), kver);
-          break;
+            (void)bpf_skb_load_bytes_net(skb, L4_off + 0, &packet->sport,
+                                         sizeof(packet->sport), kver);
+            (void)bpf_skb_load_bytes_net(skb, L4_off + 2, &packet->dport,
+                                         sizeof(packet->dport), kver);
+            break;
         case IPPROTO_ICMP:
         case IPPROTO_ICMPV6:
-          // Both IPv4 and IPv6 icmp start with u8 type & code, which we store in the bottom
-          // (ie. second) byte of sport/dport (which are be16s), the top byte is already zero.
-          (void)bpf_skb_load_bytes_net(skb, L4_off + 0, (char *)&sport + 1, 1, kver); //type
-          (void)bpf_skb_load_bytes_net(skb, L4_off + 1, (char *)&dport + 1, 1, kver); //code
-          break;
-      }
+            // Both IPv4 and IPv6 icmp start with u8 type & code, which we store
+            // in the bottom (ie. second) byte of sport/dport (which are be16s),
+            // the top byte is already zero.
+            (void)bpf_skb_load_bytes_net(skb, L4_off + 0,
+                                         (char *)&packet->sport + 1, 1,
+                                         kver); // type
+            (void)bpf_skb_load_bytes_net(skb, L4_off + 1,
+                                         (char *)&packet->dport + 1, 1,
+                                         kver); // code
+            break;
     }
+    return true;
+}
+
+procedure bool should_block_loopback_access(const SkbIpPacketData *const packet_data,
+                                            struct __sk_buff *const skb,
+                                            const uint32_t sender_uid,
+                                            const bool checks_enabled,
+                                            const bool metrics_enabled) {
+    struct bpf_sock_tuple sock_tuple = {};
+    uint32_t tuple_size;
+
+    if (packet_data->ip_version == 4) {
+        // IPv4-mapped-v6
+        sock_tuple.ipv4.saddr = packet_data->saddr.s6_addr32[3];
+        sock_tuple.ipv4.daddr = packet_data->daddr.s6_addr32[3];
+        sock_tuple.ipv4.sport = packet_data->sport;
+        sock_tuple.ipv4.dport = packet_data->dport;
+        tuple_size = sizeof(sock_tuple.ipv4);
+    } else if (packet_data->ip_version == 6) {
+        __builtin_memcpy(&sock_tuple.ipv6.saddr, &packet_data->saddr,
+                         sizeof(sock_tuple.ipv6.saddr));
+        __builtin_memcpy(&sock_tuple.ipv6.daddr, &packet_data->daddr,
+                         sizeof(sock_tuple.ipv6.daddr));
+        sock_tuple.ipv6.sport = packet_data->sport;
+        sock_tuple.ipv6.dport = packet_data->dport;
+        tuple_size = sizeof(sock_tuple.ipv6);
+    } else {
+        return false;
+    }
+
+    struct bpf_sock *local_sk;
+    if (packet_data->ip_proto == IPPROTO_TCP) {
+        local_sk = bpf_sk_lookup_tcp(skb, &sock_tuple, tuple_size,
+                                     BPF_F_CURRENT_NETNS, 0);
+    } else if (packet_data->ip_proto == IPPROTO_UDP) {
+        local_sk = bpf_sk_lookup_udp(skb, &sock_tuple, tuple_size,
+                                     BPF_F_CURRENT_NETNS, 0);
+    } else {
+        return false;
+    }
+    if (!local_sk) return false;
+
+    SkStorageValue *sks = bpf_sk_storage_get(local_sk, 0, 0);
+    const uint32_t receiver_uid = sks ? sks->uid : 0;
+    bpf_sk_release(local_sk);
+    if (!sks) return false;
+
+    // We don't care about cases where apps are sending loopback traffic to
+    // themselves.
+    if (sender_uid == receiver_uid) return false;
+
+    bool allowed = true;
+    if (checks_enabled) {
+        allowed = uids_have_loopback_permissions(sender_uid, receiver_uid);
+    }
+    if (metrics_enabled) {
+        add_loopback_access_event(
+                sender_uid, receiver_uid,
+                allowed ? LOOPBACK_ACCESS_ALLOWED : LOOPBACK_ACCESS_BLOCKED);
+    }
+    return !allowed;
+}
+
+#define LOOPBACK_CACHE_EXPIRATION_NS (10ULL * 1000ULL * 1000ULL) // 10ms
+
+procedure bool should_block_loopback_access_cached(const SkbIpPacketData *const packet_data,
+                                            struct __sk_buff *const skb,
+                                            const uint32_t sender_uid) {
+    bool checks_enabled = loopback_checks_enabled();
+    bool metrics_enabled = loopback_metrics_enabled();
+    if (!checks_enabled && !metrics_enabled) return false;
+
+    // TCP connections that already passed loopback access check
+    if (packet_data->ip_proto == IPPROTO_TCP
+        && !(packet_data->tcp_flags & TCP_FLAG8_SYN)) return false;
+    // Remaining TCP will only trigger on SYN to avoid redundant lookups for established connections
+
+    struct bpf_sock* sk = skb->sk;
+    if (!sk) return should_block_loopback_access(packet_data, skb, sender_uid,
+                                                 checks_enabled, metrics_enabled);
+    SkStorageValue *sks = bpf_sk_storage_get(sk, 0, 0);
+    if (!sks) return should_block_loopback_access(packet_data, skb, sender_uid,
+                                                 checks_enabled, metrics_enabled);
+
+    LoopbackCache *lc = &sks->loopback_cache;
+    uint64_t current_ns = bpf_ktime_get_boot_ns();
+    if (packet_data->ip_proto == IPPROTO_UDP
+        && current_ns - lc->cached_at_ns < LOOPBACK_CACHE_EXPIRATION_NS
+        && !__builtin_memcmp(&lc->daddr, &packet_data->daddr, sizeof(struct in6_addr))
+        && lc->dport == packet_data->dport) {
+        return lc->result;
+    }
+
+    bool result = should_block_loopback_access(packet_data, skb, sender_uid,
+                                               checks_enabled, metrics_enabled);
+
+    if (packet_data->ip_proto == IPPROTO_UDP) {
+        lc->cached_at_ns = current_ns;
+        __builtin_memcpy(&lc->daddr, &packet_data->daddr, sizeof(struct in6_addr));
+        lc->dport = packet_data->dport;
+        lc->result = result;
+    }
+    return result;
+}
+
+function void do_packet_tracing(const struct __sk_buff* const skb,
+                                const SkbIpPacketData* const packet,
+                                const struct egress_bool egress,
+                                const uint32_t uid,
+                                const uint32_t tag,
+                                const struct kver_uint kver) {
+    if (!KVER_IS_AT_LEAST(kver, 5, 10)) return;
+
+    uint32_t mapKey = 0;
+    bool* traceConfig = bpf_packet_trace_enabled_map_lookup_elem(&mapKey);
+    if (traceConfig == NULL) return;
+    if (*traceConfig == false) return;
+
+    PacketTrace* pkt = bpf_packet_trace_ringbuf_reserve();
+    if (pkt == NULL) return;
 
     pkt->timestampNs = bpf_ktime_get_boot_ns();
     pkt->ifindex = skb->ifindex;
@@ -376,55 +726,31 @@ static __always_inline inline void do_packet_tracing(
 
     pkt->uid = uid;
     pkt->tag = tag;
-    pkt->sport = sport;
-    pkt->dport = dport;
+    pkt->sport = packet->sport;
+    pkt->dport = packet->dport;
 
     pkt->egress = egress.egress;
     pkt->wakeup = !egress.egress && (skb->mark & 0x80000000);  // Fwmark.ingress_cpu_wakeup
-    pkt->ipProto = proto;
-    pkt->tcpFlags = flags;
-    pkt->ipVersion = ipVersion;
+    pkt->ipProto = packet->ip_proto;
+    pkt->tcpFlags = packet->tcp_flags;
+    pkt->ipVersion = packet->ip_version;
 
     bpf_packet_trace_ringbuf_submit(pkt);
 }
 
-static __always_inline inline bool skip_owner_match(struct __sk_buff* skb,
-                                                    const struct egress_bool egress,
-                                                    const struct kver_uint kver) {
-    uint32_t flag = 0;
-    if (skb->protocol == htons(ETH_P_IP)) {
-        uint8_t proto;
-        // no need to check for success, proto will be zeroed if bpf_skb_load_bytes_net() fails
-        (void)bpf_skb_load_bytes_net(skb, IP4_OFFSET(protocol), &proto, sizeof(proto), kver);
-        if (proto == IPPROTO_ESP) return true;
-        if (proto != IPPROTO_TCP) return false;  // handles read failure above
-        uint8_t ihl;
-        // we don't check for success, as this cannot fail, as it is earlier in the packet than
-        // proto, the reading of which must have succeeded, additionally the next read
-        // (a little bit deeper in the packet in spite of ihl being zeroed) of the tcp flags
-        // field will also fail, and that failure we already handle correctly
-        // (we also don't check that ihl in [0x45,0x4F] nor that ipv4 header checksum is correct)
-        (void)bpf_skb_load_bytes_net(skb, IPPROTO_IHL_OFF, &ihl, sizeof(ihl), kver);
-        // if the read below fails, we'll just assume no TCP flags are set, which is fine.
-        (void)bpf_skb_load_bytes_net(skb, (ihl & 0xF) * 4 + TCP_FLAG32_OFF,
-                                     &flag, sizeof(flag), kver);
-    } else if (skb->protocol == htons(ETH_P_IPV6)) {
-        uint8_t proto;
-        // no need to check for success, proto will be zeroed if bpf_skb_load_bytes_net() fails
-        (void)bpf_skb_load_bytes_net(skb, IP6_OFFSET(nexthdr), &proto, sizeof(proto), kver);
-        if (proto == IPPROTO_ESP) return true;
-        if (proto != IPPROTO_TCP) return false;  // handles read failure above
-        // if the read below fails, we'll just assume no TCP flags are set, which is fine.
-        (void)bpf_skb_load_bytes_net(skb, sizeof(struct ipv6hdr) + TCP_FLAG32_OFF,
-                                     &flag, sizeof(flag), kver);
-    } else {
-        return false;
-    }
+function bool skip_owner_match(const SkbIpPacketData* const packet,
+                               const struct egress_bool egress) {
+    if (packet->ip_version == 0) return false;
+
+    if (packet->ip_proto == IPPROTO_ESP) return true;
+
+    if (packet->ip_proto != IPPROTO_TCP) return false;
+
     // Always allow RST's, and additionally allow ingress FINs
-    return flag & (TCP_FLAG_RST | (egress.egress ? 0 : TCP_FLAG_FIN));  // false on read failure
+    return packet->tcp_flags & (TCP_FLAG8_RST | (egress.egress ? 0 : TCP_FLAG8_FIN));
 }
 
-static __always_inline inline BpfConfig getConfig(uint32_t configKey) {
+function BpfConfig getConfig(uint32_t configKey) {
     uint32_t mapSettingKey = configKey;
     BpfConfig* config = bpf_configuration_map_lookup_elem(&mapSettingKey);
     if (!config) {
@@ -434,22 +760,17 @@ static __always_inline inline BpfConfig getConfig(uint32_t configKey) {
     return *config;
 }
 
-static __always_inline inline bool ingress_should_discard(struct __sk_buff* skb,
-                                                          const struct kver_uint kver) {
+function bool ingress_should_discard(const SkbIpPacketData* const packet,
+                                     struct __sk_buff* skb,
+                                     const struct kver_uint kver) {
     // Require 4.19, since earlier kernels don't have bpf_skb_load_bytes_relative() which
     // provides relative to L3 header reads.  Without that we could fetch the wrong bytes.
     // Additionally earlier bpf verifiers are much harder to please.
-    if (!KVER_IS_AT_LEAST(kver, 4, 19, 0)) return false;
+    if (!KVER_IS_AT_LEAST(kver, 4, 19)) return false;
 
-    IngressDiscardKey k = {};
-    if (skb->protocol == htons(ETH_P_IP)) {
-        k.daddr.s6_addr32[2] = htonl(0xFFFF);
-        (void)bpf_skb_load_bytes_net(skb, IP4_OFFSET(daddr), &k.daddr.s6_addr32[3], 4, kver);
-    } else if (skb->protocol == htons(ETH_P_IPV6)) {
-        (void)bpf_skb_load_bytes_net(skb, IP6_OFFSET(daddr), &k.daddr, sizeof(k.daddr), kver);
-    } else {
-        return false; // non IPv4/IPv6, so no IP to match on
-    }
+    if (packet->ip_version == 0) return false;
+
+    IngressDiscardKey k = { .daddr = packet->daddr };
 
     // we didn't check for load success, because destination bytes will be zeroed if
     // bpf_skb_load_bytes_net() fails, instead we rely on daddr of '::' and '::ffff:0.0.0.0'
@@ -463,13 +784,15 @@ static __always_inline inline bool ingress_should_discard(struct __sk_buff* skb,
     return true;  // disallowed interface
 }
 
-static __always_inline inline int bpf_owner_match(struct __sk_buff* skb, uint32_t uid,
-                                                  const struct egress_bool egress,
-                                                  const struct kver_uint kver,
-                                                  const struct sdk_level_uint lvl) {
+function int bpf_owner_match(const SkbIpPacketData* const packet,
+                             struct __sk_buff* skb,
+                             uint32_t uid,
+                             const struct egress_bool egress,
+                             const struct kver_uint kver,
+                             const struct sdk_level_uint lvl) {
     if (is_system_uid(uid)) return PASS;
 
-    if (skip_owner_match(skb, egress, kver)) return PASS;
+    if (skip_owner_match(packet, egress)) return PASS;
 
     BpfConfig enabledRules = getConfig(UID_RULES_CONFIGURATION_KEY);
 
@@ -483,7 +806,7 @@ static __always_inline inline int bpf_owner_match(struct __sk_buff* skb, uint32_
     if (isBlockedByUidRules(enabledRules, uidRules)) return DROP;
 
     if (!egress.egress && skb->ifindex != 1) {
-        if (ingress_should_discard(skb, kver)) return DROP;
+        if (ingress_should_discard(packet, skb, kver)) return DROP;
         if (uidRules & IIF_MATCH) {
             if (allowed_iif && skb->ifindex != allowed_iif) {
                 // Drops packets not coming from lo nor the allowed interface
@@ -497,29 +820,30 @@ static __always_inline inline int bpf_owner_match(struct __sk_buff* skb, uint32_
         }
     }
 
-    if (SDK_LEVEL_IS_AT_LEAST(lvl, 25Q2) && skb->ifindex == 1) {
+    if (API_IS_AT_LEAST(lvl, 25Q2) && skb->ifindex == 1) {
         // TODO: sdksandbox localhost restrictions
     }
 
     return PASS;
 }
 
-static __always_inline inline void update_stats_with_config(const uint32_t selectedMap,
-                                                            const struct __sk_buff* const skb,
-                                                            const StatsKey* const key,
-                                                            const struct egress_bool egress,
-                                                            const struct kver_uint kver) {
+function void update_stats_with_config(const uint32_t selectedMap,
+                                       const struct __sk_buff* const skb,
+                                       const StatsKey* const key,
+                                       const struct egress_bool egress,
+                                       const struct kver_uint kver,
+                                       const struct undo_bool undo) {
     if (selectedMap == SELECT_MAP_A) {
-        update_stats_map_A(skb, key, egress, kver);
+        update_stats_map_A(skb, key, egress, kver, undo);
     } else {
-        update_stats_map_B(skb, key, egress, kver);
+        update_stats_map_B(skb, key, egress, kver, undo);
     }
 }
 
-static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb,
-                                                      const struct egress_bool egress,
-                                                      const struct kver_uint kver,
-                                                      const struct sdk_level_uint lvl) {
+function int bpf_traffic_account(struct __sk_buff* skb,
+                                 const struct egress_bool egress,
+                                 const struct kver_uint kver,
+                                 const struct sdk_level_uint lvl) {
     // sock_uid will be 'overflowuid' if !sk_fullsock(sk_to_full_sk(skb->sk))
     uint32_t sock_uid = bpf_get_socket_uid(skb);
 
@@ -533,12 +857,12 @@ static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb,
 
     uint64_t cookie = bpf_get_socket_cookie(skb);  // 0 iff !skb->sk
     UidTagValue* utag = bpf_cookie_tag_map_lookup_elem(&cookie);
-    uint32_t uid, tag;
+    uint32_t statsUid, tag;
     if (utag) {
-        uid = utag->uid;
+        statsUid = utag->uid;
         tag = utag->tag;
     } else {
-        uid = sock_uid;
+        statsUid = sock_uid;
         tag = 0;
     }
 
@@ -546,31 +870,55 @@ static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb,
     // interface is accounted for and subject to usage restrictions.
     // CLAT IPv6 TX sockets are *always* tagged with CLAT uid, see tagSocketAsClat()
     // CLAT daemon receives via an untagged AF_PACKET socket.
-    if (egress.egress && uid == AID_CLAT) return PASS;
+    if (egress.egress && statsUid == AID_CLAT) return PASS;
 
-    int match = bpf_owner_match(skb, sock_uid, egress, kver, lvl);
+    SkbIpPacketData packet_data = {};
+    bool parsed = parse_skb(&packet_data, skb, kver);
+
+    int match = bpf_owner_match(&packet_data, skb, sock_uid, egress, kver, lvl);
+
+    bool dns = false;
 
 // Workaround for secureVPN with VpnIsolation enabled, refer to b/159994981 for details.
 // Keep TAG_SYSTEM_DNS in sync with DnsResolver/include/netd_resolv/resolv.h
 // and TrafficStatsConstants.java
 #define TAG_SYSTEM_DNS 0xFFFFFF82
-    if (tag == TAG_SYSTEM_DNS && uid == AID_DNS) {
-        uid = sock_uid;
+    if (tag == TAG_SYSTEM_DNS && statsUid == AID_DNS) {
+        dns = true;
+        statsUid = sock_uid;
         if (match == DROP_UNLESS_DNS) match = PASS;
     } else {
         if (match == DROP_UNLESS_DNS) match = DROP;
     }
 
-    if (SDK_LEVEL_IS_AT_LEAST(lvl, 25Q2) && (match != DROP)) {
-        if (should_block_local_network_packets(skb, uid, egress, kver)) match = DROP;
+    if (API_IS_AT_LEAST(lvl, 25Q4) && parsed && (match != DROP) && egress.egress
+        && skb->ifindex == 1) {
+        if (should_block_loopback_access_cached(&packet_data, skb, sock_uid)) {
+            match = DROP;
+        }
+    }
+
+    if (API_IS_AT_LEAST(lvl, 25Q2) && parsed && (match != DROP) && !dns) {
+        if (should_block_local_network_packets(&packet_data, skb, sock_uid,
+                                               skb->ifindex, egress, kver)) {
+            if (KVER_IS_AT_LEAST(kver, 5, 10) && skb->sk && egress.egress) {
+                SkStorageValue *sks = bpf_sk_storage_get(skb->sk, 0, 0);
+                if (sks) sks->dropReasons |= DROP_REASON_LNP;
+            }
+            match = DROP;
+        }
     }
 
     // If an outbound packet is going to be dropped, we do not count that traffic.
-    if (egress.egress && (match == DROP)) return DROP;
+    if (egress.egress && (match == DROP)) {
+        uint32_t key = skb->ifindex;
+        update_iface_stats_map(skb, &key, EGRESS, KVER_4_9, UNDO);
+        return DROP;
+    }
 
-    StatsKey key = {.uid = uid, .tag = tag, .counterSet = 0, .ifaceIndex = skb->ifindex};
+    StatsKey key = {.uid = statsUid, .tag = tag, .counterSet = 0, .ifaceIndex = skb->ifindex};
 
-    uint8_t* counterSet = bpf_uid_counterset_map_lookup_elem(&uid);
+    uint8_t* counterSet = bpf_uid_counterset_map_lookup_elem(&statsUid);
     if (counterSet) key.counterSet = (uint32_t)*counterSet;
 
     uint32_t mapSettingKey = CURRENT_STATS_MAP_CONFIGURATION_KEY;
@@ -578,9 +926,9 @@ static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb,
 
     if (!selectedMap) return PASS;  // cannot happen, needed to keep bpf verifier happy
 
-    do_packet_tracing(skb, egress, uid, tag, kver);
-    update_stats_with_config(*selectedMap, skb, &key, egress, kver);
-    update_app_uid_stats_map(skb, &uid, egress, kver);
+    do_packet_tracing(skb, &packet_data, egress, statsUid, tag, kver);
+    update_stats_with_config(*selectedMap, skb, &key, egress, kver, ACCOUNT);
+    update_app_uid_stats_map(skb, &statsUid, egress, kver, ACCOUNT);
 
     // We've already handled DROP_UNLESS_DNS up above, thus when we reach here the only
     // possible values of match are DROP(0) or PASS(1), however we need to use
@@ -595,102 +943,139 @@ static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb,
 
 // Supported kernel + platform/os version combinations:
 //
-//      | 4.9 | 4.14 | 4.19 | 5.4 | 5.10 | 5.15 | 6.1 | 6.6 | 6.12 |
+//      | 4.9 | 4.14 | 4.19 | 5.4 | 5.10 | 5.15 | 6.1 | 6.6 | 6.12 | 6.18 |
+// 26Q4 |     |      |      |     |      |  x   |  x  |  x  |  x   |  x   |
+// 26Q2 |     |      |      |     |  x   |  x   |  x  |  x  |  x   |  x   |
+// 25Q4 |     |      |      |     |  x   |  x   |  x  |  x  |  x   |
 // 25Q2 |     |      |      |  x  |  x   |  x   |  x  |  x  |  x   |
 //    V |     |      |  x   |  x  |  x   |  x   |  x  |  x  |      | (netbpfload)
 //    U |     |  x   |  x   |  x  |  x   |  x   |  x  |     |      |
 //    T |  x  |  x   |  x   |  x  |  x   |  x   |     |     |      | (magic netbpfload)
 //    S |  x  |  x   |  x   |  x  |  x   |      |     |     |      | (dns netbpfload for offload)
-//    R |  x  |  x   |  x   |  x  |      |      |     |     |      | (no mainline ebpf)
-//
-// Not relevant for eBPF, but R can also run on 4.4
 
-// ----- cgroupskb/ingress/stats -----
+// ----- ingress/stats -----
 
-// Android 25Q2+ 5.10+ (localnet protection + tracing)
-DEFINE_NETD_BPF_PROG_RANGES(cgroupskb, ingress_stats, 5_10_25q2, 5_10, INF,
-                            BPFLOADER_MAINLINE_25Q2_VERSION, BPFLOADER_MAX_VER)
+// Android 26Q2+ 6.18+ (full featured + without tcpAccECN)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 6_18, INF, 26Q2, MAXAPI)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, INGRESS, KVER_5_10, SDK_LEVEL_25Q2);
+    return bpf_traffic_account(skb, INGRESS, KVER_6_18, API(26Q2));
 }
 
-// Android 25Q2+ 5.4 (localnet protection)
-DEFINE_NETD_BPF_PROG_RANGES(cgroupskb, ingress_stats, 5_4_25q2, 5_4, 5_10,
-                            BPFLOADER_MAINLINE_25Q2_VERSION, BPFLOADER_MAX_VER)
+// Android 26Q2+ 6.1/6.6/6.12 (full featured + tcpAccECN)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 6_1, 6_18, 26Q2, MAXAPI)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, INGRESS, KVER_5_4, SDK_LEVEL_25Q2);
+    update_accecn_counter(skb);
+    return bpf_traffic_account(skb, INGRESS, KVER_6_1, API(26Q2));
 }
 
-// Android U/V 5.10+ (tracing)
-DEFINE_NETD_BPF_PROG_RANGES(cgroupskb, ingress_stats, 5_10_u, 5_10, INF,
-                            BPFLOADER_MAINLINE_U_VERSION, BPFLOADER_MAINLINE_25Q2_VERSION)
+// Android 26Q2+ 5.10/5.15 (full featured)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 5_10, 6_1, 26Q2, MAXAPI)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, INGRESS, KVER_5_10, SDK_LEVEL_U);
+    return bpf_traffic_account(skb, INGRESS, KVER_5_10, API(26Q2));
 }
 
-// Android T/U/V/25Q2 5.4 & T 5.10/5.15
-DEFINE_NETD_BPF_PROG_KVER_RANGE(cgroupskb, ingress_stats, 5_4, 5_4, INF)
+// Android 25Q4/26Q1 (full featured)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 5_10, INF, 25Q4, 26Q2)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, INGRESS, KVER_5_4, SDK_LEVEL_T);
+    return bpf_traffic_account(skb, INGRESS, KVER_5_10, API(25Q4));
 }
 
-// Android T/U/V 4.19
-DEFINE_NETD_BPF_PROG_KVER_RANGE(cgroupskb, ingress_stats, 4_19, 4_19, 5_4)
+// Android 25Q2/25Q3 5.10+ (localnet protection + tracing)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 5_10, INF, 25Q2, 25Q4)
 (struct __sk_buff* skb) {
-return bpf_traffic_account(skb, INGRESS, KVER_4_19, SDK_LEVEL_T);
+    return bpf_traffic_account(skb, INGRESS, KVER_5_10, API(25Q2));
 }
 
-// Android T 4.9 & T/U 4.14
-DEFINE_NETD_BPF_PROG_KVER_RANGE(cgroupskb, ingress_stats, 4_9, 4_9, 4_19)
+// Android 25Q2/25Q3 5.4 (localnet protection)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 5_4, 5_10, 25Q2, 25Q4)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, INGRESS, KVER_4_9, SDK_LEVEL_T);
-}
-
-// ----- cgroupskb/egress/stats -----
-
-// Android 25Q2+ 5.10+ (localnet protection + tracing)
-DEFINE_NETD_BPF_PROG_RANGES(cgroupskb, egress_stats, 5_10_25q2, 5_10, INF,
-                            BPFLOADER_MAINLINE_25Q2_VERSION, BPFLOADER_MAX_VER)
-(struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, EGRESS, KVER_5_10, SDK_LEVEL_25Q2);
-}
-
-// Android 25Q2+ 5.4 (localnet protection)
-DEFINE_NETD_BPF_PROG_RANGES(cgroupskb, egress_stats, 5_4_25q2, 5_4, 5_10,
-                            BPFLOADER_MAINLINE_25Q2_VERSION, BPFLOADER_MAX_VER)
-(struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, EGRESS, KVER_5_4, SDK_LEVEL_25Q2);
+    return bpf_traffic_account(skb, INGRESS, KVER_5_4, API(25Q2));
 }
 
 // Android U/V 5.10+ (tracing)
-DEFINE_NETD_BPF_PROG_RANGES(cgroupskb, egress_stats, 5_10_u, 5_10, INF,
-                            BPFLOADER_MAINLINE_U_VERSION, BPFLOADER_MAINLINE_25Q2_VERSION)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 5_10, INF, U, 25Q2)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, EGRESS, KVER_5_10, SDK_LEVEL_U);
+    return bpf_traffic_account(skb, INGRESS, KVER_5_10, API(U));
 }
 
 // Android T/U/V/25Q2 5.4 & T 5.10/5.15
-DEFINE_NETD_BPF_PROG_KVER_RANGE(cgroupskb, egress_stats, 5_4, 5_4, INF)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 5_4, INF, T, 25Q4)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, EGRESS, KVER_5_4, SDK_LEVEL_T);
+    return bpf_traffic_account(skb, INGRESS, KVER_5_4, API(T));
 }
 
 // Android T/U/V 4.19
-DEFINE_NETD_BPF_PROG_KVER_RANGE(cgroupskb, egress_stats, 4_19, 4_19, 5_4)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 4_19, 5_4, T, 25Q2)
 (struct __sk_buff* skb) {
-return bpf_traffic_account(skb, EGRESS, KVER_4_19, SDK_LEVEL_T);
+return bpf_traffic_account(skb, INGRESS, KVER_4_19, API(T));
 }
 
 // Android T 4.9 & T/U 4.14
-DEFINE_NETD_BPF_PROG_KVER_RANGE(cgroupskb, egress_stats, 4_9, 4_9, 4_19)
+DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 4_9, 4_19, T, V)
 (struct __sk_buff* skb) {
-    return bpf_traffic_account(skb, EGRESS, KVER_4_9, SDK_LEVEL_T);
+    return bpf_traffic_account(skb, INGRESS, KVER_4_9, API(T));
+}
+
+// ----- egress/stats -----
+
+// Android 26Q2+ 6.1+ (full featured)
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 6_1, INF, 26Q2, MAXAPI)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_6_1, API(26Q2));
+}
+
+// Android 26Q2+ 5.10/5.15 (full featured)
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 5_10, 6_1, 26Q2, MAXAPI)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_5_10, API(26Q2));
+}
+
+// Android 25Q4/26Q1 (full featured)
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 5_10, INF, 25Q4, 26Q2)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_5_10, API(25Q4));
+}
+
+// Android 25Q2/25Q3 5.10+ (localnet protection + tracing)
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 5_10, INF, 25Q2, 25Q4)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_5_10, API(25Q2));
+}
+
+// Android 25Q2/25Q3 5.4 (localnet protection)
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 5_4, 5_10, 25Q2, 25Q4)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_5_4, API(25Q2));
+}
+
+// Android U/V 5.10+ (tracing)
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 5_10, INF, U, 25Q2)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_5_10, API(U));
+}
+
+// Android T/U/V/25Q2 5.4 & T 5.10/5.15
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 5_4, INF, T, 25Q4)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_5_4, API(T));
+}
+
+// Android T/U/V 4.19
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 4_19, 5_4, T, 25Q2)
+(struct __sk_buff* skb) {
+return bpf_traffic_account(skb, EGRESS, KVER_4_19, API(T));
+}
+
+// Android T 4.9 & T/U 4.14
+DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 4_9, 4_19, T, V)
+(struct __sk_buff* skb) {
+    return bpf_traffic_account(skb, EGRESS, KVER_4_9, API(T));
 }
 
 // -----
 
 // WARNING: Android T's non-updatable netd depends on the name of this program.
-DEFINE_XTBPF_PROG(skfilter, egress_xtbpf, )
+DEFINE_XTBPF_PROG(skfilter, egress_xtbpf)
 (struct __sk_buff* skb) {
     // Clat daemon does not generate new traffic, all its traffic is accounted for already
     // on the v4-* interfaces (except for the 20 (or 28) extra bytes of IPv6 vs IPv4 overhead,
@@ -704,12 +1089,12 @@ DEFINE_XTBPF_PROG(skfilter, egress_xtbpf, )
     }
 
     uint32_t key = skb->ifindex;
-    update_iface_stats_map(skb, &key, EGRESS, KVER_4_9);
+    update_iface_stats_map(skb, &key, EGRESS, KVER_4_9, ACCOUNT);
     return XTBPF_MATCH;
 }
 
 // WARNING: Android T's non-updatable netd depends on the name of this program.
-DEFINE_XTBPF_PROG(skfilter, ingress_xtbpf, )
+DEFINE_XTBPF_PROG(skfilter, ingress_xtbpf)
 (struct __sk_buff* skb) {
     // Clat daemon traffic is not accounted by virtue of iptables raw prerouting drop rule
     // (in clat_raw_PREROUTING chain), which triggers before this (in bw_raw_PREROUTING chain).
@@ -717,22 +1102,22 @@ DEFINE_XTBPF_PROG(skfilter, ingress_xtbpf, )
     // Keep that in mind when moving this out of iptables xt_bpf and into tc ingress (or xdp).
 
     uint32_t key = skb->ifindex;
-    update_iface_stats_map(skb, &key, INGRESS, KVER_4_9);
+    update_iface_stats_map(skb, &key, INGRESS, KVER_4_9, ACCOUNT);
     return XTBPF_MATCH;
 }
 
-DEFINE_SYS_BPF_PROG(schedact, ingress_account, )
+DEFINE_SYS_BPF_PROG(schedact, ingress_account)
 (struct __sk_buff* skb) {
     if (is_received_skb(skb)) {
         // Account for ingress traffic before tc drops it.
         uint32_t key = skb->ifindex;
-        update_iface_stats_map(skb, &key, INGRESS, KVER_4_9);
+        update_iface_stats_map(skb, &key, INGRESS, KVER_4_9, ACCOUNT);
     }
     return TC_ACT_UNSPEC;
 }
 
 // WARNING: Android T's non-updatable netd depends on the name of this program.
-DEFINE_XTBPF_PROG(skfilter, allowlist_xtbpf, )
+DEFINE_XTBPF_PROG(skfilter, allowlist_xtbpf)
 (struct __sk_buff* skb) {
     uint32_t sock_uid = bpf_get_socket_uid(skb);
     if (is_system_uid(sock_uid)) return XTBPF_MATCH;
@@ -751,7 +1136,7 @@ DEFINE_XTBPF_PROG(skfilter, allowlist_xtbpf, )
 }
 
 // WARNING: Android T's non-updatable netd depends on the name of this program.
-DEFINE_XTBPF_PROG(skfilter, denylist_xtbpf, )
+DEFINE_XTBPF_PROG(skfilter, denylist_xtbpf)
 (struct __sk_buff* skb) {
     uint32_t sock_uid = bpf_get_socket_uid(skb);
     UidOwnerValue* denylistMatch = bpf_uid_owner_map_lookup_elem(&sock_uid);
@@ -760,40 +1145,57 @@ DEFINE_XTBPF_PROG(skfilter, denylist_xtbpf, )
     return XTBPF_NOMATCH;
 }
 
-static __always_inline inline uint8_t get_app_permissions() {
+function uint8_t get_app_permissions() {
     uint64_t gid_uid = bpf_get_current_uid_gid();
+    uint32_t uid = (gid_uid & 0xffffffff);
     /*
-     * A given app is guaranteed to have the same app ID in all the profiles in
-     * which it is installed, and install permission is granted to app for all
-     * user at install time so we only check the appId part of a request uid at
-     * run time. See UserHandle#isSameApp for detail.
+     * A given app is guaranteed to have the same app ID in all the profiles
+     * in which it is installed, and install permission is granted to app
+     * for all user at install time so we only check the appId part of a
+     * request uid at run time. See UserHandle#isSameApp for detail.
      */
-    uint32_t appId = (gid_uid & 0xffffffff) % AID_USER_OFFSET;  // == PER_USER_RANGE == 100000
-    uint8_t* permissions = bpf_uid_permission_map_lookup_elem(&appId);
+    uint32_t appId = uid % AID_USER_OFFSET; // == PER_USER_RANGE == 100000
+    uint8_t *permissions = bpf_uid_permission_map_lookup_elem(&appId);
     // if UID not in map, then default to just INTERNET permission.
     return permissions ? *permissions : BPF_PERMISSION_INTERNET;
 }
 
-static __always_inline inline int inet_socket_create(struct bpf_sock* sk,
-                                                     const struct kver_uint kver) {
-    if (KVER_IS_AT_LEAST(kver, 5, 10, 0)) {
-        SkStorageValue *v = bpf_sk_storage_get(sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
-        if (v) v->cookie = bpf_get_sk_cookie(sk);
+function int inet_socket_create(struct bpf_sock* sk, const struct kver_uint kver) {
+    uint64_t gid_uid = bpf_get_current_uid_gid();
+
+    if (KVER_IS_AT_LEAST(kver, 5, 10)) {
+        SkStorageValue *sks = bpf_sk_storage_get(sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+        if (sks) {
+            sks->cookie = bpf_get_sk_cookie(sk);
+            sks->uid = gid_uid;
+            sks->gid = (gid_uid >> 32);
+            sks->l4s.enabled = (sk->type == SOCK_STREAM && sk->protocol == IPPROTO_TCP);
+        }
     }
-    return (get_app_permissions() & BPF_PERMISSION_INTERNET) ? BPF_ALLOW : BPF_DISALLOW;
+
+    uint32_t mapKey = 0;
+    bool *uidMigrationEnabled = bpf_uid_migration_enabled_map_lookup_elem(&mapKey);
+    if (uidMigrationEnabled && *uidMigrationEnabled) {
+        uint32_t uid = (gid_uid & 0xffffffff);
+        return (get_chunk_permissions(uid) & PERMISSION_BIT_NO_INTERNET)
+                   ? BPF_DISALLOW
+                   : BPF_ALLOW;
+    } else {
+        return (get_app_permissions() & BPF_PERMISSION_INTERNET) ? BPF_ALLOW : BPF_DISALLOW;
+    }
 }
 
-DEFINE_NETD_BPF_PROG_KVER(cgroupsock, inet_create, 5_10, 5_10)
+DEFINE_NETD_T_BPF_PROG_KVER(cgroupsock, inet_create, 5_10)
 (struct bpf_sock* sk) {
     return inet_socket_create(sk, KVER_5_10);
 }
 
-DEFINE_NETD_BPF_PROG_KVER_RANGE(cgroupsock, inet_create, 4_14, 4_14, 5_10)
+DEFINE_NETD_T_BPF_PROG_KVER_RANGE(cgroupsock, inet_create, 4_14, 5_10)
 (struct bpf_sock* sk) {
     return inet_socket_create(sk, KVER_4_14);
 }
 
-DEFINE_NETD_BPF_PROG_KVER(cgroupsockrelease, inet_release, , 5_10)
+DEFINE_NETD_T_BPF_PROG_KVER(cgroupsockrelease, inet_release, 5_10)
 (struct bpf_sock* sk) {
     uint64_t cookie = bpf_get_sk_cookie(sk);
     if (cookie) bpf_cookie_tag_map_delete_elem(&cookie);
@@ -801,28 +1203,12 @@ DEFINE_NETD_BPF_PROG_KVER(cgroupsockrelease, inet_release, , 5_10)
     return 1;
 }
 
-static __always_inline inline int check_localhost(__unused struct bpf_sock_addr *ctx) {
-    // See include/uapi/linux/bpf.h:
-    //
-    // struct bpf_sock_addr {
-    //   __u32 user_family;	//     R: 4 byte
-    //   __u32 user_ip4;	// BE, R: 1,2,4-byte,   W: 4-byte
-    //   __u32 user_ip6[4];	// BE, R: 1,2,4,8-byte, W: 4,8-byte
-    //   __u32 user_port;	// BE, R: 1,2,4-byte,   W: 4-byte
-    //   __u32 family;		//     R: 4 byte
-    //   __u32 type;		//     R: 4 byte
-    //   __u32 protocol;	//     R: 4 byte
-    //   __u32 msg_src_ip4;	// BE, R: 1,2,4-byte,   W: 4-byte
-    //   __u32 msg_src_ip6[4];	// BE, R: 1,2,4,8-byte, W: 4,8-byte
-    //   __bpf_md_ptr(struct bpf_sock *, sk);
-    // };
-    return BPF_ALLOW;
-}
+// --- BIND CGROUP HOOKS ---
 
-static inline __always_inline int block_port(struct bpf_sock_addr *ctx) {
-    if (!ctx->user_port) return BPF_ALLOW;
+function bool block_bind_port(__u32 protocol, __be16 user_port) {
+    if (!user_port) return false;
 
-    switch (ctx->protocol) {
+    switch (protocol) {
         case IPPROTO_TCP:
         case IPPROTO_MPTCP:
         case IPPROTO_UDP:
@@ -831,77 +1217,281 @@ static inline __always_inline int block_port(struct bpf_sock_addr *ctx) {
         case IPPROTO_SCTP:
             break;
         default:
-            return BPF_ALLOW; // unknown protocols are allowed
+            return false; // unknown protocols are allowed
     }
 
-    int key = ctx->user_port >> 6;
-    int shift = ctx->user_port & 63;
+    // Note: user_port is in network byte order, so bitmap ordering is funky.
+    int key = user_port >> 6;
+    int shift = user_port & 63;
 
     uint64_t *val = bpf_blocked_ports_map_lookup_elem(&key);
     // Lookup should never fail in reality, but if it does return here to keep the
     // BPF verifier happy.
-    if (!val) return BPF_ALLOW;
+    if (!val) return false;
 
-    if ((*val >> shift) & 1) return BPF_DISALLOW;
+    if ((*val >> shift) & 1) return true;
+    return false;
+}
+
+function bool is_netd() {
+    uint32_t uid = bpf_get_current_uid_gid();  // low 32 bits is uid
+    if (uid) return false;  // netd runs as root
+
+    const uint32_t key = 0;
+    uint32_t *pid = bpf_netd_pid_map_lookup_elem(&key);
+    if (!pid) return false;
+
+    // userspace system call 'getpid()' returns what kernel/ebpf calls 'tgid' (thread group id)
+    // (while what kernel/ebpf calls 'pid' is returned by linux specific system call 'gettid()')
+    uint32_t tgid = bpf_get_current_pid_tgid() >> 32;  // high 32 bits is tgid
+    return tgid == *pid;
+}
+
+function bool is_root_or_shell() {
+    uint32_t uid = bpf_get_current_uid_gid();  // low 32 bits is uid
+    return (uid == AID_ROOT) || (uid == AID_SHELL);
+}
+
+function bool is_unpriv_tcp_port(__be16 port) {
+    switch (port) {
+        case htons(20):   // ftp (active mode data)
+        case htons(21):   // ftp (control)
+        case htons(22):   // ssh (incl. sftp)
+        case htons(23):   // telnet
+        case htons(80):   // http
+        case htons(443):  // https
+        case htons(445):  // smb over ip (direct host)
+        case htons(515):  // lpd
+        case htons(631):  // ipp
+            return true;
+        default:
+            return false;
+    }
+}
+
+function bool is_unpriv_udp_port(__be16 port) {
+    switch (port) {
+        case htons(319):  // ptp
+        case htons(320):  // ptp
+        case htons(443):  // http/3
+            return true;
+        default:
+            return false;
+    }
+}
+
+function bool is_unpriv_port(__u32 protocol, __be16 port) {
+    switch (protocol) {
+        case IPPROTO_TCP: return is_unpriv_tcp_port(port);
+        case IPPROTO_UDP: return is_unpriv_udp_port(port);
+        default:          return false;
+    }
+}
+
+// kernel's include/linux/bpf.h defines flag BPF_RET_BIND_NO_CAP_NET_BIND_SERVICE as (1 << 0) == 1,
+// as a flag, it must be shifted up by 1 (making it == 2) and combined with 'generic' ALLOW (== 1)
+static const int BPF_ALLOW_IGNORING_CAP_NET_BIND = BPF_ALLOW + 2;
+
+function int inet_bind(struct bpf_sock_addr *ctx, const struct kver_uint kver) {
+    const bool is5_15 = KVER_IS_AT_LEAST(kver, 5, 15);
+    if (block_bind_port(ctx->protocol, ctx->user_port)) return BPF_DISALLOW;
+    if (is5_15) {
+        if (ctx->user_port == htons(53) && is_netd())
+            return BPF_ALLOW_IGNORING_CAP_NET_BIND;
+        if (ctx->protocol == IPPROTO_TCP && ctx->user_port == htons(555) && is_root_or_shell())
+            return BPF_ALLOW_IGNORING_CAP_NET_BIND;
+        if (is_unpriv_port(ctx->protocol, ctx->user_port))
+            return BPF_ALLOW_IGNORING_CAP_NET_BIND;
+    }
     return BPF_ALLOW;
 }
 
-DEFINE_NETD_BPF_PROG_KVER(bind4, inet4_bind, , 4_19)
+DEFINE_NETD_T_BPF_PROG_KVER(bind4, inet4_bind, 5_15)
 (struct bpf_sock_addr *ctx) {
-    return block_port(ctx);
+    return inet_bind(ctx, KVER_5_15);
 }
 
-DEFINE_NETD_BPF_PROG_KVER(bind6, inet6_bind, , 4_19)
+DEFINE_NETD_T_BPF_PROG_KVER_RANGE(bind4, inet4_bind, 4_19, 5_15)
 (struct bpf_sock_addr *ctx) {
-    return block_port(ctx);
+    return inet_bind(ctx, KVER_4_19);
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(connect4, inet4_connect, , 4_19)
+DEFINE_NETD_T_BPF_PROG_KVER(bind6, inet6_bind, 5_15)
 (struct bpf_sock_addr *ctx) {
-    return check_localhost(ctx);
+    return inet_bind(ctx, KVER_5_15);
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(connect6, inet6_connect, , 4_19)
+DEFINE_NETD_T_BPF_PROG_KVER_RANGE(bind6, inet6_bind, 4_19, 5_15)
 (struct bpf_sock_addr *ctx) {
-    return check_localhost(ctx);
+    return inet_bind(ctx, KVER_4_19);
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(recvmsg4, udp4_recvmsg, , 4_19)
-(struct bpf_sock_addr *ctx) {
-    return check_localhost(ctx);
+// --- CONNECT CGROUP HOOKS ---
+
+DEFINE_NETD_BPF_PROG_RANGES(connect4, inet4_connect, 4_19, INF, V, MAXAPI)
+(__unused struct bpf_sock_addr *ctx) {
+    return BPF_ALLOW;
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(recvmsg6, udp6_recvmsg, , 4_19)
-(struct bpf_sock_addr *ctx) {
-    return check_localhost(ctx);
+DEFINE_NETD_BPF_PROG_RANGES(connect6, inet6_connect, 4_19, INF, V, MAXAPI)
+(__unused struct bpf_sock_addr *ctx) {
+    return BPF_ALLOW;
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(sendmsg4, udp4_sendmsg, , 4_19)
-(struct bpf_sock_addr *ctx) {
-    return check_localhost(ctx);
+// --- UDP RECVMSG HOOKS ---
+
+DEFINE_NETD_BPF_PROG_RANGES(recvmsg4, udp4_recvmsg, 4_19, INF, V, MAXAPI)
+(__unused struct bpf_sock_addr *ctx) {
+    return BPF_ALLOW;
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(sendmsg6, udp6_sendmsg, , 4_19)
-(struct bpf_sock_addr *ctx) {
-    return check_localhost(ctx);
+DEFINE_NETD_BPF_PROG_RANGES(recvmsg6, udp6_recvmsg, 4_19, INF, V, MAXAPI)
+(__unused struct bpf_sock_addr *ctx) {
+    return BPF_ALLOW;
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(getsockopt, prog, , 5_4)
-(struct bpf_sockopt *ctx) {
+// --- UDP SENDMSG HOOKS ---
+
+DEFINE_NETD_BPF_PROG_RANGES(sendmsg4, udp4_sendmsg, 4_19, INF, V, MAXAPI)
+(__unused struct bpf_sock_addr *ctx) {
+    return BPF_ALLOW;
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(sendmsg6, udp6_sendmsg, 4_19, INF, V, MAXAPI)
+(__unused struct bpf_sock_addr *ctx) {
+    return BPF_ALLOW;
+}
+
+// --- GETSOCKOPT HOOK ---
+
+function int inet_getsockopt(struct bpf_sockopt *ctx,
+                             const struct kver_uint kver,
+                             const struct sdk_level_uint lvl) {
+    SkStorageValue *sks = KVER_IS_AT_LEAST(kver, 5, 10) ? bpf_sk_storage_get(ctx->sk, 0, 0) : NULL;
+    uint8_t *optval_end = ctx->optval_end;
+    uint8_t *optval = ctx->optval;
+
+    if (API_IS_AT_LEAST(lvl, 26Q2)
+        && KVER_IS_BETWEEN(6, 1, kver, 6, 18)
+        && ctx->level == SOL_TCP
+        && ctx->optname == TCP_ANDROID_L4S
+        && ctx->sk->type == SOCK_STREAM
+        && ctx->sk->protocol == IPPROTO_TCP) {
+
+        if (!is_netd()) return bpf_disallow(EPERM);
+
+        if (optval + sizeof(uint8_t) > optval_end) return bpf_disallow(EINVAL);
+
+        if (!sks) return bpf_disallow(EUNATCH);
+
+        *optval = sks->l4s.enabled;
+        WRITE_ONCE(ctx->retval, 0);
+        WRITE_ONCE(ctx->optlen, sizeof(uint8_t));
+        return BPF_ALLOW;
+    }
+
+    if (KVER_IS_AT_LEAST(kver, 5, 10)
+        && ctx->level == SOL_SOCKET
+        && ctx->optname == SO_ANDROID_DROP_REASON) {
+
+        if (optval + sizeof(uint64_t) > optval_end) return bpf_disallow(EINVAL);
+
+        if (!sks) return bpf_disallow(EUNATCH);
+
+        *(uint64_t *)optval = sks->dropReasons;
+        sks->dropReasons = DROP_REASON_NONE;
+        WRITE_ONCE(ctx->retval, 0);
+        WRITE_ONCE(ctx->optlen, sizeof(uint64_t));
+        return BPF_ALLOW;
+    }
+
     // Tell kernel to return 'original' kernel reply (instead of the bpf modified buffer)
     // This is important if the answer is larger than PAGE_SIZE (max size this bpf hook can provide)
     ctx->optlen = 0;
     return BPF_ALLOW;
 }
 
-DEFINE_NETD_V_BPF_PROG_KVER(setsockopt, prog, , 5_4)
+DEFINE_NETD_BPF_PROG_RANGES(getsockopt, prog, 6_18, INF, V, MAXAPI)
 (struct bpf_sockopt *ctx) {
+    return inet_getsockopt(ctx, KVER_6_18, API(V));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(getsockopt, prog, 6_1, 6_18, 26Q2, MAXAPI)
+(struct bpf_sockopt *ctx) {
+    return inet_getsockopt(ctx, KVER_6_1, API(26Q2));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(getsockopt, prog, 6_1, 6_18, V, 26Q2)
+(struct bpf_sockopt *ctx) {
+    return inet_getsockopt(ctx, KVER_6_1, API(V));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(getsockopt, prog, 5_10, 6_1, V, MAXAPI)
+(struct bpf_sockopt *ctx) {
+    return inet_getsockopt(ctx, KVER_5_10, API(V));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(getsockopt, prog, 5_4, 5_10, V, MAXAPI)
+(struct bpf_sockopt *ctx) {
+    return inet_getsockopt(ctx, KVER_5_4, API(V));
+}
+
+// --- SETSOCKOPT HOOK ---
+
+function int inet_setsockopt(struct bpf_sockopt *ctx,
+                             const struct kver_uint kver,
+                             const struct sdk_level_uint lvl) {
+    SkStorageValue *sks = KVER_IS_AT_LEAST(kver, 5, 10) ? bpf_sk_storage_get(ctx->sk, 0, 0) : NULL;
+    uint8_t *optval_end = ctx->optval_end;
+    uint8_t *optval = ctx->optval;
+
+    if (API_IS_AT_LEAST(lvl, 26Q2)
+        && KVER_IS_BETWEEN(6, 1, kver, 6, 18)
+        && ctx->level == SOL_TCP
+        && ctx->optname == TCP_ANDROID_L4S
+        && ctx->sk->type == SOCK_STREAM
+        && ctx->sk->protocol == IPPROTO_TCP) {
+
+        if (!is_netd()) return bpf_disallow(EPERM);
+
+        if (optval + sizeof(uint8_t) > optval_end) return bpf_disallow(EINVAL);
+
+        if (!sks) return bpf_disallow(EUNATCH);
+
+        sks->l4s.enabled = !!*optval;
+        WRITE_ONCE(ctx->optlen, -1);
+        return BPF_ALLOW;
+    }
+
     // Tell kernel to use/process original buffer provided by userspace.
     // This is important if it is larger than PAGE_SIZE (max size this bpf hook can handle).
     ctx->optlen = 0;
     return BPF_ALLOW;
 }
 
-#include "tcpAccECN.c"
+DEFINE_NETD_BPF_PROG_RANGES(setsockopt, prog, 6_18, INF, V, MAXAPI)
+(struct bpf_sockopt *ctx) {
+    return inet_setsockopt(ctx, KVER_6_18, API(V));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(setsockopt, prog, 6_1, 6_18, 26Q2, MAXAPI)
+(struct bpf_sockopt *ctx) {
+    return inet_setsockopt(ctx, KVER_6_1, API(26Q2));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(setsockopt, prog, 6_1, 6_18, V, 26Q2)
+(struct bpf_sockopt *ctx) {
+    return inet_setsockopt(ctx, KVER_6_1, API(V));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(setsockopt, prog, 5_10, 6_1, V, MAXAPI)
+(struct bpf_sockopt *ctx) {
+    return inet_setsockopt(ctx, KVER_5_10, API(V));
+}
+
+DEFINE_NETD_BPF_PROG_RANGES(setsockopt, prog, 5_4, 5_10, V, MAXAPI)
+(struct bpf_sockopt *ctx) {
+    return inet_setsockopt(ctx, KVER_5_4, API(V));
+}
 
 LICENSE("Apache 2.0");

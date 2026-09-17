@@ -183,6 +183,9 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
     // The max vendor name length in utf-8 bytes
     private static final int MAX_VENDOR_NAME_UTF8_BYTES = 24;
 
+    // The max vendor software version length in utf-8 bytes
+    private static final int MAX_VENDOR_SW_VERSION_UTF8_BYTES = 16;
+
     // This regex pattern allows "XXXXXX", "XX:XX:XX" and "XX-XX-XX" OUI formats.
     // Note that this regex allows "XX:XX-XX" as well but we don't need to be a strict checker
     private static final String OUI_REGEX = "^([0-9A-Fa-f]{2}[:-]?){2}([0-9A-Fa-f]{2})$";
@@ -368,6 +371,16 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
                 mOtDaemonCallbackProxy);
         otDaemon.asBinder().linkToDeath(() -> mHandler.post(this::onOtDaemonDied), 0);
         mOtDaemon = otDaemon;
+
+        // The Border Router features depend on the infra link state. When ot-daemon is re-started,
+        // ensure the latest infra link state is set to prevent Border Router features from being
+        // disabled until the next upstream network link properties change.
+        if (mNetworkToLinkProperties.containsKey(mUpstreamNetwork)) {
+            setInfraLinkState(
+                newInfraLinkStateBuilder(
+                    mNetworkToLinkProperties.get(mUpstreamNetwork)).build());
+        }
+
         mHandler.post(mNat64CidrController::maybeUpdateNat64Cidr);
         return mOtDaemon;
     }
@@ -383,6 +396,20 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
             }
         }
         return vendorName;
+    }
+
+    static String getVendorSwVersion(Resources resources,
+            MockableSystemProperties systemProperties) {
+        final String PROP_SW_VERSION = "ro.build.version.incremental";
+        String vendorSwVersion = resources.getString(R.string.config_thread_vendor_sw_version);
+        if (vendorSwVersion.equalsIgnoreCase(PROP_SW_VERSION)) {
+            vendorSwVersion = systemProperties.get(PROP_SW_VERSION);
+            // Assume it's always ASCII chars in ro.build.version.incremental
+            if (vendorSwVersion.length() > MAX_VENDOR_SW_VERSION_UTF8_BYTES) {
+                vendorSwVersion = vendorSwVersion.substring(0, MAX_VENDOR_SW_VERSION_UTF8_BYTES);
+            }
+        }
+        return vendorSwVersion;
     }
 
     static String getModelName(Resources resources, MockableSystemProperties systemProperties) {
@@ -673,6 +700,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
                 .setBorderRouterAutoJoinEnabled(autoJoinEnabled)
                 .setCountryCodeEnabled(countryCodeEnabled)
                 .setVendorName(getVendorName(mResources.get(), mSystemProperties))
+                .setVendorSwVersion(getVendorSwVersion(mResources.get(), mSystemProperties))
                 .setModelName(getModelName(mResources.get(), mSystemProperties))
                 .build();
     }

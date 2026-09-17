@@ -287,6 +287,11 @@ public class VpnTest {
         mConnectUtil = new ConnectUtil(mTestContext);
         mPackageManager = mTestContext.getPackageManager();
         assumeTrue(supportedHardware());
+        // Ensure Wi-Fi and cell networks are requested even on devices with mobile_data_always_on
+        // disabled, or possibly ethernet connected. This is a requirement for
+        // CtsNetUtils#getTestableNetworks().
+        mNetworkCallbackRule.requestWifiIfSupported();
+        mNetworkCallbackRule.requestCellIfSupported();
     }
 
     @After
@@ -1844,7 +1849,7 @@ public class VpnTest {
     private static final boolean EXPECT_PASS = false;
     private static final boolean EXPECT_BLOCK = true;
 
-    @Test @IgnoreUpTo(Build.VERSION_CODES.R)
+    @Test
     public void testBlockIncomingPackets() throws Exception {
         final Network network = mCM.getActiveNetwork();
         assertNotNull("Requires a working Internet connection", network);
@@ -2005,11 +2010,11 @@ public class VpnTest {
             final FileDescriptor dstUdpFd = dstSock.getFileDescriptor$();
             checkBlockUdp(srcTunFd.getFileDescriptor(), dstUdpFd,
                     InetAddresses.parseNumericAddress("192.0.2.2") /* dstAddress */,
-                    InetAddresses.parseNumericAddress("192.0.2.1") /* srcAddress */,
+                    InetAddresses.parseNumericAddress("8.8.8.8") /* srcAddress */,
                     duplicatedAddress ? EXPECT_PASS : EXPECT_BLOCK);
             checkBlockUdp(srcTunFd.getFileDescriptor(), dstUdpFd,
                     InetAddresses.parseNumericAddress("2001:db8:1:2::ffe") /* dstAddress */,
-                    InetAddresses.parseNumericAddress("2001:db8:1:2::ffa") /* srcAddress */,
+                    InetAddresses.parseNumericAddress("2001:4860:4860::8888") /* srcAddress */,
                     duplicatedAddress ? EXPECT_PASS : EXPECT_BLOCK);
 
             // Traffic on VPN should not be affected

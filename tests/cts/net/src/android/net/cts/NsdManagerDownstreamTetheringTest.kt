@@ -22,11 +22,10 @@ import android.net.TetheringManager.TETHERING_ETHERNET
 import android.net.TetheringManager.TetheringRequest
 import android.net.nsd.NsdManager
 import android.os.Build
-import android.os.Handler
-import android.os.HandlerThread
 import android.platform.test.annotations.AppModeFull
 import androidx.test.filters.SmallTest
-import com.android.testutils.AutoCloseTestInterfaceRule
+import com.android.testutils.AutoCloseTestResourcesRule
+import com.android.testutils.AutoCloseableTestNetworkInterface
 import com.android.testutils.ConnectivityModuleTest
 import com.android.testutils.DevSdkIgnoreRule
 import com.android.testutils.DevSdkIgnoreRunner
@@ -55,28 +54,30 @@ class NsdManagerDownstreamTetheringTest : EthernetTetheringTestBase() {
     private val nsdManager by lazy { context.getSystemService(NsdManager::class.java)!! }
     private val serviceType = "_nmt%09d._tcp".format(Random().nextInt(1_000_000_000))
 
-    private val handlerThread = HandlerThread("$TAG thread").apply { start() }
-    private val handler = Handler(handlerThread.looper)
-    private lateinit var downstreamIface: EthernetTestInterface
     private var tetheringEventCallback: MyTetheringEventCallback? = null
 
+    private lateinit var downstreamIface: EthernetTestInterface
+
     @get:Rule
-    val testInterfaceRule = AutoCloseTestInterfaceRule(context)
+    val testResourcesRule = AutoCloseTestResourcesRule()
 
     @Before
     override fun setUp() {
         super.setUp()
-        val iface = testInterfaceRule.createTapInterface()
-        downstreamIface = EthernetTestInterface(context, handler, iface)
+
+        val iface = AutoCloseableTestNetworkInterface.createTap(context)
+        downstreamIface = EthernetTestInterface(context, iface)
+        testResourcesRule.add(downstreamIface)
     }
 
     @After
     override fun tearDown() {
+        // TODO: fix the test so the explicit close() can be removed.
+        // Note that EthernetTestInterface.close() is idempotent,
         if (::downstreamIface.isInitialized) {
-            downstreamIface.destroy()
+            downstreamIface.close()
         }
-        handlerThread.quitSafely()
-        handlerThread.join()
+
         maybeUnregisterTetheringEventCallback(tetheringEventCallback)
         super.tearDown()
     }

@@ -16,6 +16,13 @@
 
 package com.android.server.connectivity.mdns;
 
+import static android.net.nsd.OffloadEngine.OFFLOAD_TYPE_FILTER_REPLIES;
+import static android.net.nsd.OffloadEngine.OFFLOAD_TYPE_QUERY;
+
+import static com.android.server.connectivity.mdns.MdnsConstants.EMPTY_NETWORK_CAPABILITIES;
+import static com.android.server.connectivity.mdns.MdnsConstants.SERVICE_REMOVED_BY_GOODBYE_RECEIVED;
+import static com.android.server.connectivity.mdns.MdnsConstants.SERVICE_REMOVED_BY_SOCKET_DESTROYED;
+import static com.android.server.connectivity.mdns.MdnsConstants.SERVICE_REMOVED_BY_TTL_EXPIRED;
 import static com.android.server.connectivity.mdns.MdnsQueryScheduler.INITIAL_AGGRESSIVE_TIME_BETWEEN_BURSTS_MS;
 import static com.android.server.connectivity.mdns.MdnsQueryScheduler.MAX_TIME_BETWEEN_AGGRESSIVE_BURSTS_MS;
 import static com.android.server.connectivity.mdns.MdnsQueryScheduler.TIME_BETWEEN_RETRANSMISSION_QUERIES_IN_BURST_MS;
@@ -26,9 +33,11 @@ import static com.android.server.connectivity.mdns.MdnsServiceTypeClient.EVENT_Q
 import static com.android.server.connectivity.mdns.MdnsServiceTypeClient.EVENT_REMOVE_EXPIRED_SERVICES;
 import static com.android.server.connectivity.mdns.MdnsServiceTypeClient.EVENT_START_QUERYTASK;
 import static com.android.server.connectivity.mdns.MdnsServiceTypeClient.NO_HOSTNAME;
+import static com.android.server.connectivity.mdns.MdnsServiceTypeClient.NO_SUBTYPE;
 import static com.android.server.connectivity.mdns.MdnsServiceTypeClient.REMOVE_SERVICE_AFTER_QUERY_SENT_TIME;
 import static com.android.server.connectivity.mdns.MdnsServiceTypeClient.SERVICE_NAME_DISCOVERY;
-import static com.android.server.connectivity.mdns.util.MdnsUtils.createOffloadServiceInfoFromFilterReplies;
+import static com.android.server.connectivity.mdns.util.MdnsUtils.LOCAL_TLD;
+import static com.android.server.connectivity.mdns.util.MdnsUtils.createOffloadServiceInfoFromDiscoveryOffload;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -59,6 +68,7 @@ import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.net.InetAddresses;
 import android.net.Network;
+import android.net.nsd.NsdServiceInfo;
 import android.net.nsd.OffloadServiceInfo;
 import android.os.Build;
 import android.os.Handler;
@@ -69,7 +79,7 @@ import android.text.TextUtils;
 import com.android.net.module.util.CollectionUtils;
 import com.android.net.module.util.SharedLog;
 import com.android.server.connectivity.mdns.MdnsServiceInfo.TextEntry;
-import com.android.server.connectivity.mdns.MdnsServiceTypeClient.FilterRepliesInfo;
+import com.android.server.connectivity.mdns.MdnsServiceTypeClient.DiscoveryOffloadInfo;
 import com.android.server.connectivity.mdns.util.MdnsUtils;
 import com.android.testutils.DevSdkIgnoreRule;
 import com.android.testutils.DevSdkIgnoreRunner;
@@ -129,6 +139,8 @@ public class MdnsServiceTypeClientTests {
     @Mock
     private MdnsServiceBrowserListener mockListenerTwo;
     @Mock
+    private MdnsServiceBrowserListener mockListenerThree;
+    @Mock
     private MdnsMultinetworkSocketClient mockSocketClient;
     @Mock
     private Network mockNetwork;
@@ -159,7 +171,8 @@ public class MdnsServiceTypeClientTests {
     private long latestDelayMs = 0;
     private Message delayMessage = null;
     private Handler realHandler = null;
-    private MdnsFeatureFlags featureFlags = MdnsFeatureFlags.newBuilder().build();
+    private MdnsFeatureFlags featureFlags =
+            MdnsFeatureFlags.newBuilder().setAllFlagsForTesting().build();
     private Message message = null;
 
     @Before
@@ -170,7 +183,8 @@ public class MdnsServiceTypeClientTests {
 
         expectedIPv4Packets = new DatagramPacket[24];
         expectedIPv6Packets = new DatagramPacket[24];
-        socketKey = new SocketKey(mockNetwork, INTERFACE_INDEX, "interface");
+        socketKey = new SocketKey(mockNetwork, INTERFACE_INDEX, "interface",
+                EMPTY_NETWORK_CAPABILITIES);
 
         for (int i = 0; i < expectedIPv4Packets.length; ++i) {
             expectedIPv4Packets[i] = new DatagramPacket(buf, 0 /* offset */, 5 /* length */,
@@ -237,7 +251,8 @@ public class MdnsServiceTypeClientTests {
         handler = new Handler(thread.getLooper());
         serviceCache = new MdnsServiceCache(
                 thread.getLooper(),
-                MdnsFeatureFlags.newBuilder().setIsExpiredServicesRemovalEnabled(false).build(),
+                MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                        .setIsExpiredServicesRemovalEnabled(false).build(),
                 mockDecoderClock);
 
         doAnswer(inv -> {
@@ -275,13 +290,16 @@ public class MdnsServiceTypeClientTests {
             return null;
         }).when(mockScheduler).sendDelayedMessage(anyInt(), anyInt(), anyInt(), any(), anyLong());
 
-        client = makeMdnsServiceTypeClient(featureFlags);
+        client = makeMdnsServiceTypeClient(featureFlags, false);
     }
 
-    private MdnsServiceTypeClient makeMdnsServiceTypeClient(MdnsFeatureFlags featureFlags) {
+    private MdnsServiceTypeClient makeMdnsServiceTypeClient(
+            MdnsFeatureFlags featureFlags,
+            boolean isReceiveOnly
+    ) {
         return new MdnsServiceTypeClient(SERVICE_TYPE, mockSocketClient, currentThreadExecutor,
                 mockDecoderClock, socketKey, mockSharedLog, thread.getLooper(), mockDeps,
-                serviceCache, featureFlags, mockCallback);
+                serviceCache, featureFlags, mockCallback, isReceiveOnly);
     }
 
     @After
@@ -304,6 +322,26 @@ public class MdnsServiceTypeClientTests {
 
     private void processResponse(MdnsPacket packet, SocketKey socketKey) {
         runOnHandler(() -> client.processResponse(packet, socketKey));
+    }
+
+    private void processProxyOffloadEngineResponse(
+            NsdServiceInfo serviceInfo,
+            boolean isServiceLost) {
+        runOnHandler(() -> client.processProxyOffloadEngineResponse(serviceInfo, isServiceLost));
+    }
+
+    private MdnsResponse getCachedService(
+            String serviceName,
+            MdnsServiceCache.CacheKey cacheKey,
+            boolean includeExpiredServices) {
+        return HandlerUtils.visibleOnHandlerThread(
+                handler,
+                () -> serviceCache.getCachedService(
+                        serviceName,
+                        cacheKey,
+                        includeExpiredServices
+                )
+        );
     }
 
     private void stopSendAndReceive(MdnsServiceBrowserListener listener) {
@@ -437,6 +475,52 @@ public class MdnsServiceTypeClientTests {
     }
 
     @Test
+    public void sendQueries_dualQuery_passiveScanMode() {
+        featureFlags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsDualQueryForUnicastResponseEnabled(true).build();
+        client = makeMdnsServiceTypeClient(featureFlags, false);
+
+        MdnsSearchOptions searchOptions = MdnsSearchOptions.newBuilder()
+                .addSubtype(SUBTYPE).setQueryMode(PASSIVE_QUERY_MODE).build();
+        startSendAndReceive(mockListenerOne, searchOptions);
+        // Always try to remove the task.
+        verify(mockDeps, times(1)).removeMessages(any(), eq(EVENT_START_QUERYTASK));
+
+        // First burst, first query (Dual query)
+        verifyAndSendQuery(0 /* index */, 0, true /* expectsUnicastResponse */,
+                1 /* scheduledCount */, 1 /* sendMessageCount */,
+                false /* useAccurateDelayCallback */, true /* dualQuery */);
+
+        // First burst, second query (Not dual query)
+        verifyAndSendQuery(2 /* index */, MdnsConfigs.timeBetweenQueriesInBurstMs(),
+                false /* expectsUnicastResponse */, 2 /* scheduledCount */,
+                2 /* sendMessageCount */, false /* useAccurateDelayCallback */,
+                false /* dualQuery */);
+
+        // First burst, third query (Not dual query)
+        verifyAndSendQuery(3 /* index */, MdnsConfigs.timeBetweenQueriesInBurstMs(),
+                false /* expectsUnicastResponse */, 3 /* scheduledCount */,
+                3 /* sendMessageCount */, false /* useAccurateDelayCallback */,
+                false /* dualQuery */);
+
+        // Second burst, first query (Dual query)
+        verifyAndSendQuery(4 /* index */, MdnsConfigs.timeBetweenBurstsMs(),
+                true /* expectsUnicastResponse */, 4 /* scheduledCount */,
+                4 /* sendMessageCount */, false /* useAccurateDelayCallback */,
+                true /* dualQuery */);
+
+        // Third burst, first query (Dual query)
+        verifyAndSendQuery(6 /* index */, MdnsConfigs.timeBetweenBurstsMs(),
+                true /* expectsUnicastResponse */, 5 /* scheduledCount */,
+                5 /* sendMessageCount */, false /* useAccurateDelayCallback */,
+                true /* dualQuery */);
+
+        // Stop sending packets.
+        stopSendAndReceive(mockListenerOne);
+        verify(mockDeps, times(2)).removeMessages(any(), eq(EVENT_START_QUERYTASK));
+    }
+
+    @Test
     public void sendQueries_activeScanWithQueryBackoff() {
         MdnsSearchOptions searchOptions =
                 MdnsSearchOptions.newBuilder()
@@ -488,13 +572,11 @@ public class MdnsServiceTypeClientTests {
         verify(mockDeps, times(2)).removeMessages(any(), eq(EVENT_START_QUERYTASK));
         assertNotNull(delayMessage);
         verifyAndSendQuery(12 /* index */, (long) (TEST_TTL / 2 * 0.8) /* timeInMs */,
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                14 /* scheduledCount */);
+                false /* expectsUnicastResponse */, 14 /* scheduledCount */);
         currentTime += (long) (TEST_TTL / 2 * 0.8);
         doReturn(currentTime).when(mockDecoderClock).elapsedRealtime();
         verifyAndSendQuery(13 /* index */, MdnsConfigs.timeBetweenQueriesInBurstMs(),
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                15 /* scheduledCount */);
+                false /* expectsUnicastResponse */, 15 /* scheduledCount */);
     }
 
     @Test
@@ -509,16 +591,13 @@ public class MdnsServiceTypeClientTests {
         verify(mockDeps, times(1)).removeMessages(any(), eq(EVENT_START_QUERYTASK));
 
         verifyAndSendQuery(0 /* index */, 0 /* timeInMs */, true /* expectsUnicastResponse */,
-                true /* multipleSocketDiscovery */, 1 /* scheduledCount */);
+                1 /* scheduledCount */);
         verifyAndSendQuery(1 /* index */, MdnsConfigs.timeBetweenQueriesInBurstMs(),
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                2 /* scheduledCount */);
+                false /* expectsUnicastResponse */, 2 /* scheduledCount */);
         verifyAndSendQuery(2 /* index */, MdnsConfigs.timeBetweenQueriesInBurstMs(),
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                3 /* scheduledCount */);
+                false /* expectsUnicastResponse */, 3 /* scheduledCount */);
         verifyAndSendQuery(3 /* index */, MdnsConfigs.timeBetweenBurstsMs(),
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                4 /* scheduledCount */);
+                false /* expectsUnicastResponse */, 4 /* scheduledCount */);
 
         // In backoff mode, the current scheduled task will be canceled and reschedule if the
         // 0.8 * smallestRemainingTtl is larger than time to next run.
@@ -531,10 +610,10 @@ public class MdnsServiceTypeClientTests {
         verify(mockDeps, times(2)).removeMessages(any(), eq(EVENT_START_QUERYTASK));
         assertNotNull(delayMessage);
         verifyAndSendQuery(4 /* index */, 80000 /* timeInMs */, false /* expectsUnicastResponse */,
-                true /* multipleSocketDiscovery */, 6 /* scheduledCount */);
+                6 /* scheduledCount */);
         // Next run should also be scheduled in 0.8 * smallestRemainingTtl
         verifyAndSendQuery(5 /* index */, 80000 /* timeInMs */, false /* expectsUnicastResponse */,
-                true /* multipleSocketDiscovery */, 7 /* scheduledCount */);
+                7 /* scheduledCount */);
 
         // If the records is not refreshed, the current scheduled task will not be canceled.
         doReturn(TEST_ELAPSED_REALTIME + 20001).when(mockDecoderClock).elapsedRealtime();
@@ -542,7 +621,7 @@ public class MdnsServiceTypeClientTests {
                 "service-instance-1", "192.0.2.123", 5353,
                 SERVICE_TYPE_LABELS,
                 Collections.emptyMap(), TEST_TTL,
-                TEST_ELAPSED_REALTIME - 1), socketKey);
+                TEST_ELAPSED_REALTIME - 1, "hostname"), socketKey);
         verify(mockDeps, times(2)).removeMessages(any(), eq(EVENT_START_QUERYTASK));
 
         // In backoff mode, the current scheduled task will not be canceled if the
@@ -598,7 +677,8 @@ public class MdnsServiceTypeClientTests {
         //MdnsConfigsFlagsImpl.alwaysAskForUnicastResponseInEachBurst.override(true);
         MdnsSearchOptions searchOptions = MdnsSearchOptions.newBuilder()
                 .addSubtype(SUBTYPE).setQueryMode(ACTIVE_QUERY_MODE).build();
-        QueryTaskConfig config = new QueryTaskConfig(searchOptions.getQueryMode());
+        QueryTaskConfig config =
+                new QueryTaskConfig(searchOptions.getQueryMode(), false /* isDualQueryEnabled */);
 
         // This is the first query. We will ask for unicast response.
         assertTrue(config.expectUnicastResponse);
@@ -623,7 +703,8 @@ public class MdnsServiceTypeClientTests {
     public void testQueryTaskConfig_askForUnicastInFirstQuery() {
         MdnsSearchOptions searchOptions = MdnsSearchOptions.newBuilder()
                 .addSubtype(SUBTYPE).setQueryMode(ACTIVE_QUERY_MODE).build();
-        QueryTaskConfig config = new QueryTaskConfig(searchOptions.getQueryMode());
+        QueryTaskConfig config =
+                new QueryTaskConfig(searchOptions.getQueryMode(), false /* isDualQueryEnabled */);
 
         // This is the first query. We will ask for unicast response.
         assertTrue(config.expectUnicastResponse);
@@ -641,6 +722,33 @@ public class MdnsServiceTypeClientTests {
         int oldTransactionId = config.getTransactionId();
         config = config.getConfigForNextRun(ACTIVE_QUERY_MODE);
         assertFalse(config.expectUnicastResponse);
+        assertEquals(config.getTransactionId(), oldTransactionId + 1);
+    }
+
+    @Test
+    public void testQueryTaskConfig_dualQueryEnabled_askForUnicastInFirstQueryOfEachBurst() {
+        MdnsSearchOptions searchOptions = MdnsSearchOptions.newBuilder()
+                .addSubtype(SUBTYPE).setQueryMode(ACTIVE_QUERY_MODE).build();
+        QueryTaskConfig config =
+                new QueryTaskConfig(searchOptions.getQueryMode(), true /* isDualQueryEnabled */);
+
+        // This is the first query of the first burst. We will ask for unicast response.
+        assertTrue(config.expectUnicastResponse);
+        assertEquals(config.getTransactionId(), 1);
+
+        // For the rest of queries in this burst, we will NOT ask for unicast response.
+        for (int i = 1; i < MdnsConfigs.queriesPerBurst(); i++) {
+            int oldTransactionId = config.getTransactionId();
+            config = config.getConfigForNextRun(ACTIVE_QUERY_MODE);
+            assertFalse(config.expectUnicastResponse);
+            assertEquals(config.getTransactionId(), oldTransactionId + 1);
+        }
+
+        // This is the first query of a new burst. We WILL ask for unicast response if dual query is
+        // enabled.
+        int oldTransactionId = config.getTransactionId();
+        config = config.getConfigForNextRun(ACTIVE_QUERY_MODE);
+        assertTrue(config.expectUnicastResponse);
         assertEquals(config.getTransactionId(), oldTransactionId + 1);
     }
 
@@ -808,6 +916,8 @@ public class MdnsServiceTypeClientTests {
         }
         assertEquals(socketKey.getInterfaceIndex(), serviceInfo.getInterfaceIndex());
         assertEquals(socketKey.getNetwork(), serviceInfo.getNetwork());
+        assertEquals(socketKey.getCreationCapabilitiesBits(),
+                serviceInfo.getCreationCapabilitiesBits());
     }
 
     @Test
@@ -832,6 +942,249 @@ public class MdnsServiceTypeClientTests {
 
         verify(mockListenerOne, never()).onServiceFound(any(MdnsServiceInfo.class), anyBoolean());
         verify(mockListenerOne, never()).onServiceUpdated(any(MdnsServiceInfo.class));
+    }
+
+    @Test
+    public void processProxyOffloadEngineResponse_notGoodBye_shouldUpdateCache() {
+        final String serviceName = "service-instance";
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        NsdServiceInfo nsdServiceInfo = new NsdServiceInfo(
+                serviceName,
+                SERVICE_TYPE
+        );
+        nsdServiceInfo.setSubtypes(Set.of("subtype1"));
+        nsdServiceInfo.setHostname("c.d.e");
+        nsdServiceInfo.setPort(5353);
+        nsdServiceInfo.setAttribute("attr1", "attr1Value".getBytes());
+        nsdServiceInfo.setAttribute("attr2", "attr2Value".getBytes());
+        nsdServiceInfo.setHostAddresses(List.of(
+                InetAddresses.parseNumericAddress("192.0.2.123"),
+                InetAddresses.parseNumericAddress("2001:db8::123")
+        ));
+        client = makeMdnsServiceTypeClient(flags, true);
+        MdnsRecord expectedSRVRecord = new MdnsServiceRecord(
+                new String[] {serviceName, "_googlecast", "_tcp", "local", LOCAL_TLD},
+                1000L /* receiptTimeMillis */,
+                true /* cacheFlush */,
+                MdnsRecord.EXPIRATION_MAX,
+                0 /* servicePriority */, 0 /* serviceWeight */,
+                nsdServiceInfo.getPort(),
+                nsdServiceInfo.getHostname().split("\\.")
+        );
+        MdnsTextRecord expectedTXTRecord = new MdnsTextRecord(
+                new String[] {serviceName, "_googlecast", "_tcp", "local", LOCAL_TLD},
+                1000L /* receiptTimeMillis */,
+                true /* cacheFlush */,
+                MdnsRecord.EXPIRATION_MAX,
+                MdnsUtils.attrsToTextEntries(
+                        nsdServiceInfo.getAttributes(), flags)
+        );
+        MdnsPointerRecord serviceTypePTRRecord = new MdnsPointerRecord(
+                MdnsUtils.splitServiceType(nsdServiceInfo),
+                1000L /* receiptTimeMillis */,
+                true /* cacheFlush */,
+                MdnsRecord.EXPIRATION_MAX,
+                new String[] {serviceName, "_googlecast", "_tcp", "local", LOCAL_TLD}
+        );
+        MdnsPointerRecord subTypePTRRecord = new MdnsPointerRecord(
+                MdnsUtils.constructFullSubtype(
+                        MdnsUtils.splitServiceType(nsdServiceInfo),
+                        "subtype1"
+                ),
+                1000L /* receiptTimeMillis */,
+                true /* cacheFlush */,
+                MdnsRecord.EXPIRATION_MAX,
+                new String[] {serviceName, "_googlecast", "_tcp", "local", LOCAL_TLD}
+        );
+        MdnsInetAddressRecord inetAddr1 = new MdnsInetAddressRecord(
+                new String[] {nsdServiceInfo.getHostname(), LOCAL_TLD},
+                1000L /* receiptTimeMillis */,
+                true /* cacheFlush */,
+                MdnsRecord.EXPIRATION_MAX,
+                nsdServiceInfo.getHostAddresses().get(0)
+        );
+        MdnsInetAddressRecord inetAddr2 = new MdnsInetAddressRecord(
+                new String[] {nsdServiceInfo.getHostname(), LOCAL_TLD},
+                1000L /* receiptTimeMillis */,
+                true /* cacheFlush */,
+                MdnsRecord.EXPIRATION_MAX,
+                nsdServiceInfo.getHostAddresses().get(1)
+        );
+
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo,
+                /* isServiceLost */ false
+        );
+        MdnsResponse mdnsResponse = getCachedService(
+                nsdServiceInfo.getServiceName(),
+                new MdnsServiceCache.CacheKey(SERVICE_TYPE, socketKey),
+                false
+        );
+
+        assertNotNull(mdnsResponse);
+        assertEquals(mdnsResponse.getServiceInstanceName(), nsdServiceInfo.getServiceName());
+        assertRecordsEqual(
+                mdnsResponse,
+                List.of(
+                        expectedSRVRecord,
+                        expectedTXTRecord,
+                        serviceTypePTRRecord,
+                        subTypePTRRecord,
+                        inetAddr1,
+                        inetAddr2
+                )
+        );
+    }
+
+    @Test
+    public void processProxyOffloadEngineResponse_GoodBye_shouldClearCache() {
+        final String serviceName = "service-instance";
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        NsdServiceInfo nsdServiceInfo = new NsdServiceInfo(serviceName, SERVICE_TYPE);
+        client = makeMdnsServiceTypeClient(flags, true);
+        startSendAndReceive(mockListenerOne, MdnsSearchOptions.getDefaultOptions());
+
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo,
+                /* isServiceLost */ false
+        );
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo,
+                /* isServiceLost */ true
+        );
+        MdnsResponse mdnsResponseForGoodByeResponse = getCachedService(
+                nsdServiceInfo.getServiceName(),
+                new MdnsServiceCache.CacheKey(SERVICE_TYPE, socketKey),
+                false
+        );
+
+        assertNull(mdnsResponseForGoodByeResponse);
+    }
+
+    @Test
+    public void processProxyOffloadEngineResponse_incompleteResponse() {
+        final String serviceName = "service-instance";
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        NsdServiceInfo nsdServiceInfo = new NsdServiceInfo(serviceName, SERVICE_TYPE);
+        client = makeMdnsServiceTypeClient(flags, true);
+        startSendAndReceive(mockListenerOne, MdnsSearchOptions.getDefaultOptions());
+
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo,
+                /* isServiceLost */ false
+        );
+        MdnsResponse cachedResponse = getCachedService(
+                nsdServiceInfo.getServiceName(),
+                new MdnsServiceCache.CacheKey(SERVICE_TYPE, socketKey),
+                false
+        );
+
+        verify(mockListenerOne).onServiceNameDiscovered(
+                serviceInfoCaptor.capture(), eq(false) /* isServiceFromCache */);
+        verify(mockListenerOne, never()).onServiceFound(any(MdnsServiceInfo.class), anyBoolean());
+        verify(mockListenerOne, never()).onServiceUpdated(any(MdnsServiceInfo.class));
+        assertNotNull(cachedResponse);
+    }
+
+    @Test
+    public void processProxyOffloadEngineResponse_inOrder() {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        final String serviceName1 = "service-instance1";
+        final String serviceName2 = "service-instance2";
+        final String ipV4Address = "192.0.2.0";
+        final String ipV6Address = "2001:db8::";
+        NsdServiceInfo nsdServiceInfo1 = new NsdServiceInfo(serviceName1, SERVICE_TYPE);
+        nsdServiceInfo1.setSubtypes(Set.of(SUBTYPE));
+        NsdServiceInfo nsdServiceInfo2 = new NsdServiceInfo(serviceName2, SERVICE_TYPE);
+        nsdServiceInfo2.setSubtypes(Set.of(SUBTYPE));
+        client = makeMdnsServiceTypeClient(flags, true);
+        startSendAndReceive(mockListenerOne, MdnsSearchOptions.getDefaultOptions());
+        InOrder inOrder = inOrder(mockListenerOne);
+
+        // Process the initial response which contains only the service name
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo1,
+                /* isServiceLost */ false
+        );
+
+        // Process the service lost response
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo1,
+                /* isServiceLost */ true
+        );
+
+        // Process the initial response which contains only the service name
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo2,
+                /* isServiceLost */ false
+        );
+
+        nsdServiceInfo2.setHostname("MyHost");
+        nsdServiceInfo2.setPort(5353);
+        nsdServiceInfo2.setHostAddresses(
+                List.of(InetAddresses.parseNumericAddress(ipV4Address))
+        );
+
+        // Process the response which is complete as it contains hostname & IP address & port
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo2,
+                /* isServiceLost */ false
+        );
+
+        // update the host address and set the attribute
+        nsdServiceInfo2.setHostAddresses(
+                List.of(
+                        InetAddresses.parseNumericAddress(ipV4Address),
+                        InetAddresses.parseNumericAddress(ipV6Address)
+                )
+        );
+        nsdServiceInfo2.setAttribute("key", "value".getBytes());
+        nsdServiceInfo2.setPort(5354);
+
+        // Process the updated response which is complete as it contains hostname & IP address
+        processProxyOffloadEngineResponse(
+                nsdServiceInfo2,
+                /* isServiceLost */ false
+        );
+
+        // Verify onServiceNameDiscovered was first called for the initial response.
+        inOrder.verify(mockListenerOne).onServiceNameDiscovered(
+                serviceInfoCaptor.capture(), eq(false) /* isServiceFromCache */);
+        assertEquals(serviceName1, serviceInfoCaptor.getValue().getServiceInstanceName());
+
+        inOrder.verify(mockListenerOne).onServiceNameRemoved(
+                serviceInfoCaptor.capture(), eq(SERVICE_REMOVED_BY_GOODBYE_RECEIVED));
+        assertEquals(serviceName1, serviceInfoCaptor.getValue().getServiceInstanceName());
+
+        inOrder.verify(mockListenerOne).onServiceNameDiscovered(
+                serviceInfoCaptor.capture(), eq(false) /* isServiceFromCache */);
+        assertEquals(serviceName2, serviceInfoCaptor.getValue().getServiceInstanceName());
+
+        inOrder.verify(mockListenerOne).onServiceFound(
+                serviceInfoCaptor.capture(), eq(false) /* isServiceFromCache */);
+        verifyServiceInfo(serviceInfoCaptor.getAllValues().get(3),
+                serviceName2,
+                SERVICE_TYPE_LABELS,
+                List.of(ipV4Address) /* ipv4Address */,
+                List.of() /* ipv6Address */,
+                5353 /* port */,
+                Collections.singletonList(SUBTYPE) /* subTypes */,
+                Collections.singletonMap("key", null) /* attributes */,
+                socketKey);
+        inOrder.verify(mockListenerOne).onServiceUpdated(serviceInfoCaptor.capture());
+        verifyServiceInfo(serviceInfoCaptor.getAllValues().get(4),
+                serviceName2,
+                SERVICE_TYPE_LABELS,
+                List.of(ipV4Address) /* ipv4Address */,
+                List.of(ipV6Address) /* ipv6Address */,
+                5354 /* port */,
+                Collections.singletonList(SUBTYPE) /* subTypes */,
+                Collections.singletonMap("key", "value") /* attributes */,
+                socketKey);
     }
 
     @Test
@@ -943,22 +1296,26 @@ public class MdnsServiceTypeClientTests {
     }
 
     private void verifyServiceRemovedNoCallback(MdnsServiceBrowserListener listener) {
-        verify(listener, never()).onServiceRemoved(any());
-        verify(listener, never()).onServiceNameRemoved(any());
+        verify(listener, never()).onServiceRemoved(any(), anyInt());
+        verify(listener, never()).onServiceNameRemoved(any(), anyInt());
     }
 
+
     private void verifyServiceRemovedCallback(MdnsServiceBrowserListener listener,
-            String serviceName, String[] serviceType, SocketKey socketKey) {
+            String serviceName, String[] serviceType, SocketKey socketKey,
+            int serviceRemovedReason) {
         verify(listener).onServiceRemoved(argThat(
-                info -> serviceName.equals(info.getServiceInstanceName())
-                        && Arrays.equals(serviceType, info.getServiceType())
-                        && info.getInterfaceIndex() == socketKey.getInterfaceIndex()
-                        && socketKey.getNetwork().equals(info.getNetwork())));
+                        info -> serviceName.equals(info.getServiceInstanceName())
+                                && Arrays.equals(serviceType, info.getServiceType())
+                                && info.getInterfaceIndex() == socketKey.getInterfaceIndex()
+                                && socketKey.getNetwork().equals(info.getNetwork())),
+                eq(serviceRemovedReason));
         verify(listener).onServiceNameRemoved(argThat(
-                info -> serviceName.equals(info.getServiceInstanceName())
-                        && Arrays.equals(serviceType, info.getServiceType())
-                        && info.getInterfaceIndex() == socketKey.getInterfaceIndex()
-                        && socketKey.getNetwork().equals(info.getNetwork())));
+                        info -> serviceName.equals(info.getServiceInstanceName())
+                                && Arrays.equals(serviceType, info.getServiceType())
+                                && info.getInterfaceIndex() == socketKey.getInterfaceIndex()
+                                && socketKey.getNetwork().equals(info.getNetwork())),
+                eq(serviceRemovedReason));
     }
 
     @Test
@@ -988,10 +1345,10 @@ public class MdnsServiceTypeClientTests {
                 serviceName, ipV6Address, 5353,
                 SERVICE_TYPE_LABELS,
                 Collections.emptyMap(), 0L), socketKey);
-        verifyServiceRemovedCallback(
-                mockListenerOne, serviceName, SERVICE_TYPE_LABELS, socketKey);
-        verifyServiceRemovedCallback(
-                mockListenerTwo, serviceName, SERVICE_TYPE_LABELS, socketKey);
+        verifyServiceRemovedCallback(mockListenerOne, serviceName, SERVICE_TYPE_LABELS, socketKey,
+                SERVICE_REMOVED_BY_GOODBYE_RECEIVED);
+        verifyServiceRemovedCallback(mockListenerTwo, serviceName, SERVICE_TYPE_LABELS, socketKey,
+                SERVICE_REMOVED_BY_GOODBYE_RECEIVED);
     }
 
     @Test
@@ -1074,8 +1431,8 @@ public class MdnsServiceTypeClientTests {
         verify(mockDeps, times(2)).sendMessage(any(), any(Message.class));
 
         // Verify removed callback was called.
-        verifyServiceRemovedCallback(
-                mockListenerOne, serviceInstanceName, SERVICE_TYPE_LABELS, socketKey);
+        verifyServiceRemovedCallback(mockListenerOne, serviceInstanceName, SERVICE_TYPE_LABELS,
+                socketKey, SERVICE_REMOVED_BY_TTL_EXPIRED);
     }
 
     @Test
@@ -1123,8 +1480,8 @@ public class MdnsServiceTypeClientTests {
         firstMdnsTask.run();
 
         // Verify removed callback was called.
-        verifyServiceRemovedCallback(
-                mockListenerOne, serviceInstanceName, SERVICE_TYPE_LABELS, socketKey);
+        verifyServiceRemovedCallback(mockListenerOne, serviceInstanceName, SERVICE_TYPE_LABELS,
+                socketKey, SERVICE_REMOVED_BY_TTL_EXPIRED);
     }
 
     @Test
@@ -1195,7 +1552,8 @@ public class MdnsServiceTypeClientTests {
                 socketKey);
 
         // Verify onServiceRemoved was called for the last response.
-        inOrder.verify(mockListenerOne).onServiceRemoved(serviceInfoCaptor.capture());
+        inOrder.verify(mockListenerOne).onServiceRemoved(
+                serviceInfoCaptor.capture(), eq(SERVICE_REMOVED_BY_GOODBYE_RECEIVED));
         verifyServiceInfo(serviceInfoCaptor.getAllValues().get(3),
                 serviceName,
                 SERVICE_TYPE_LABELS,
@@ -1207,7 +1565,8 @@ public class MdnsServiceTypeClientTests {
                 socketKey);
 
         // Verify onServiceNameRemoved was called for the last response.
-        inOrder.verify(mockListenerOne).onServiceNameRemoved(serviceInfoCaptor.capture());
+        inOrder.verify(mockListenerOne).onServiceNameRemoved(
+                serviceInfoCaptor.capture(), eq(SERVICE_REMOVED_BY_GOODBYE_RECEIVED));
         verifyServiceInfo(serviceInfoCaptor.getAllValues().get(4),
                 serviceName,
                 SERVICE_TYPE_LABELS,
@@ -1452,6 +1811,85 @@ public class MdnsServiceTypeClientTests {
     }
 
     @Test
+    public void testResolveAllServices() throws Exception {
+        final String instanceName = "service-instance";
+        final String[] hostname = new String[] { "testhost "};
+        final String ipV4Address = "192.0.2.0";
+        final String ipV6Address = "2001:db8::";
+        final MdnsSearchOptions resolveOptions = MdnsSearchOptions.newBuilder()
+                .setResolveAllServices(true).build();
+        doCallRealMethod().when(mockDeps).getDatagramPacketsFromMdnsPacket(
+                any(), any(MdnsPacket.class), any(InetSocketAddress.class), anyBoolean());
+
+        startSendAndReceive(mockListenerOne, resolveOptions);
+        InOrder inOrder = inOrder(mockListenerOne, mockSocketClient);
+
+        // Get a first query for PTR
+        final ArgumentCaptor<List<DatagramPacket>> ptrQueryCaptor =
+                ArgumentCaptor.forClass(List.class);
+        currentThreadExecutor.getAndClearLastScheduledRunnable().run();
+        // Sent twice for IPv4 and IPv6
+        inOrder.verify(mockSocketClient, times(2)).sendPacketRequestingUnicastResponse(
+                ptrQueryCaptor.capture(), eq(socketKey), eq(false));
+        final MdnsPacket ptrQueryPacket = MdnsPacket.parse(
+                new MdnsPacketReader(ptrQueryCaptor.getValue().get(0)));
+
+        final String[] serviceName = getTestServiceName(instanceName);
+        assertTrue(hasQuestion(ptrQueryPacket, MdnsRecord.TYPE_PTR, SERVICE_TYPE_LABELS));
+
+        // Process a response with just a PTR record
+        final MdnsPacket ptrResponse = new MdnsPacket(
+                0 /* flags */,
+                Collections.emptyList() /* questions */,
+                List.of(new MdnsPointerRecord(SERVICE_TYPE_LABELS, TEST_ELAPSED_REALTIME,
+                        false /* cacheFlush */, TEST_TTL, serviceName)),
+                Collections.emptyList() /* authorityRecords */,
+                Collections.emptyList() /* additionalRecords */);
+        processResponse(ptrResponse, socketKey);
+        dispatchMessage();
+        inOrder.verify(mockListenerOne).onServiceNameDiscovered(
+                any(), eq(false) /* isServiceFromCache */);
+
+        // Expect a query for SRV/TXT
+        final ArgumentCaptor<List<DatagramPacket>> srvTxtQueryCaptor =
+                ArgumentCaptor.forClass(List.class);
+        currentThreadExecutor.getAndClearLastScheduledRunnable().run();
+        inOrder.verify(mockSocketClient, times(2)).sendPacketRequestingMulticastResponse(
+                srvTxtQueryCaptor.capture(), eq(socketKey), eq(false));
+        final MdnsPacket srvTxtQueryPacket = MdnsPacket.parse(
+                new MdnsPacketReader(srvTxtQueryCaptor.getValue().get(0)));
+        assertTrue(hasQuestion(srvTxtQueryPacket, MdnsRecord.TYPE_ANY, serviceName));
+
+        // Process a response with SRV/TXT/addresses
+        final MdnsPacket srvTxtResponse = new MdnsPacket(
+                0 /* flags */,
+                Collections.emptyList() /* questions */,
+                // Answers:
+                List.of(
+                        new MdnsServiceRecord(serviceName, TEST_ELAPSED_REALTIME,
+                                true /* cacheFlush */, TEST_TTL, 0 /* servicePriority */,
+                                0 /* serviceWeight */, 1234 /* servicePort */, hostname),
+                        new MdnsTextRecord(serviceName, TEST_ELAPSED_REALTIME,
+                                true /* cacheFlush */, TEST_TTL,
+                                Collections.emptyList() /* entries */)),
+                Collections.emptyList() /* authorityRecords */,
+                // Additional records:
+                List.of(
+                        new MdnsInetAddressRecord(hostname, TEST_ELAPSED_REALTIME,
+                                true /* cacheFlush */, TEST_TTL,
+                                InetAddresses.parseNumericAddress(ipV4Address)),
+                        new MdnsInetAddressRecord(hostname, TEST_ELAPSED_REALTIME,
+                                true /* cacheFlush */, TEST_TTL,
+                                InetAddresses.parseNumericAddress(ipV6Address))
+                ));
+        processResponse(srvTxtResponse, socketKey);
+        dispatchMessage();
+
+        inOrder.verify(mockListenerOne).onServiceFound(any(), eq(false) /* isServiceFromCache */);
+        inOrder.verifyNoMoreInteractions();
+    }
+
+    @Test
     public void testProcessResponse_ResolveExcludesOtherServices() {
         final String requestedInstance = "instance1";
         final String otherInstance = "instance2";
@@ -1500,7 +1938,8 @@ public class MdnsServiceTypeClientTests {
         verify(mockListenerOne, never()).onServiceNameDiscovered(
                 matchServiceName(otherInstance), anyBoolean());
         verify(mockListenerOne, never()).onServiceUpdated(matchServiceName(otherInstance));
-        verify(mockListenerOne, never()).onServiceRemoved(matchServiceName(otherInstance));
+        verify(mockListenerOne, never()).onServiceRemoved(
+                matchServiceName(otherInstance), anyInt());
 
         // mockListenerTwo gets notified for both though
         final InOrder inOrder = inOrder(mockListenerTwo);
@@ -1514,7 +1953,8 @@ public class MdnsServiceTypeClientTests {
         inOrder.verify(mockListenerTwo).onServiceFound(
                 matchServiceName(otherInstance), eq(false) /* isServiceFromCache */);
         inOrder.verify(mockListenerTwo).onServiceUpdated(matchServiceName(otherInstance));
-        inOrder.verify(mockListenerTwo).onServiceRemoved(matchServiceName(otherInstance));
+        inOrder.verify(mockListenerTwo).onServiceRemoved(
+                matchServiceName(otherInstance), eq(SERVICE_REMOVED_BY_GOODBYE_RECEIVED));
     }
 
     @Test
@@ -1586,7 +2026,8 @@ public class MdnsServiceTypeClientTests {
         verify(mockListenerOne, never()).onServiceNameDiscovered(
                 matchServiceName(otherInstance), anyBoolean());
         verify(mockListenerOne, never()).onServiceUpdated(matchServiceName(otherInstance));
-        verify(mockListenerOne, never()).onServiceRemoved(matchServiceName(otherInstance));
+        verify(mockListenerOne, never()).onServiceRemoved(
+                matchServiceName(otherInstance), anyInt());
 
         // mockListenerTwo gets notified for both though
         final InOrder inOrder = inOrder(mockListenerTwo);
@@ -1600,7 +2041,8 @@ public class MdnsServiceTypeClientTests {
         inOrder.verify(mockListenerTwo).onServiceFound(
                 matchServiceName(otherInstance), eq(false) /* isServiceFromCache */);
         inOrder.verify(mockListenerTwo).onServiceUpdated(matchServiceName(otherInstance));
-        inOrder.verify(mockListenerTwo).onServiceRemoved(matchServiceName(otherInstance));
+        inOrder.verify(mockListenerTwo).onServiceRemoved(
+                matchServiceName(otherInstance), eq(SERVICE_REMOVED_BY_GOODBYE_RECEIVED));
     }
 
     @Test
@@ -1680,8 +2122,10 @@ public class MdnsServiceTypeClientTests {
                 matchingInstance, ipV6Address, 5353, SERVICE_TYPE_LABELS,
                 Collections.emptyMap(), 0L /* ttl */), socketKey);
 
-        inOrder.verify(mockListenerOne).onServiceRemoved(matchServiceName(matchingInstance));
-        inOrder.verify(mockListenerOne).onServiceNameRemoved(matchServiceName(matchingInstance));
+        inOrder.verify(mockListenerOne).onServiceRemoved(
+                matchServiceName(matchingInstance), eq(SERVICE_REMOVED_BY_GOODBYE_RECEIVED));
+        inOrder.verify(mockListenerOne).onServiceNameRemoved(
+                matchServiceName(matchingInstance), eq(SERVICE_REMOVED_BY_GOODBYE_RECEIVED));
     }
 
     @Test
@@ -1732,14 +2176,18 @@ public class MdnsServiceTypeClientTests {
                 matchServiceName(requestedInstance), eq(false) /* isServiceFromCache */);
         inOrder1.verify(mockListenerOne).onServiceFound(
                 matchServiceName(requestedInstance), eq(false) /* isServiceFromCache */);
-        inOrder1.verify(mockListenerOne).onServiceRemoved(matchServiceName(requestedInstance));
-        inOrder1.verify(mockListenerOne).onServiceNameRemoved(matchServiceName(requestedInstance));
+        inOrder1.verify(mockListenerOne).onServiceRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_SOCKET_DESTROYED));
+        inOrder1.verify(mockListenerOne).onServiceNameRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_SOCKET_DESTROYED));
         verify(mockListenerOne, never()).onServiceFound(
                 matchServiceName(otherInstance), anyBoolean());
         verify(mockListenerOne, never()).onServiceNameDiscovered(
                 matchServiceName(otherInstance), anyBoolean());
-        verify(mockListenerOne, never()).onServiceRemoved(matchServiceName(otherInstance));
-        verify(mockListenerOne, never()).onServiceNameRemoved(matchServiceName(otherInstance));
+        verify(mockListenerOne, never()).onServiceRemoved(
+                matchServiceName(otherInstance), anyInt());
+        verify(mockListenerOne, never()).onServiceNameRemoved(
+                matchServiceName(otherInstance), anyInt());
 
         // mockListenerTwo gets notified for both though
         final InOrder inOrder2 = inOrder(mockListenerTwo);
@@ -1747,14 +2195,18 @@ public class MdnsServiceTypeClientTests {
                 matchServiceName(requestedInstance), eq(false) /* isServiceFromCache */);
         inOrder2.verify(mockListenerTwo).onServiceFound(
                 matchServiceName(requestedInstance), eq(false) /* isServiceFromCache */);
-        inOrder2.verify(mockListenerTwo).onServiceRemoved(matchServiceName(requestedInstance));
-        inOrder2.verify(mockListenerTwo).onServiceNameRemoved(matchServiceName(requestedInstance));
+        inOrder2.verify(mockListenerTwo).onServiceRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_SOCKET_DESTROYED));
+        inOrder2.verify(mockListenerTwo).onServiceNameRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_SOCKET_DESTROYED));
         verify(mockListenerTwo).onServiceNameDiscovered(
                 matchServiceName(otherInstance), eq(false) /* isServiceFromCache */);
         verify(mockListenerTwo).onServiceFound(
                 matchServiceName(otherInstance), eq(false) /* isServiceFromCache */);
-        verify(mockListenerTwo).onServiceRemoved(matchServiceName(otherInstance));
-        verify(mockListenerTwo).onServiceNameRemoved(matchServiceName(otherInstance));
+        verify(mockListenerTwo).onServiceRemoved(
+                matchServiceName(otherInstance), eq(SERVICE_REMOVED_BY_SOCKET_DESTROYED));
+        verify(mockListenerTwo).onServiceNameRemoved(
+                matchServiceName(otherInstance), eq(SERVICE_REMOVED_BY_SOCKET_DESTROYED));
     }
 
     @Test
@@ -1948,22 +2400,22 @@ public class MdnsServiceTypeClientTests {
         verify(mockDeps, times(2)).removeMessages(any(), eq(EVENT_START_QUERYTASK));
         assertNotNull(delayMessage);
         verifyAndSendQuery(12 /* index */, (long) (TEST_TTL / 2 * 0.8) /* timeInMs */,
-                true /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                14 /* scheduledCount */);
+                true /* expectsUnicastResponse */, 14 /* scheduledCount */);
         currentTime += (long) (TEST_TTL / 2 * 0.8);
         doReturn(currentTime).when(mockDecoderClock).elapsedRealtime();
         verifyAndSendQuery(13 /* index */, 0 /* timeInMs */,
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                15 /* scheduledCount */);
+                false /* expectsUnicastResponse */, 15 /* scheduledCount */);
         verifyAndSendQuery(14 /* index */, TIME_BETWEEN_RETRANSMISSION_QUERIES_IN_BURST_MS,
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                16 /* scheduledCount */);
+                false /* expectsUnicastResponse */, 16 /* scheduledCount */);
     }
 
     @Test
     public void testSendQueryWithKnownAnswers() throws Exception {
         client = makeMdnsServiceTypeClient(
-                MdnsFeatureFlags.newBuilder().setIsQueryWithKnownAnswerEnabled(true).build());
+                MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                        .setIsQueryWithKnownAnswerEnabled(true).build(),
+                false
+        );
 
         doCallRealMethod().when(mockDeps).getDatagramPacketsFromMdnsPacket(
                 any(), any(MdnsPacket.class), any(InetSocketAddress.class), anyBoolean());
@@ -2025,7 +2477,10 @@ public class MdnsServiceTypeClientTests {
     @Test
     public void testSendQueryWithSubTypeWithKnownAnswers() throws Exception {
         client = makeMdnsServiceTypeClient(
-                MdnsFeatureFlags.newBuilder().setIsQueryWithKnownAnswerEnabled(true).build());
+                MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                        .setIsQueryWithKnownAnswerEnabled(true).build(),
+                false
+        );
 
         doCallRealMethod().when(mockDeps).getDatagramPacketsFromMdnsPacket(
                 any(), any(MdnsPacket.class), any(InetSocketAddress.class), anyBoolean());
@@ -2149,7 +2604,10 @@ public class MdnsServiceTypeClientTests {
     @Test
     public void sendQueries_AccurateDelayCallback() {
         client = makeMdnsServiceTypeClient(
-                MdnsFeatureFlags.newBuilder().setIsAccurateDelayCallbackEnabled(true).build());
+                MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                        .setIsAccurateDelayCallbackEnabled(true).build(),
+                false
+        );
 
         final int numOfQueriesBeforeBackoff = 2;
         final MdnsSearchOptions searchOptions = MdnsSearchOptions.newBuilder()
@@ -2162,19 +2620,18 @@ public class MdnsServiceTypeClientTests {
 
         // Verify that the first query has been sent.
         verifyAndSendQuery(0 /* index */, 0 /* timeInMs */, true /* expectsUnicastResponse */,
-                true /* multipleSocketDiscovery */, 1 /* scheduledCount */,
-                1 /* sendMessageCount */, true /* useAccurateDelayCallback */);
+                1 /* scheduledCount */, 1 /* sendMessageCount */,
+                true /* useAccurateDelayCallback */);
 
         // Verify that the second query has been sent
         verifyAndSendQuery(1 /* index */, 0 /* timeInMs */, false /* expectsUnicastResponse */,
-                true /* multipleSocketDiscovery */, 2 /* scheduledCount */,
-                2 /* sendMessageCount */, true /* useAccurateDelayCallback */);
+                2 /* scheduledCount */, 2 /* sendMessageCount */,
+                true /* useAccurateDelayCallback */);
 
         // Verify that the third query has been sent
         verifyAndSendQuery(2 /* index */, TIME_BETWEEN_RETRANSMISSION_QUERIES_IN_BURST_MS,
-                false /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                3 /* scheduledCount */, 3 /* sendMessageCount */,
-                true /* useAccurateDelayCallback */);
+                false /* expectsUnicastResponse */, 3 /* scheduledCount */,
+                3 /* sendMessageCount */, true /* useAccurateDelayCallback */);
 
         // In backoff mode, the current scheduled task will be canceled and reschedule if the
         // 0.8 * smallestRemainingTtl is larger than time to next run.
@@ -2189,8 +2646,7 @@ public class MdnsServiceTypeClientTests {
         verify(mockScheduler, times(6)).removeDelayedMessage(EVENT_START_QUERYTASK);
         assertNotNull(message);
         verifyAndSendQuery(3 /* index */, (long) (TEST_TTL / 2 * 0.8) /* timeInMs */,
-                true /* expectsUnicastResponse */, true /* multipleSocketDiscovery */,
-                5 /* scheduledCount */, 4 /* sendMessageCount */,
+                true /* expectsUnicastResponse */, 5 /* scheduledCount */, 4 /* sendMessageCount */,
                 true /* useAccurateDelayCallback */);
 
         // Stop sending packets.
@@ -2201,7 +2657,10 @@ public class MdnsServiceTypeClientTests {
     @Test
     public void testTimerFdCloseProperly() {
         client = makeMdnsServiceTypeClient(
-                MdnsFeatureFlags.newBuilder().setIsAccurateDelayCallbackEnabled(true).build());
+                MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                        .setIsAccurateDelayCallbackEnabled(true).build(),
+                false
+        );
 
         // Start query
         startSendAndReceive(mockListenerOne, MdnsSearchOptions.newBuilder().build());
@@ -2227,13 +2686,13 @@ public class MdnsServiceTypeClientTests {
     public void testExpireServiceRemovedAfterQuerySent() throws IOException {
         final String requestedInstance = "instance1";
         final String ipV4Address = "192.0.2.0";
-        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder()
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
                 .setIsExpiredServicesRemovalEnabled(true)
                 .setIsOptimizedExpiredServiceRemovalEnabled(true)
                 .setIsAccurateDelayCallbackEnabled(true)
                 .build();
         serviceCache = new MdnsServiceCache(thread.getLooper(), flags, mockDecoderClock);
-        client = makeMdnsServiceTypeClient(flags);
+        client = makeMdnsServiceTypeClient(flags, false);
         startSendAndReceive(mockListenerOne,
                 MdnsSearchOptions.newBuilder().setQueryMode(AGGRESSIVE_QUERY_MODE).build());
 
@@ -2257,8 +2716,8 @@ public class MdnsServiceTypeClientTests {
         verifyQuerySentAndRemoveExpiredServices(2 /* count */);
         runOnHandler(() -> realHandler.dispatchMessage(
                 realHandler.obtainMessage(EVENT_REMOVE_EXPIRED_SERVICES)));
-        verify(mockListenerOne, never()).onServiceRemoved(any());
-        verify(mockListenerOne, never()).onServiceNameRemoved(any());
+        verify(mockListenerOne, never()).onServiceRemoved(any(), anyInt());
+        verify(mockListenerOne, never()).onServiceNameRemoved(any(), anyInt());
 
         // Advance the time so that the service's TTL is expired, and send a query again. Attempt to
         // remove expired services for which there should be a callback.
@@ -2268,24 +2727,24 @@ public class MdnsServiceTypeClientTests {
         verifyQuerySentAndRemoveExpiredServices(3 /* count */);
         runOnHandler(() -> realHandler.dispatchMessage(
                 realHandler.obtainMessage(EVENT_REMOVE_EXPIRED_SERVICES)));
-        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1))
-                .onServiceRemoved(matchServiceName(requestedInstance));
-        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1))
-                .onServiceNameRemoved(matchServiceName(requestedInstance));
+        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1)).onServiceRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_TTL_EXPIRED));
+        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1)).onServiceNameRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_TTL_EXPIRED));
     }
 
     @Test
     public void testNoLostCallbackIfServiceHasNotNotified() throws IOException {
         final String requestedInstance = "instance1";
         final String ipV4Address = "192.0.2.0";
-        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder()
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
                 .setIsExpiredServicesRemovalEnabled(true)
                 .setIsOptimizedExpiredServiceRemovalEnabled(true)
                 .setIsAccurateDelayCallbackEnabled(true)
                 .build();
         long currentTime = TEST_ELAPSED_REALTIME;
         serviceCache = new MdnsServiceCache(thread.getLooper(), flags, mockDecoderClock);
-        client = makeMdnsServiceTypeClient(flags);
+        client = makeMdnsServiceTypeClient(flags, false);
         doReturn(currentTime).when(mockDecoderClock).elapsedRealtime();
         startSendAndReceive(mockListenerOne,
                 MdnsSearchOptions.newBuilder().setQueryMode(AGGRESSIVE_QUERY_MODE).build());
@@ -2323,22 +2782,26 @@ public class MdnsServiceTypeClientTests {
         doReturn(currentTime).when(mockDecoderClock).elapsedRealtime();
         runOnHandler(() -> realHandler.dispatchMessage(
                 realHandler.obtainMessage(EVENT_REMOVE_EXPIRED_SERVICES)));
-        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1))
-                .onServiceRemoved(matchServiceName(requestedInstance));
-        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1))
-                .onServiceNameRemoved(matchServiceName(requestedInstance));
-        verify(mockListenerTwo, never()).onServiceRemoved(any());
-        verify(mockListenerTwo, never()).onServiceNameRemoved(any());
+        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1)).onServiceRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_TTL_EXPIRED));
+        verify(mockListenerOne, timeout(TEST_TIMEOUT_MS).times(1)).onServiceNameRemoved(
+                matchServiceName(requestedInstance), eq(SERVICE_REMOVED_BY_TTL_EXPIRED));
+        verify(mockListenerTwo, never()).onServiceRemoved(any(), anyInt());
+        verify(mockListenerTwo, never()).onServiceNameRemoved(any(), anyInt());
     }
 
-    private Set<FilterRepliesInfo> getFilterRepliesInfo() throws Exception {
-        final CompletableFuture<Set<FilterRepliesInfo>> future = new CompletableFuture<>();
-        handler.post(() -> future.complete(client.getFilterRepliesInfo()));
+    private Set<DiscoveryOffloadInfo> getAllDiscoveryOffloadInfos() throws Exception {
+        final CompletableFuture<Set<DiscoveryOffloadInfo>> future = new CompletableFuture<>();
+        handler.post(() -> future.complete(client.getAllDiscoveryOffloadInfos()));
         return future.get(DEFAULT_TIMEOUT, TimeUnit.MILLISECONDS);
     }
 
     @Test
-    public void testGetFilterRepliesInfo() throws Exception {
+    public void testGetAllDiscoveryOffloadInfos() throws Exception {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        client = makeMdnsServiceTypeClient(flags, false);
+
         final String instanceName = "instance1";
         final String subtype = "subtype";
         final MdnsSearchOptions resolveOptions = MdnsSearchOptions.newBuilder()
@@ -2349,32 +2812,61 @@ public class MdnsServiceTypeClientTests {
         startSendAndReceive(mockListenerOne, resolveOptions);
         startSendAndReceive(mockListenerTwo, discoverOptions);
 
+        // Check offload service info. There should be two services for both resolution and
+        // discovery.
+        final Set<DiscoveryOffloadInfo> offloadInfo = getAllDiscoveryOffloadInfos();
+        assertEquals(2, offloadInfo.size());
+
+        final DiscoveryOffloadInfo resolveInfo = new DiscoveryOffloadInfo(
+                instanceName, SERVICE_TYPE, List.of(), NO_HOSTNAME);
+        final DiscoveryOffloadInfo discoverInfo = new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype), NO_HOSTNAME);
+        assertTrue(offloadInfo.containsAll(Set.of(resolveInfo, discoverInfo)));
+
         // Get a service response
         processResponse(createResponse(instanceName, "192.0.2.0", 5353, SUBTYPE,
                 Collections.emptyMap() /* textAttributes */, TEST_TTL), socketKey);
 
-        // Check offload service info. There should be two services for both resolution and
-        // discovery.
-        final Set<FilterRepliesInfo> offloadInfo = getFilterRepliesInfo();
-        assertEquals(2, offloadInfo.size());
+        // Check offload service info again. The resolution info should be updated.
+        final Set<DiscoveryOffloadInfo> offloadInfo2 = getAllDiscoveryOffloadInfos();
+        assertEquals(2, offloadInfo2.size());
 
-        final FilterRepliesInfo resolveInfo = new FilterRepliesInfo(
+        final DiscoveryOffloadInfo resolveInfoWithHostname = new DiscoveryOffloadInfo(
                 instanceName, SERVICE_TYPE, List.of(), "hostname");
-        final FilterRepliesInfo discoverInfo = new FilterRepliesInfo(
-                SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype), NO_HOSTNAME);
-        assertTrue(offloadInfo.containsAll(Set.of(resolveInfo, discoverInfo)));
+        assertTrue(offloadInfo2.containsAll(Set.of(resolveInfoWithHostname, discoverInfo)));
+
+        // Get a service response with a different hostname
+        final ArrayList<String> type = new ArrayList<>();
+        type.add(SUBTYPE);
+        type.add(MdnsConstants.SUBTYPE_LABEL);
+        type.addAll(Arrays.asList(SERVICE_TYPE_LABELS));
+        processResponse(createResponse(instanceName, "192.0.2.0", 5353, type.toArray(new String[0]),
+                Collections.emptyMap() /* textAttributes */, TEST_TTL, TEST_ELAPSED_REALTIME,
+                "otherHostname"), socketKey);
+
+        // Check offload service info again. The resolution info should be updated.
+        final Set<DiscoveryOffloadInfo> offloadInfo3 = getAllDiscoveryOffloadInfos();
+        assertEquals(2, offloadInfo3.size());
+
+        final DiscoveryOffloadInfo resolveInfoWithOtherHostname = new DiscoveryOffloadInfo(
+                instanceName, SERVICE_TYPE, List.of(), "otherHostname");
+        assertTrue(offloadInfo3.containsAll(Set.of(resolveInfoWithOtherHostname, discoverInfo)));
 
         // Stop the resolution listener
         stopSendAndReceive(mockListenerOne);
 
         // Check offload service info again. There should be only one service for discovery.
-        final Set<FilterRepliesInfo> offloadInfo2 = getFilterRepliesInfo();
-        assertEquals(1, offloadInfo2.size());
-        assertTrue(offloadInfo2.contains(discoverInfo));
+        final Set<DiscoveryOffloadInfo> offloadInfo4 = getAllDiscoveryOffloadInfos();
+        assertEquals(1, offloadInfo4.size());
+        assertTrue(offloadInfo4.contains(discoverInfo));
     }
 
     @Test
-    public void testGetFilterRepliesInfo_twoDiscoveryRequests() throws Exception {
+    public void testGetAllDiscoveryOffloadInfos_twoDiscoveryRequests() throws Exception {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        client = makeMdnsServiceTypeClient(flags, false);
+
         final String subtype = "subtype";
         final MdnsSearchOptions discoverOptions1 = MdnsSearchOptions.newBuilder().build();
         final MdnsSearchOptions discoverOptions2 = MdnsSearchOptions.newBuilder()
@@ -2384,23 +2876,69 @@ public class MdnsServiceTypeClientTests {
         startSendAndReceive(mockListenerTwo, discoverOptions2);
 
         // Check offload service info. There should be only one service info with base type.
-        final Set<FilterRepliesInfo> offloadInfo = getFilterRepliesInfo();
+        final Set<DiscoveryOffloadInfo> offloadInfo = getAllDiscoveryOffloadInfos();
         assertEquals(1, offloadInfo.size());
-        assertTrue(offloadInfo.contains(new FilterRepliesInfo(
-                SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(), NO_HOSTNAME)));
+        assertTrue(offloadInfo.contains(new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype, NO_SUBTYPE), NO_HOSTNAME)));
 
         // Stop base type listener
         stopSendAndReceive(mockListenerOne);
 
         // Check offload service info. There is still a service with subtypes.
-        final Set<FilterRepliesInfo> offloadInfo2 = getFilterRepliesInfo();
+        final Set<DiscoveryOffloadInfo> offloadInfo2 = getAllDiscoveryOffloadInfos();
         assertEquals(1, offloadInfo2.size());
-        assertTrue(offloadInfo2.contains(new FilterRepliesInfo(
+        assertTrue(offloadInfo2.contains(new DiscoveryOffloadInfo(
                 SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype), NO_HOSTNAME)));
     }
 
     @Test
-    public void testGetFilterRepliesInfo_combineSubtypes() throws Exception {
+    public void testGetAllDiscoveryOffloadInfos_twoDiscoveryRequests_NoSubtypes() throws Exception {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        client = makeMdnsServiceTypeClient(flags, false);
+
+        final MdnsSearchOptions discoverOptions1 = MdnsSearchOptions.newBuilder().build();
+        final MdnsSearchOptions discoverOptions2 = MdnsSearchOptions.newBuilder().build();
+        // Register two discovery listeners, none of them specifies any subtype
+        startSendAndReceive(mockListenerOne, discoverOptions1);
+        startSendAndReceive(mockListenerTwo, discoverOptions2);
+
+        // Check offload service info. There should be only one service info with base type
+        // and an empty subtype
+        final Set<DiscoveryOffloadInfo> offloadInfo = getAllDiscoveryOffloadInfos();
+        assertEquals(1, offloadInfo.size());
+        assertTrue(offloadInfo.contains(new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY,
+                SERVICE_TYPE,
+                List.of(NO_SUBTYPE), NO_HOSTNAME)
+        ));
+
+        // Stop 1st listener
+        stopSendAndReceive(mockListenerOne);
+        // Check offload service info. There is still one service info with base type and
+        // an empty subtype.
+        final Set<DiscoveryOffloadInfo> offloadInfo2 = getAllDiscoveryOffloadInfos();
+        assertEquals(1, offloadInfo2.size());
+        assertTrue(offloadInfo2.contains(new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY,
+                SERVICE_TYPE,
+                List.of(NO_SUBTYPE),
+                NO_HOSTNAME))
+        );
+
+        // Stop 2nd listener
+        stopSendAndReceive(mockListenerTwo);
+
+        final Set<DiscoveryOffloadInfo> offloadInfo3 = getAllDiscoveryOffloadInfos();
+        assertEquals(0, offloadInfo3.size());
+    }
+
+    @Test
+    public void testGetAllDiscoveryOffloadInfos_combineSubtypes() throws Exception {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        client = makeMdnsServiceTypeClient(flags, false);
+
         final String subtype1 = "subtype1";
         final String subtype2 = "subtype2";
         final MdnsSearchOptions discoverOptions1 = MdnsSearchOptions.newBuilder()
@@ -2412,26 +2950,68 @@ public class MdnsServiceTypeClientTests {
         startSendAndReceive(mockListenerTwo, discoverOptions2);
 
         // Check offload service info. There should be a service info with combined subtypes.
-        final Set<FilterRepliesInfo> offloadInfo = getFilterRepliesInfo();
+        final Set<DiscoveryOffloadInfo> offloadInfo = getAllDiscoveryOffloadInfos();
         assertEquals(1, offloadInfo.size());
-        assertTrue(offloadInfo.contains(new FilterRepliesInfo(
+        assertTrue(offloadInfo.contains(new DiscoveryOffloadInfo(
                 SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype1, subtype2), NO_HOSTNAME)));
+
+        final MdnsSearchOptions discoverOptions3 = MdnsSearchOptions.newBuilder().build();
+        startSendAndReceive(mockListenerThree, discoverOptions3);
+        final Set<DiscoveryOffloadInfo> updatedOffloadInfo = getAllDiscoveryOffloadInfos();
+        assertEquals(1, updatedOffloadInfo.size());
+        assertTrue(updatedOffloadInfo.contains(new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY,
+                SERVICE_TYPE,
+                List.of(subtype1, subtype2, NO_SUBTYPE),
+                NO_HOSTNAME))
+        );
+
 
         // Stop one of listener
         stopSendAndReceive(mockListenerOne);
 
         // Check offload service info. There is still a service with subtypes.
-        final Set<FilterRepliesInfo> offloadInfo2 = getFilterRepliesInfo();
+        final Set<DiscoveryOffloadInfo> offloadInfo2 = getAllDiscoveryOffloadInfos();
         assertEquals(1, offloadInfo2.size());
-        assertTrue(offloadInfo2.contains(new FilterRepliesInfo(
-                SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype2), NO_HOSTNAME)));
+        assertTrue(offloadInfo2.contains(new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype2, NO_SUBTYPE), NO_HOSTNAME)));
+
+        // Stop 2nd listener
+        stopSendAndReceive(mockListenerTwo);
+        final Set<DiscoveryOffloadInfo> offloadInfo3 = getAllDiscoveryOffloadInfos();
+        assertEquals(1, offloadInfo3.size());
+        assertTrue(offloadInfo3.contains(new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY,
+                SERVICE_TYPE,
+                List.of(NO_SUBTYPE),
+                NO_HOSTNAME))
+        );
+
+        // Stop the 3rd listener
+        stopSendAndReceive(mockListenerThree);
+        final Set<DiscoveryOffloadInfo> offloadInfo4 = getAllDiscoveryOffloadInfos();
+        assertEquals(0, offloadInfo4.size());
     }
 
     @Test
-    public void testOffloadServiceInfoUpdate() {
-        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder()
+    public void sendAndReceive_forReceiveOnlyServiceTypeClient_DoesNotSchedule() {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
                 .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
-        client = makeMdnsServiceTypeClient(flags);
+        client = makeMdnsServiceTypeClient(flags, true);
+        final String subtype = "subtype";
+        final MdnsSearchOptions discoverOptions = MdnsSearchOptions.newBuilder()
+                .addSubtype(subtype).build();
+
+        startSendAndReceive(mockListenerOne, discoverOptions);
+
+        assertNull(currentThreadExecutor.getAndClearSubmittedRunnable());
+    }
+
+    @Test
+    public void sendAndReceive_onOffloadStartOrUpdateIsInvoked_forReceiveOnlyServiceTypeClient() {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        client = makeMdnsServiceTypeClient(flags, true);
         final String instanceName = "instance1";
         final String subtype = "subtype";
         final MdnsSearchOptions resolveOptions = MdnsSearchOptions.newBuilder()
@@ -2442,13 +3022,44 @@ public class MdnsServiceTypeClientTests {
         startSendAndReceive(mockListenerOne, resolveOptions);
         startSendAndReceive(mockListenerTwo, discoverOptions);
 
-        final OffloadServiceInfo resolveInfo1 = createOffloadServiceInfoFromFilterReplies(
-                new FilterRepliesInfo(
-                        instanceName, SERVICE_TYPE, List.of(), NO_HOSTNAME));
+        long offloadType = OFFLOAD_TYPE_QUERY | OFFLOAD_TYPE_FILTER_REPLIES;
+        final OffloadServiceInfo resolveInfo1 = createOffloadServiceInfoFromDiscoveryOffload(
+                new DiscoveryOffloadInfo(
+                        instanceName, SERVICE_TYPE, List.of(), NO_HOSTNAME), offloadType);
         verify(mockCallback).onOffloadStartOrUpdate(socketKey.getInterfaceName(), resolveInfo1);
-        final OffloadServiceInfo discoverInfo = createOffloadServiceInfoFromFilterReplies(
-                new FilterRepliesInfo(
-                        SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype), NO_HOSTNAME));
+        final OffloadServiceInfo discoverInfo = createOffloadServiceInfoFromDiscoveryOffload(
+                new DiscoveryOffloadInfo(
+                        SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype), NO_HOSTNAME),
+                offloadType
+        );
+        verify(mockCallback).onOffloadStartOrUpdate(socketKey.getInterfaceName(), discoverInfo);
+    }
+
+    @Test
+    public void testOffloadServiceInfoUpdate() {
+        final MdnsFeatureFlags flags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true).build();
+        client = makeMdnsServiceTypeClient(flags, false);
+        final String instanceName = "instance1";
+        final String subtype = "subtype";
+        final MdnsSearchOptions resolveOptions = MdnsSearchOptions.newBuilder()
+                .setResolveInstanceName(instanceName).build();
+        final MdnsSearchOptions discoverOptions = MdnsSearchOptions.newBuilder()
+                .addSubtype(subtype).build();
+        // Register two listener, one is for service resolution and one is for service discovery.
+        startSendAndReceive(mockListenerOne, resolveOptions);
+        startSendAndReceive(mockListenerTwo, discoverOptions);
+
+        long offloadType = OFFLOAD_TYPE_QUERY | OFFLOAD_TYPE_FILTER_REPLIES;
+        final OffloadServiceInfo resolveInfo1 = createOffloadServiceInfoFromDiscoveryOffload(
+                new DiscoveryOffloadInfo(
+                        instanceName, SERVICE_TYPE, List.of(), NO_HOSTNAME), offloadType);
+        verify(mockCallback).onOffloadStartOrUpdate(socketKey.getInterfaceName(), resolveInfo1);
+        final OffloadServiceInfo discoverInfo = createOffloadServiceInfoFromDiscoveryOffload(
+                new DiscoveryOffloadInfo(
+                        SERVICE_NAME_DISCOVERY, SERVICE_TYPE, List.of(subtype), NO_HOSTNAME),
+                offloadType
+        );
         verify(mockCallback).onOffloadStartOrUpdate(socketKey.getInterfaceName(), discoverInfo);
 
         // Get a service response
@@ -2456,9 +3067,9 @@ public class MdnsServiceTypeClientTests {
                 MdnsUtils.constructFullSubtype(SERVICE_TYPE_LABELS, SUBTYPE),
                 Collections.emptyMap() /* textAttributes */, TEST_TTL), socketKey);
 
-        final OffloadServiceInfo resolveInfo2 = createOffloadServiceInfoFromFilterReplies(
-                new FilterRepliesInfo(
-                        instanceName, SERVICE_TYPE, List.of(), "hostname"));
+        final OffloadServiceInfo resolveInfo2 = createOffloadServiceInfoFromDiscoveryOffload(
+                new DiscoveryOffloadInfo(
+                        instanceName, SERVICE_TYPE, List.of(), "hostname"), offloadType);
         verify(mockCallback).onOffloadStartOrUpdate(socketKey.getInterfaceName(), resolveInfo2);
 
         stopSendAndReceive(mockListenerOne);
@@ -2468,6 +3079,50 @@ public class MdnsServiceTypeClientTests {
         verify(mockCallback).onOffloadStop(socketKey.getInterfaceName(), discoverInfo);
     }
 
+    @Test
+    public void testNotifySocketDestroyed_offloadInfoUpdated() {
+        // 1. Enable feature flag and create client
+        featureFlags = MdnsFeatureFlags.newBuilder().setAllFlagsForTesting()
+                .setIsSelectiveMdnsResponseOffloadEnabled(true)
+                .build();
+        client = makeMdnsServiceTypeClient(featureFlags, false /* isReceiveOnly */);
+
+        // 2. Register listeners
+        final MdnsServiceBrowserListener listener1 = Mockito.mock(MdnsServiceBrowserListener.class);
+        final MdnsServiceBrowserListener listener2 = Mockito.mock(MdnsServiceBrowserListener.class);
+
+        final MdnsSearchOptions discoveryOptions = MdnsSearchOptions.getDefaultOptions();
+        final String resolveInstanceName = "my-instance";
+        final MdnsSearchOptions resolutionOptions = MdnsSearchOptions.newBuilder()
+                .setResolveInstanceName(resolveInstanceName).build();
+
+        // Register discovery listener
+        startSendAndReceive(listener1, discoveryOptions);
+
+        long offloadType = OFFLOAD_TYPE_QUERY | OFFLOAD_TYPE_FILTER_REPLIES;
+        final DiscoveryOffloadInfo discoveryInfo = new DiscoveryOffloadInfo(
+                SERVICE_NAME_DISCOVERY, SERVICE_TYPE, Collections.singletonList(""), NO_HOSTNAME);
+        verify(mockCallback).onOffloadStartOrUpdate(eq(socketKey.getInterfaceName()),
+                eq(createOffloadServiceInfoFromDiscoveryOffload(discoveryInfo, offloadType)));
+
+        // Register resolution listener
+        startSendAndReceive(listener2, resolutionOptions);
+        final DiscoveryOffloadInfo resolutionInfo = new DiscoveryOffloadInfo(
+                resolveInstanceName, SERVICE_TYPE, Collections.emptyList(), NO_HOSTNAME);
+        verify(mockCallback).onOffloadStartOrUpdate(eq(socketKey.getInterfaceName()),
+                eq(createOffloadServiceInfoFromDiscoveryOffload(resolutionInfo, offloadType)));
+
+        // 3. Call notifySocketDestroyed
+        notifySocketDestroyed();
+
+        // 4. Verify offload stop calls
+        verify(mockCallback).onOffloadStop(eq(socketKey.getInterfaceName()),
+                eq(createOffloadServiceInfoFromDiscoveryOffload(resolutionInfo, offloadType)));
+
+        verify(mockCallback).onOffloadStop(eq(socketKey.getInterfaceName()),
+                eq(createOffloadServiceInfoFromDiscoveryOffload(discoveryInfo, offloadType)));
+    }
+
     private static MdnsServiceInfo matchServiceName(String name) {
         return argThat(info -> info.getServiceInstanceName().equals(name));
     }
@@ -2475,20 +3130,24 @@ public class MdnsServiceTypeClientTests {
     // verifies that the right query was enqueued with the right delay, and send query by executing
     // the runnable.
     private void verifyAndSendQuery(int index, long timeInMs, boolean expectsUnicastResponse) {
-        verifyAndSendQuery(index, timeInMs, expectsUnicastResponse,
-                true /* multipleSocketDiscovery */, index + 1 /* scheduledCount */);
+        verifyAndSendQuery(index, timeInMs, expectsUnicastResponse, index + 1 /* scheduledCount */);
     }
 
     private void verifyAndSendQuery(int index, long timeInMs, boolean expectsUnicastResponse,
-            boolean multipleSocketDiscovery, int scheduledCount) {
-        verifyAndSendQuery(index, timeInMs, expectsUnicastResponse,
-                multipleSocketDiscovery, scheduledCount, index + 1 /* sendMessageCount */,
-                false /* useAccurateDelayCallback */);
+            int scheduledCount) {
+        verifyAndSendQuery(index, timeInMs, expectsUnicastResponse, scheduledCount,
+                index + 1 /* sendMessageCount */, false /* useAccurateDelayCallback */);
     }
 
     private void verifyAndSendQuery(int index, long timeInMs, boolean expectsUnicastResponse,
-            boolean multipleSocketDiscovery, int scheduledCount, int sendMessageCount,
-            boolean useAccurateDelayCallback) {
+            int scheduledCount, int sendMessageCount, boolean useAccurateDelayCallback) {
+        verifyAndSendQuery(index, timeInMs, expectsUnicastResponse, scheduledCount,
+                sendMessageCount, useAccurateDelayCallback, false /* dualQuery */);
+    }
+
+    private void verifyAndSendQuery(int index, long timeInMs, boolean expectsUnicastResponse,
+            int scheduledCount, int sendMessageCount, boolean useAccurateDelayCallback,
+            boolean dualQuery) {
         if (useAccurateDelayCallback && message != null && realHandler != null) {
             dispatchRealtimeSchedulerMessage();
         } else {
@@ -2503,18 +3162,30 @@ public class MdnsServiceTypeClientTests {
             verify(mockSocketClient).sendPacketRequestingUnicastResponse(
                     argThat(pkts -> pkts.get(0).equals(expectedIPv4Packets[index])),
                     eq(socketKey), eq(false));
-            if (multipleSocketDiscovery) {
-                verify(mockSocketClient).sendPacketRequestingUnicastResponse(
-                        argThat(pkts -> pkts.get(0).equals(expectedIPv6Packets[index])),
+            verify(mockSocketClient).sendPacketRequestingUnicastResponse(
+                    argThat(pkts -> pkts.get(0).equals(expectedIPv6Packets[index])),
+                    eq(socketKey), eq(false));
+            if (dualQuery) {
+                verify(mockSocketClient).sendPacketRequestingMulticastResponse(
+                        argThat(pkts -> pkts.get(0).equals(expectedIPv4Packets[index + 1])),
+                        eq(socketKey), eq(false));
+                verify(mockSocketClient).sendPacketRequestingMulticastResponse(
+                        argThat(pkts -> pkts.get(0).equals(expectedIPv6Packets[index + 1])),
                         eq(socketKey), eq(false));
             }
         } else {
             verify(mockSocketClient).sendPacketRequestingMulticastResponse(
                     argThat(pkts -> pkts.get(0).equals(expectedIPv4Packets[index])),
                     eq(socketKey), eq(false));
-            if (multipleSocketDiscovery) {
-                verify(mockSocketClient).sendPacketRequestingMulticastResponse(
-                        argThat(pkts -> pkts.get(0).equals(expectedIPv6Packets[index])),
+            verify(mockSocketClient).sendPacketRequestingMulticastResponse(
+                    argThat(pkts -> pkts.get(0).equals(expectedIPv6Packets[index])),
+                    eq(socketKey), eq(false));
+            if (dualQuery) {
+                verify(mockSocketClient).sendPacketRequestingUnicastResponse(
+                        argThat(pkts -> pkts.get(0).equals(expectedIPv4Packets[index + 1])),
+                        eq(socketKey), eq(false));
+                verify(mockSocketClient).sendPacketRequestingUnicastResponse(
+                        argThat(pkts -> pkts.get(0).equals(expectedIPv6Packets[index + 1])),
                         eq(socketKey), eq(false));
             }
         }
@@ -2638,7 +3309,7 @@ public class MdnsServiceTypeClientTests {
             @NonNull Map<String, String> textAttributes,
             long ptrTtlMillis) {
         return createResponse(serviceInstanceName, host, port, type, textAttributes, ptrTtlMillis,
-                TEST_ELAPSED_REALTIME);
+                TEST_ELAPSED_REALTIME, "hostname");
     }
 
     // Creates a mDNS response.
@@ -2649,7 +3320,8 @@ public class MdnsServiceTypeClientTests {
             @NonNull String[] type,
             @NonNull Map<String, String> textAttributes,
             long ptrTtlMillis,
-            long receiptTimeMillis) {
+            long receiptTimeMillis,
+            @NonNull String hostname) {
 
         final ArrayList<MdnsRecord> answerRecords = new ArrayList<>();
 
@@ -2675,14 +3347,14 @@ public class MdnsServiceTypeClientTests {
                 0 /* servicePriority */,
                 0 /* serviceWeight */,
                 port,
-                new String[]{"hostname"});
+                new String[]{hostname});
         answerRecords.add(serviceRecord);
 
         // Set A/AAAA record.
         if (host != null) {
             final InetAddress addr = InetAddresses.parseNumericAddress(host);
             final MdnsInetAddressRecord inetAddressRecord = new MdnsInetAddressRecord(
-                    new String[] {"hostname"} /* name */,
+                    new String[] {hostname} /* name */,
                     receiptTimeMillis,
                     false /* cacheFlush */,
                     TEST_TTL,
@@ -2709,5 +3381,14 @@ public class MdnsServiceTypeClientTests {
                 Collections.emptyList() /* authorityRecords */,
                 Collections.emptyList() /* additionalRecords */
         );
+    }
+
+    void assertRecordsEqual(MdnsResponse response, List<MdnsRecord> records) {
+        assertEquals("Unexpected number of records in MdnsResponse",
+                response.getNumRecords(), records.size());
+        for (MdnsRecord r : records) {
+            assertTrue("Could not find " + r + " in " + response,
+                    response.hasIdenticalRecord(r));
+        }
     }
 }

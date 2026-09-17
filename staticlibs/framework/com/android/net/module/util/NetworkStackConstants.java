@@ -225,6 +225,9 @@ public final class NetworkStackConstants {
     public static final byte TCPHDR_PSH = (byte) (1 << 3);
     public static final byte TCPHDR_ACK = (byte) (1 << 4);
     public static final byte TCPHDR_URG = (byte) (1 << 5);
+    public static final byte TCPHDR_ECE = (byte) (1 << 6);
+    public static final byte TCPHDR_CWR = (byte) (1 << 7);
+    // TODO: change these constants from byte to short and add TCPHDR_AE.
 
     /**
      * UDP constants.
@@ -284,6 +287,7 @@ public final class NetworkStackConstants {
     public static final int TYPE_TXT = 16;
     public static final int TYPE_AAAA = 28;
     public static final int TYPE_SRV = 33;
+    public static final int TYPE_ANY = 255;
 
     /**
      * IEEE802.11 standard constants.
@@ -334,6 +338,15 @@ public final class NetworkStackConstants {
      * <p>{@link #TEST_URL_EXPIRATION_TIME} must also be set to use this setting.
      */
     public static final String TEST_CAPTIVE_PORTAL_HTTP_URL = "test_captive_portal_http_url";
+    /**
+     * A test URL used to override configuration settings and overlays for the network validation
+     * fallback URL, when set in {@link android.provider.DeviceConfig} configuration.
+     *
+     * <p>This URL will be ignored if the host is not "localhost", and {@link
+     * #TEST_URL_EXPIRATION_TIME} must also be set to use this setting.
+     */
+    public static final String TEST_CAPTIVE_PORTAL_FALLBACK_URL =
+            "test_captive_portal_fallback_url";
     /**
      * Expiration time of the test URL, in ms, relative to {@link System#currentTimeMillis()}.
      *

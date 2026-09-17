@@ -16,7 +16,7 @@
 
 package com.android.server.vcn.routeselection;
 
-import static android.net.vcn.VcnManager.VCN_NETWORK_SELECTION_PENALTY_TIMEOUT_MINUTES_LIST_KEY;
+import static android.net.vcn.VcnManager.KEY_NETWORK_SELECTION_PENALTY_TIMEOUT_MIN_INT_ARRAY;
 import static android.net.vcn.util.PersistableBundleUtils.PersistableBundleWrapper;
 
 import static com.android.server.vcn.routeselection.NetworkPriorityClassifier.PRIORITY_INVALID;
@@ -64,6 +64,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
     @Mock private IpSecPacketLossDetector mIpSecPacketLossDetector;
     @Mock private Dependencies mDependencies;
     @Mock private NetworkEvaluatorCallback mEvaluatorCallback;
+    @Mock private NetworkMetricMonitor mMetricMonitor;
 
     @Captor private ArgumentCaptor<NetworkMetricMonitorCallback> mMetricMonitorCbCaptor;
 
@@ -73,11 +74,11 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
     public void setUp() throws Exception {
         super.setUp();
 
-        when(mDependencies.newIpSecPacketLossDetector(any(), any(), any(), any()))
+        when(mDependencies.newIpSecPacketLossDetector(any(), any(), any(), any(), any()))
                 .thenReturn(mIpSecPacketLossDetector);
 
         when(mCarrierConfig.getIntArray(
-                        eq(VCN_NETWORK_SELECTION_PENALTY_TIMEOUT_MINUTES_LIST_KEY), any()))
+                        eq(KEY_NETWORK_SELECTION_PENALTY_TIMEOUT_MIN_INT_ARRAY), any()))
                 .thenReturn(new int[] {PENALTY_TIMEOUT_MIN});
 
         mNetworkEvaluator = newValidUnderlyingNetworkEvaluator();
@@ -91,6 +92,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
                 SUB_GROUP,
                 mSubscriptionSnapshot,
                 mCarrierConfig,
+                mVcnMetrics,
                 mEvaluatorCallback,
                 mDependencies);
     }
@@ -230,7 +232,8 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
 
     private NetworkMetricMonitorCallback getMetricMonitorCbCaptor() throws Exception {
         verify(mDependencies)
-                .newIpSecPacketLossDetector(any(), any(), any(), mMetricMonitorCbCaptor.capture());
+                .newIpSecPacketLossDetector(
+                        any(), any(), any(), any(), mMetricMonitorCbCaptor.capture());
 
         return mMetricMonitorCbCaptor.getValue();
     }
@@ -239,7 +242,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
         assertFalse(mNetworkEvaluator.isPenalized());
 
         // Validation failed
-        when(mIpSecPacketLossDetector.isValidationFailed()).thenReturn(true);
+        when(mIpSecPacketLossDetector.isValidationSucceeded()).thenReturn(false);
         getMetricMonitorCbCaptor().onValidationResultReceived();
 
         // Verify the evaluator is penalized
@@ -265,7 +268,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
         checkPenalizeNetwork();
 
         // Validation passed
-        when(mIpSecPacketLossDetector.isValidationFailed()).thenReturn(false);
+        when(mIpSecPacketLossDetector.isValidationSucceeded()).thenReturn(true);
         getMetricMonitorCbCaptor().onValidationResultReceived();
 
         // Verify the evaluator is not penalized and penalty timeout is canceled
@@ -291,7 +294,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
         assertFalse(mNetworkEvaluator.isPenalized());
 
         // Validation passed
-        when(mIpSecPacketLossDetector.isValidationFailed()).thenReturn(false);
+        when(mIpSecPacketLossDetector.isValidationSucceeded()).thenReturn(true);
         getMetricMonitorCbCaptor().onValidationResultReceived();
 
         // Verifications
@@ -303,7 +306,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
     public void testSetCarrierConfig() throws Exception {
         final int additionalTimeoutMin = 10;
         when(mCarrierConfig.getIntArray(
-                        eq(VCN_NETWORK_SELECTION_PENALTY_TIMEOUT_MINUTES_LIST_KEY), any()))
+                        eq(KEY_NETWORK_SELECTION_PENALTY_TIMEOUT_MIN_INT_ARRAY), any()))
                 .thenReturn(new int[] {PENALTY_TIMEOUT_MIN + additionalTimeoutMin});
 
         // Update evaluator and penalize the network
@@ -326,7 +329,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
 
     @Test
     public void testCompare() throws Exception {
-        when(mIpSecPacketLossDetector.isValidationFailed()).thenReturn(true);
+        when(mIpSecPacketLossDetector.isValidationSucceeded()).thenReturn(false);
         getMetricMonitorCbCaptor().onValidationResultReceived();
 
         final UnderlyingNetworkEvaluator penalized = mNetworkEvaluator;
@@ -341,7 +344,7 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
     }
 
     @Test
-    public void testNotifyNetworkMetricMonitorOnLpChange() throws Exception {
+    public void testNotifyNetworkMetricMonitorOnNcChange() throws Exception {
         // Clear calls invoked when initializing mNetworkEvaluator
         reset(mIpSecPacketLossDetector);
 
@@ -353,11 +356,11 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
                 mSubscriptionSnapshot,
                 mCarrierConfig);
 
-        verify(mIpSecPacketLossDetector).onLinkPropertiesOrCapabilitiesChanged();
+        verify(mIpSecPacketLossDetector).onNetworkCapabilitiesChanged(CELL_NETWORK_CAPABILITIES);
     }
 
     @Test
-    public void testNotifyNetworkMetricMonitorOnNcChange() throws Exception {
+    public void testNotifyNetworkMetricMonitorOnLpChange() throws Exception {
         // Clear calls invoked when initializing mNetworkEvaluator
         reset(mIpSecPacketLossDetector);
 
@@ -369,6 +372,57 @@ public class UnderlyingNetworkEvaluatorTest extends NetworkEvaluationTestBase {
                 mSubscriptionSnapshot,
                 mCarrierConfig);
 
-        verify(mIpSecPacketLossDetector).onLinkPropertiesOrCapabilitiesChanged();
+        verify(mIpSecPacketLossDetector).onLinkPropertiesChanged(LINK_PROPERTIES);
+    }
+
+    @Test
+    public void testOnIsPenalizedChanged_startPenalty() throws Exception {
+        mNetworkEvaluator.addMetricMonitor(mMetricMonitor);
+
+        assertFalse(mNetworkEvaluator.isPenalized());
+
+        // One monitor is penalized
+        when(mMetricMonitor.isPenalized()).thenReturn(true);
+        getMetricMonitorCbCaptor().onIsPenalizedChanged();
+
+        assertTrue(mNetworkEvaluator.isPenalized());
+        verify(mEvaluatorCallback).onEvaluationResultChanged();
+
+        // The other monitor is penalized
+        when(mIpSecPacketLossDetector.isPenalized()).thenReturn(true);
+        getMetricMonitorCbCaptor().onIsPenalizedChanged();
+
+        assertTrue(mNetworkEvaluator.isPenalized());
+        verify(mEvaluatorCallback).onEvaluationResultChanged();
+    }
+
+    @Test
+    public void testOnIsPenalizedChanged_stopPenalty() throws Exception {
+        mNetworkEvaluator.addMetricMonitor(mMetricMonitor);
+
+        assertFalse(mNetworkEvaluator.isPenalized());
+
+        // Both monitors are penalized
+        when(mMetricMonitor.isPenalized()).thenReturn(true);
+        when(mIpSecPacketLossDetector.isPenalized()).thenReturn(true);
+        getMetricMonitorCbCaptor().onIsPenalizedChanged();
+
+        assertTrue(mNetworkEvaluator.isPenalized());
+        verify(mEvaluatorCallback).onEvaluationResultChanged();
+        reset(mEvaluatorCallback);
+
+        // One monitor stops being penalized and the evaluator is still being penalized
+        when(mMetricMonitor.isPenalized()).thenReturn(false);
+        getMetricMonitorCbCaptor().onIsPenalizedChanged();
+
+        assertTrue(mNetworkEvaluator.isPenalized());
+        verify(mEvaluatorCallback, never()).onEvaluationResultChanged();
+
+        // Both monitor stops being penalized and the evaluator is not penalized
+        when(mIpSecPacketLossDetector.isPenalized()).thenReturn(false);
+        getMetricMonitorCbCaptor().onIsPenalizedChanged();
+
+        assertFalse(mNetworkEvaluator.isPenalized());
+        verify(mEvaluatorCallback).onEvaluationResultChanged();
     }
 }

@@ -24,7 +24,7 @@ import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED;
 import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
 import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
-import static android.net.vcn.VcnManager.VCN_RESTRICTED_TRANSPORTS_INT_ARRAY_KEY;
+import static android.net.vcn.VcnManager.KEY_RESTRICTED_TRANSPORTS_INT_ARRAY;
 import static android.net.vcn.VcnManager.VCN_STATUS_CODE_ACTIVE;
 import static android.net.vcn.VcnManager.VCN_STATUS_CODE_SAFE_MODE;
 import static android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID;
@@ -169,27 +169,28 @@ public class VcnManagementServiceTest {
     private static final int TEST_SUBSCRIPTION_ID = 1;
     private static final int TEST_SUBSCRIPTION_ID_2 = 2;
     private static final SubscriptionInfo TEST_SUBSCRIPTION_INFO =
-            new SubscriptionInfo(
-                    TEST_SUBSCRIPTION_ID /* id */,
-                    "" /* iccId */,
-                    0 /* simSlotIndex */,
-                    "Carrier" /* displayName */,
-                    "Carrier" /* carrierName */,
-                    0 /* nameSource */,
-                    255 /* iconTint */,
-                    "12345" /* number */,
-                    0 /* roaming */,
-                    null /* icon */,
-                    "0" /* mcc */,
-                    "0" /* mnc */,
-                    "0" /* countryIso */,
-                    false /* isEmbedded */,
-                    null /* nativeAccessRules */,
-                    null /* cardString */,
-                    false /* isOpportunistic */,
-                    TEST_UUID_1.toString() /* groupUUID */,
-                    0 /* carrierId */,
-                    0 /* profileClass */);
+            new SubscriptionInfo.Builder()
+                    .setId(TEST_SUBSCRIPTION_ID)
+                    .setIccId("")
+                    .setSimSlotIndex(0)
+                    .setDisplayName("Carrier")
+                    .setCarrierName("Carrier")
+                    .setDisplayNameSource(0)
+                    .setIconTint(255)
+                    .setNumber("12345")
+                    .setDataRoaming(0)
+                    .setIcon(null)
+                    .setMcc("0")
+                    .setMnc("0")
+                    .setCountryIso("0")
+                    .setEmbedded(false)
+                    .setNativeAccessRules(null)
+                    .setCardString(null)
+                    .setOpportunistic(false)
+                    .setGroupUuid(TEST_UUID_1.toString())
+                    .setCarrierId(0)
+                    .setProfileClass(0)
+                    .build();
 
     private final Context mMockContextWithoutAttributionTag = mock(Context.class);
     private final Context mMockContext = mock(Context.class);
@@ -1095,7 +1096,7 @@ public class VcnManagementServiceTest {
 
         PersistableBundle carrierConfigBundle = new PersistableBundle();
         carrierConfigBundle.putIntArray(
-                VCN_RESTRICTED_TRANSPORTS_INT_ARRAY_KEY,
+                KEY_RESTRICTED_TRANSPORTS_INT_ARRAY,
                 restrictedTransports.stream().mapToInt(i -> i).toArray());
         final PersistableBundleWrapper carrierConfig =
                 new PersistableBundleWrapper(carrierConfigBundle);
@@ -1153,7 +1154,7 @@ public class VcnManagementServiceTest {
 
         PersistableBundle carrierConfigBundle = new PersistableBundle();
         carrierConfigBundle.putIntArray(
-                VCN_RESTRICTED_TRANSPORTS_INT_ARRAY_KEY,
+                KEY_RESTRICTED_TRANSPORTS_INT_ARRAY,
                 restrictedTransportInCarrierConfig.stream().mapToInt(i -> i).toArray());
         final PersistableBundleWrapper carrierConfig =
                 new PersistableBundleWrapper(carrierConfigBundle);

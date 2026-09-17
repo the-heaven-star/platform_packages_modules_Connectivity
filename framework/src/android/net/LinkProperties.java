@@ -85,12 +85,6 @@ public final class LinkProperties implements Parcelable {
      */
     private final transient boolean mParcelSensitiveFields;
 
-    private static final int MIN_MTU    = 68;
-
-    private static final int MIN_MTU_V6 = 1280;
-
-    private static final int MAX_MTU    = 10000;
-
     private static final int INET6_ADDR_LENGTH = 16;
 
     // Stores the properties of links that are "stacked" above this link.
@@ -1610,7 +1604,7 @@ public final class LinkProperties implements Parcelable {
      * Get the URL of the captive portal API endpoint to get more information about the network.
      *
      * <p>This is null unless the application has
-     * {@link android.Manifest.permission.NETWORK_SETTINGS} or
+     * {@link android.Manifest.permission#NETWORK_SETTINGS} or
      * {@link NetworkStack#PERMISSION_MAINLINE_NETWORK_STACK} permissions, and the network provided
      * the URL.
      * @hide
@@ -1634,7 +1628,7 @@ public final class LinkProperties implements Parcelable {
      * Get the CaptivePortalData obtained from the captive portal API (RFC7710bis).
      *
      * <p>This is null unless the application has
-     * {@link android.Manifest.permission.NETWORK_SETTINGS} or
+     * {@link android.Manifest.permission#NETWORK_SETTINGS} or
      * {@link NetworkStack#PERMISSION_MAINLINE_NETWORK_STACK} permissions.
      * @hide
      */
@@ -1860,10 +1854,6 @@ public final class LinkProperties implements Parcelable {
      * @hide
      */
     public static boolean isValidMtu(int mtu, boolean ipv6) {
-        if (ipv6) {
-            return mtu >= MIN_MTU_V6 && mtu <= MAX_MTU;
-        } else {
-            return mtu >= MIN_MTU && mtu <= MAX_MTU;
-        }
+        return LinkPropertiesUtils.isValidMtu(mtu, ipv6);
     }
 }

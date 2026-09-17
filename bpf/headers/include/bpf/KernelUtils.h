@@ -108,7 +108,8 @@ static inline bool __unused isLtsKernel() {
            isKernelVersion(5, 15) ||  // first supported in Android T
            isKernelVersion(6,  1) ||  // first supported in Android U
            isKernelVersion(6,  6) ||  // first supported in Android V
-           isKernelVersion(6, 12);    // first supported in Android 25Q2
+           isKernelVersion(6, 12) ||  // first supported in Android 25Q2
+           isKernelVersion(6, 18);    // first supported in Android 26Q2
 }
 
 // Figure out the bitness of userspace.
@@ -123,6 +124,9 @@ static constexpr bool isUserspace64bit() {
 
 #if defined(__LP64__)
 static_assert(isUserspace64bit(), "huh? LP64 must have 64-bit userspace");
+// a 64-bit userspace requires and thus implies a 64-bit kernel
+static constexpr bool isKernel64Bit() { return true; }
+static constexpr bool isKernel32Bit() { return false; }
 #elif defined(__ILP32__)
 static_assert(isUserspace32bit(), "huh? ILP32 must have 32-bit userspace");
 #else
@@ -131,9 +135,11 @@ static_assert(isUserspace32bit(), "huh? ILP32 must have 32-bit userspace");
 
 static_assert(isUserspace32bit() || isUserspace64bit(), "must be either 32 or 64 bit");
 
+#if defined(__ILP32__)
 // Figure out the bitness of the kernel.
 static inline bool isKernel64Bit() {
     // a 64-bit userspace requires a 64-bit kernel
+    // (left for documentation, this never triggers and compiles out due to #if ILP32 guard)
     if (isUserspace64bit()) return true;
 
     static bool init = false;
@@ -182,6 +188,7 @@ static inline bool isKernel64Bit() {
 static inline __unused bool isKernel32Bit() {
     return !isKernel64Bit();
 }
+#endif  // defined(__ILP32__)
 
 static constexpr bool isArm() {
 #if defined(__arm__)

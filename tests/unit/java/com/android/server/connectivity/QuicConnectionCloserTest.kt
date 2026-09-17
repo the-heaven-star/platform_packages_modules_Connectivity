@@ -20,7 +20,6 @@ import android.net.InetAddresses
 import android.net.LinkAddress
 import android.net.LinkProperties
 import android.net.Network
-import android.net.TEST_IFACE
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -33,7 +32,6 @@ import com.android.net.module.util.SkDestroyListener
 import com.android.net.module.util.netlink.InetDiagMessage
 import com.android.net.module.util.netlink.StructInetDiagSockId
 import com.android.net.module.util.netlink.StructNlMsgHdr
-import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo
 import com.android.testutils.DevSdkIgnoreRunner
 import com.android.testutils.visibleOnHandlerThread
 import java.net.InetSocketAddress
@@ -61,6 +59,7 @@ private const val SHORT_TIMEOUT_MS = 100L
 
 // TODO: Use OsConstants.SO_MARK once this API is available
 private const val SO_MARK = 36
+private const val TEST_IFACE = "wlan0"
 
 private val TEST_SRC_ADDRESS = InetAddresses.parseNumericAddress("2001:db8:1:2::2")
 private val TEST_SRC_SOCKET_ADDRESS = InetSocketAddress(
@@ -79,7 +78,6 @@ private val TEST_NETWORK = Network(TEST_NETID)
 private val TEST_PAYLOAD = byteArrayOf(0, 1, 2, 3, 4, 5)
 
 @RunWith(DevSdkIgnoreRunner::class)
-@IgnoreUpTo(Build.VERSION_CODES.R)
 class QuicConnectionCloserTest {
     private val pfd = mock(ParcelFileDescriptor::class.java)
     private val skDestroyListener = mock(SkDestroyListener::class.java)

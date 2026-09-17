@@ -330,7 +330,8 @@ int main(int argc, char **argv) {
   // TODO: actually perform true DAD
   send_dad(tunnel.write_fd6, &Global_Clatd_Config.ipv6_local_subnet);
 
-#if 0
+#if defined(__LP64__)
+  // Only do this on 64-bit userspace, saves us debugging weird 32-bit x86 socketcall() stuff
   enable_seccomp();  // WARNING: from this point forward very limited system calls available.
 #endif
 

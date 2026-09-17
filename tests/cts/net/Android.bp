@@ -29,7 +29,7 @@ java_defaults {
     sdk_version: "module_current",
     libs: [
         "framework-annotations-lib",
-        "framework-connectivity.impl",
+        "framework-connectivity-post-jarjar",
         "framework-connectivity-b.impl",
         "framework-connectivity-t.impl",
         "framework-tethering.impl",
@@ -61,9 +61,14 @@ java_defaults {
     ],
     jarjar_rules: "jarjar-rules-shared.txt",
     static_libs: [
+        "android.permission.flags-aconfig-java-export",
+        "android.provider.flags-aconfig-java",
+        "com.android.tethering.flags-aconfig-java",
         "ApfGeneratorLib",
         "bouncycastle-unbundled",
         "FrameworksNetCommonTests",
+        "com.android.tethering.flags-aconfig-java",
+        "conscrypt-exported-networksecurity-aconfig-flags-lib",
         "core-tests-support",
         "cts-net-utils",
         "CtsNetTestsNonUpdatableLib",
@@ -74,12 +79,11 @@ java_defaults {
         "modules-utils-build",
         "net-tests-utils",
         "net-utils-framework-common",
-        "NetworkStackApiCurrentShims",
         "truth",
         "TetheringIntegrationTestsBaseLib",
     ],
 
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     per_testcase_directory: true,
     host_required: ["net-tests-utils-host-common"],
     host_common_data: [":net-tests-utils-host-common"],
@@ -110,11 +114,51 @@ android_test {
     test_suites: [
         "automotive-general-tests",
         "cts",
+        // See test/dts/README.md for triage instructions for bugs from the dts suite.
+        // Bugs should not be filed on the core networking team.
+        "dts",
         "mts-tethering",
         "mcts-tethering",
         "general-tests",
     ],
     resource_zips: [":connectivity-module-version-as-resource-zip"],
+    test_options: {
+        test_runner_options: [
+            {
+                name: "exclude-annotation",
+                value: "com.android.testutils.filters.CtsNetTestCasesLocalNetNoPermissions",
+            },
+        ],
+    },
+}
+
+android_test {
+    name: "CtsNetTestCasesLocalNetNoPermissions", // Must not request local network permission.
+    defaults: ["CtsNetTestCasesDefaults"],
+    test_suites: [
+        "automotive-general-tests",
+        "cts",
+        "general-tests",
+        "mts-tethering",
+        "mcts-tethering",
+    ],
+    target_sdk_version: "37",
+    package_name: "android.net.cts.localnetnopermissions",
+    instrumentation_target_package: "android.net.cts.localnetnopermissions",
+    test_options: {
+        test_runner_options: [
+            {
+                name: "include-annotation",
+                value: "com.android.testutils.filters.CtsNetTestCasesLocalNetNoPermissions",
+            },
+        ],
+        tradefed_options: [
+            {
+                name: "com.android.tradefed.targetprep.suite.SuiteApkInstaller:grant-permissions",
+                value: "false",
+            },
+        ],
+    },
 }
 
 java_defaults {
@@ -184,11 +228,10 @@ android_test_helper_app {
     package_name: "android.net.cts.carrierservicepackage",
     manifest: "carrierservicepackage/AndroidManifest.xml",
     srcs: ["carrierservicepackage/src/**/*.java"],
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     // Tag this module as a cts test artifact
     test_suites: [
         "automotive-general-tests",
-        "cts",
         "general-tests",
     ],
     sdk_version: "test_current",

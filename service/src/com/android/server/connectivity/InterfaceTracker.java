@@ -16,6 +16,8 @@
 
 package com.android.server.connectivity;
 
+import static com.android.modules.utils.build.SdkLevel.isAtLeastB;
+
 import android.annotation.Nullable;
 import android.content.Context;
 import android.system.Os;
@@ -24,7 +26,6 @@ import android.util.Log;
 
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.annotations.VisibleForTesting;
-import com.android.server.BpfNetMaps;
 
 import java.util.Map;
 
@@ -34,7 +35,7 @@ import java.util.Map;
  */
 public class InterfaceTracker {
     static {
-        if (BpfNetMaps.isAtLeast25Q2()) {
+        if (isAtLeastB()) {
             System.loadLibrary("service-connectivity");
         }
     }
@@ -76,12 +77,22 @@ public class InterfaceTracker {
     /**
      * To remove interface from tracking
      * @param interfaceName name of interface removed.
-     * @return true if the value was present and now removed.
+     * @return The index of the removed interface, or 0 if it was not present.
      */
-    public boolean removeInterface(@Nullable final String interfaceName) {
-        if (interfaceName == null) return false;
+    public int removeInterface(@Nullable final String interfaceName) {
+        if (interfaceName == null) return 0;
         synchronized (mInterfaceMap) {
-            return mInterfaceMap.remove(interfaceName) != null;
+            final Integer interfaceIndex = mInterfaceMap.remove(interfaceName);
+            return interfaceIndex != null ? interfaceIndex : 0;
+        }
+    }
+
+    /**
+     * Check if an interface is currently tracked.
+     */
+    public boolean hasInterface(int interfaceIndex) {
+        synchronized (mInterfaceMap) {
+            return mInterfaceMap.containsValue(interfaceIndex);
         }
     }
 

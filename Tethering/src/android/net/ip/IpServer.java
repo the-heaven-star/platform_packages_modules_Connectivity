@@ -36,13 +36,14 @@ import static android.net.TetheringManager.TETHER_ERROR_TETHER_IFACE_ERROR;
 import static android.net.TetheringManager.TETHER_ERROR_UNTETHER_IFACE_ERROR;
 import static android.net.TetheringManager.TetheringRequest.checkStaticAddressConfiguration;
 import static android.net.dhcp.IDhcpServer.STATUS_SUCCESS;
+import static android.net.platform.flags.Flags.connectivityServiceModifyQdiscClsact;
 import static android.net.util.NetworkConstants.asByte;
 import static android.system.OsConstants.RT_SCOPE_UNIVERSE;
 
 import static com.android.net.module.util.ConnectivityCommonFlags.USE_ROUTE_PARCEL_IPCS;
 import static com.android.net.module.util.Inet4AddressUtils.intToInet4AddressHTH;
 import static com.android.net.module.util.NetworkStackConstants.RFC7421_PREFIX_LENGTH;
-import static com.android.networkstack.tethering.TetheringConfiguration.USE_SYNC_SM;
+import static com.android.net.module.util.netlink.RtNetlinkQdiscMessage.CLSACT;
 import static com.android.networkstack.tethering.TetheringFeatureFlags.TETHERING_AND_P2P_GO_LOCAL_AGENT;
 import static com.android.networkstack.tethering.util.PrefixUtils.asIpPrefix;
 import static com.android.networkstack.tethering.util.TetheringMessageBase.BASE_IPSERVER;
@@ -74,6 +75,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.RemoteException;
 import android.os.ServiceSpecificException;
+import android.system.Os;
 import android.util.ArraySet;
 import android.util.Log;
 import android.util.SparseArray;
@@ -93,14 +95,14 @@ import com.android.net.module.util.NetdUtils;
 import com.android.net.module.util.RoutingCoordinatorManager;
 import com.android.net.module.util.SdkUtil;
 import com.android.net.module.util.SharedLog;
-import com.android.net.module.util.SyncStateMachine.StateInfo;
+import com.android.net.module.util.SyncStateMachine;
 import com.android.net.module.util.ip.InterfaceController;
+import com.android.net.module.util.netlink.NetlinkUtils;
 import com.android.networkstack.tethering.BpfCoordinator;
 import com.android.networkstack.tethering.TetheringConfiguration;
 import com.android.networkstack.tethering.metrics.TetheringMetrics;
 import com.android.networkstack.tethering.util.InterfaceSet;
 import com.android.networkstack.tethering.util.PrefixUtils;
-import com.android.networkstack.tethering.util.StateMachineShim;
 import com.android.tethering.mainline.beta.Flags;
 
 import java.net.Inet4Address;
@@ -122,7 +124,7 @@ import java.util.Set;
  *
  * @hide
  */
-public class IpServer extends StateMachineShim {
+public class IpServer extends SyncStateMachine {
     public static final int STATE_UNAVAILABLE = 0;
     public static final int STATE_AVAILABLE   = 1;
     public static final int STATE_TETHERED    = 2;
@@ -238,6 +240,11 @@ public class IpServer extends StateMachineShim {
          */
         public boolean isFeatureNotChickenedOut(Context context, String name) {
             return DeviceConfigUtils.isTetheringFeatureNotChickenedOut(context, name);
+        }
+
+        /** Whether the flag for connectivity service modify qdisc clsact is enabled or not. */
+        public boolean isConnectivityServiceModifyQdiscClsactEnabled() {
+            return connectivityServiceModifyQdiscClsact();
         }
 
         /** Create a NetworkAgent instance to be used by IpServer. */
@@ -371,7 +378,7 @@ public class IpServer extends StateMachineShim {
             RoutingCoordinatorManager routingCoordinatorManager, Callback callback,
             TetheringConfiguration config,
             TetheringMetrics tetheringMetrics, Dependencies deps) {
-        super(ifaceName, USE_SYNC_SM ? null : handler.getLooper());
+        super(ifaceName, handler.getLooper().getThread());
         mContext = Objects.requireNonNull(context);
         mHandler = handler;
         mLog = log.forSubComponent(ifaceName);
@@ -381,7 +388,7 @@ public class IpServer extends StateMachineShim {
         mIpv4PrefixRequest = new IIpv4PrefixRequest.Stub() {
             @Override
             public void onIpv4PrefixConflict(IpPrefix ipPrefix) throws RemoteException {
-                sendMessage(CMD_NOTIFY_PREFIX_CONFLICT);
+                processMessage(CMD_NOTIFY_PREFIX_CONFLICT);
             }
         };
         mCallback = callback;
@@ -502,12 +509,12 @@ public class IpServer extends StateMachineShim {
      * Enable this IpServer. IpServer state machine will be tethered or localHotspot state based on
      * the connectivity scope of the TetheringRequest. */
     public void enable(@NonNull final TetheringRequest request) {
-        sendMessage(CMD_TETHER_REQUESTED, 0, 0, request);
+        processMessage(CMD_TETHER_REQUESTED, 0, 0, request);
     }
 
     /** Stop this IpServer. After this is called this IpServer should not be used any more. */
     public void stop() {
-        sendMessage(CMD_INTERFACE_DOWN);
+        processMessage(CMD_INTERFACE_DOWN);
     }
 
     /**
@@ -515,8 +522,14 @@ public class IpServer extends StateMachineShim {
      * next tethering request.
      */
     public void unwanted() {
-        sendMessage(CMD_TETHER_UNREQUESTED);
+        processMessage(CMD_TETHER_UNREQUESTED);
     }
+
+    /** Process message in sync state machine. */
+    public void processMessage(int what, Object obj) {
+        processMessage(what, 0, 0, obj);
+    }
+
 
     /** Internals. */
 
@@ -598,12 +611,7 @@ public class IpServer extends StateMachineShim {
 
         private void handleError() {
             mLastError = TETHER_ERROR_DHCPSERVER_ERROR;
-            if (USE_SYNC_SM) {
-                sendMessage(CMD_SERVICE_FAILED_TO_START, TETHER_ERROR_DHCPSERVER_ERROR);
-            } else {
-                sendMessageAtFrontOfQueueToAsyncSM(CMD_SERVICE_FAILED_TO_START,
-                        TETHER_ERROR_DHCPSERVER_ERROR);
-            }
+            processMessage(CMD_SERVICE_FAILED_TO_START, TETHER_ERROR_DHCPSERVER_ERROR, 0, null);
         }
     }
 
@@ -643,7 +651,7 @@ public class IpServer extends StateMachineShim {
         @Override
         public void onNewPrefixRequest(@NonNull final IpPrefix currentPrefix) {
             Objects.requireNonNull(currentPrefix);
-            sendMessage(CMD_NEW_PREFIX_REQUEST, currentPrefix);
+            processMessage(CMD_NEW_PREFIX_REQUEST, currentPrefix);
         }
 
         @Override
@@ -833,10 +841,8 @@ public class IpServer extends StateMachineShim {
             return false;
         }
 
-        if (SdkLevel.isAtLeastS()) {
-            // DAD Proxy starts forwarding packets after IPv6 upstream is present.
-            mDadProxy = mDeps.getDadProxy(getHandler(), mInterfaceParams);
-        }
+        // DAD Proxy starts forwarding packets after IPv6 upstream is present.
+        mDadProxy = mDeps.getDadProxy(getHandler(), mInterfaceParams);
 
         return true;
     }
@@ -1125,6 +1131,24 @@ public class IpServer extends StateMachineShim {
         mStaticIpv4ClientAddr = request.getClientStaticIpv4Address();
     }
 
+    private void maybeModifyQdiscClsact(boolean add) {
+        if (!mDeps.isConnectivityServiceModifyQdiscClsactEnabled()) return;
+
+        final int ifIndex = Os.if_nametoindex(mIfaceName);
+        if (ifIndex == 0) {
+            if (add) {
+                mLog.e("Failed to find interface index for " + mIfaceName + ".");
+            }
+            return;
+        }
+
+        if (add) {
+            NetlinkUtils.sendRtmNewQdiscRequest(ifIndex, CLSACT);
+        } else {
+            NetlinkUtils.sendRtmDelQdiscRequest(ifIndex, CLSACT);
+        }
+    }
+
     class InitialState extends State {
         @Override
         public void enter() {
@@ -1181,13 +1205,7 @@ public class IpServer extends StateMachineShim {
                 // message (and generally ignores them). It is difficult to know for sure whether
                 // this is correct in all cases, but this is equivalent to what IpServer was doing
                 // in previous versions of the mainline module.
-                // TODO : remove sendMessageAtFrontOfQueueToAsyncSM after migrating to the Sync
-                // StateMachine.
-                if (USE_SYNC_SM) {
-                    sendSelfMessageToSyncSM(CMD_SERVICE_FAILED_TO_START, mLastError);
-                } else {
-                    sendMessageAtFrontOfQueueToAsyncSM(CMD_SERVICE_FAILED_TO_START, mLastError);
-                }
+                sendSelfMessage(CMD_SERVICE_FAILED_TO_START, 0, 0, mLastError);
             }
 
             if (DBG) Log.d(TAG, getStateString(mDesiredInterfaceState) + " serve " + mIfaceName);
@@ -1232,6 +1250,7 @@ public class IpServer extends StateMachineShim {
                 if (mTetheringAgent == null) {
                     NetdUtils.networkAddInterface(mNetd, LOCAL_NET_ID, mIfaceName,
                             20 /* maxAttempts */, 50 /* pollingIntervalMs */);
+                    maybeModifyQdiscClsact(true /* add */);
                     // Activate a route to dest and IPv6 link local.
                     NetdUtils.modifyRoute(mNetd, NetdUtils.ModifyOperation.ADD, LOCAL_NET_ID,
                             new RouteInfo(asIpPrefix(mIpv4Address), null, mIfaceName,
@@ -1275,6 +1294,7 @@ public class IpServer extends StateMachineShim {
                 } finally {
                     if (mTetheringAgent == null) {
                         mNetd.networkRemoveInterface(LOCAL_NET_ID, mIfaceName);
+                        maybeModifyQdiscClsact(false /* add */);
                     }
                 }
             } catch (RemoteException | ServiceSpecificException e) {

@@ -24,15 +24,15 @@ java_defaults {
     srcs: [
         "base/**/*.java",
     ],
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     static_libs: [
         "DhcpPacketLib",
         "androidx.test.rules",
-        "com.android.tethering.mainline.beta.flags-aconfig-java",
+        "com.android.tethering.mainline.beta.flags-aconfig-java-deprecated",
         "cts-net-utils",
         "mockito-target-minus-junit4",
         "net-tests-utils",
-        "net-utils-device-common",
+        "net-utils-connectivity-apks",
         "net-utils-device-common-bpf",
         "net-utils-device-common-struct-base",
         "testables",

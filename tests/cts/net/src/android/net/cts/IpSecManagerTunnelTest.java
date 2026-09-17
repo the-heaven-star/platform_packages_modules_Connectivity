@@ -80,7 +80,6 @@ import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 
-// TODO: b/268552823 Improve the readability of IpSecManagerTunnelTest
 @RunWith(AndroidJUnit4.class)
 @AppModeFull(reason = "MANAGE_TEST_NETWORKS permission can't be granted to instant apps")
 public class IpSecManagerTunnelTest extends IpSecBaseTest {
@@ -1379,13 +1378,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET, AF_INET, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV4InV4() throws Exception {
         doTestMigrateTunnel(AF_INET, AF_INET, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV4InV4_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET, AF_INET, false, true);
@@ -1404,13 +1401,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET, AF_INET, true, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV4InV4UdpEncap() throws Exception {
         doTestMigrateTunnel(AF_INET, AF_INET, true, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV4InV4UdpEncap_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET, AF_INET, true, true);
@@ -1429,13 +1424,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET, AF_INET6, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV4InV6() throws Exception {
         doTestMigrateTunnel(AF_INET, AF_INET6, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV4InV6_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET, AF_INET6, false, true);
@@ -1454,13 +1447,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET6, AF_INET, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV6InV4() throws Exception {
         doTestMigrateTunnel(AF_INET6, AF_INET, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV6InV4_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET6, AF_INET, false, true);
@@ -1479,13 +1470,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET6, AF_INET, true, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV6InV4UdpEncap() throws Exception {
         doTestMigrateTunnel(AF_INET6, AF_INET, true, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV6InV4UdpEncap_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET6, AF_INET, true, true);
@@ -1504,13 +1493,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET, AF_INET6, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV6InV6() throws Exception {
         doTestMigrateTunnel(AF_INET, AF_INET6, false, true);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTransportInTunnelModeV6InV6_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET, AF_INET6, false, true);
@@ -1530,13 +1517,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET, AF_INET, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV4InV4() throws Exception {
         doTestMigrateTunnel(AF_INET, AF_INET, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV4InV4_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET, AF_INET, false, false);
@@ -1555,13 +1540,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET, AF_INET, true, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV4InV4UdpEncap() throws Exception {
         doTestMigrateTunnel(AF_INET, AF_INET, true, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV4InV4UdpEncap_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET, AF_INET, true, false);
@@ -1580,13 +1563,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET, AF_INET6, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV4InV6() throws Exception {
         doTestMigrateTunnel(AF_INET, AF_INET6, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV4InV6_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET, AF_INET6, false, false);
@@ -1605,13 +1586,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET6, AF_INET, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV6InV4() throws Exception {
         doTestMigrateTunnel(AF_INET6, AF_INET, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV6InV4_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET6, AF_INET, false, false);
@@ -1630,13 +1609,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET6, AF_INET, true, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV6InV4UdpEncap() throws Exception {
         doTestMigrateTunnel(AF_INET6, AF_INET, true, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV6InV4UdpEncap_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET6, AF_INET, true, false);
@@ -1655,13 +1632,11 @@ public class IpSecManagerTunnelTest extends IpSecBaseTest {
         checkTunnelInput(AF_INET6, AF_INET6, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV6InV6() throws Exception {
         doTestMigrateTunnel(AF_INET6, AF_INET6, false, false);
     }
 
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     @Test
     public void testMigrateTunnelV6InV6_EncapTypeChange() throws Exception {
         doTestMigrateTunnelWithEncapTypeChange(AF_INET6, AF_INET6, false, false);

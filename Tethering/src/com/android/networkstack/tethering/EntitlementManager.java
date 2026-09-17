@@ -16,6 +16,7 @@
 
 package com.android.networkstack.tethering;
 
+import static android.content.Context.RECEIVER_NOT_EXPORTED;
 import static android.content.pm.PackageManager.GET_ACTIVITIES;
 import static android.net.TetheringConstants.EXTRA_ADD_TETHER_TYPE;
 import static android.net.TetheringConstants.EXTRA_PROVISION_CALLBACK;
@@ -32,13 +33,11 @@ import static android.net.TetheringManager.TETHERING_WIFI;
 import static android.net.TetheringManager.TETHER_ERROR_ENTITLEMENT_UNKNOWN;
 import static android.net.TetheringManager.TETHER_ERROR_NO_ERROR;
 import static android.net.TetheringManager.TETHER_ERROR_PROVISIONING_FAILED;
+import static android.provider.Settings.ACTION_TETHER_UNSUPPORTED_CARRIER_UI;
 import static android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID;
 
 import static com.android.internal.annotations.VisibleForTesting.Visibility.PRIVATE;
-import static com.android.networkstack.apishim.ConstantsShim.ACTION_TETHER_UNSUPPORTED_CARRIER_UI;
-import static com.android.networkstack.apishim.ConstantsShim.RECEIVER_NOT_EXPORTED;
 
-import android.annotation.NonNull;
 import android.app.ActivityManager;
 import android.app.AlarmManager;
 import android.app.PendingIntent;
@@ -48,6 +47,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.net.TetheringManager.TetheringRequest;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Parcel;
@@ -57,17 +57,22 @@ import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.provider.Settings;
+import android.util.ArraySet;
 import android.util.SparseIntArray;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.modules.utils.build.SdkLevel;
 import com.android.net.module.util.FrameworkConnectivityStatsLog;
+import com.android.net.module.util.SdkUtil;
 import com.android.net.module.util.SharedLog;
+import com.android.tethering.flags.Flags;
 
 import java.io.PrintWriter;
 import java.util.BitSet;
+import java.util.Set;
 
 /**
  * Re-check tethering provisioning for enabled downstream tether types.
@@ -114,10 +119,16 @@ public class EntitlementManager {
     private PendingIntent mProvisioningRecheckAlarm;
     private boolean mLastCellularUpstreamPermitted = true;
     private boolean mUsingCellularAsUpstream = false;
-    private boolean mNeedReRunProvisioningUi = false;
+    /**
+     * A list of users that have requested tethering with a UI who are waiting for an entitlement
+     * check. This is used when a tethering request is made while the upstream is not cellular, so
+     * the check has to be deferred until a cellular upstream is available.
+     */
+    private final ArraySet<UserHandle> mPendingUiProvisioningUsers = new ArraySet<>();
     private OnTetherProvisioningFailedListener mListener;
     private TetheringConfigurationFetcher mFetcher;
     private final Dependencies mDeps;
+    private final boolean mShouldShowEntitlementUiToRequesters;
 
     @VisibleForTesting(visibility = PRIVATE)
     static class Dependencies {
@@ -143,8 +154,10 @@ public class EntitlementManager {
          *         perform entitlement check.
          */
         @Nullable
-        protected Intent runUiTetherProvisioning(int type, final TetheringConfiguration config,
-                ResultReceiver receiver) {
+        protected Intent runUiTetherProvisioning(int type,
+                final TetheringConfiguration config, ResultReceiver receiver,
+                @NonNull Set<UserHandle> pendingUiProvisioningUsers,
+                boolean shouldShowEntitlementUiToRequesters) {
             if (DBG) mLog.i("runUiTetherProvisioning: " + type);
 
             Intent intent = new Intent(Settings.ACTION_TETHER_PROVISIONING_UI);
@@ -154,13 +167,33 @@ public class EntitlementManager {
             intent.putExtra(EXTRA_TETHER_SUBID, config.activeDataSubId);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
+            final int currentUserId = getCurrentUser();
+            final UserHandle currentUser = UserHandle.of(currentUserId);
+
+            // TODO: Remove unreachable code after feature rollout.
+            if (shouldShowEntitlementUiToRequesters) {
+                if (pendingUiProvisioningUsers.contains(currentUser)) {
+                    mContext.startActivityAsUser(intent, currentUser);
+                    return intent;
+                } else {
+                    mLog.e("Current user (" + currentUserId
+                            + ") did not request tethering before. Allowed users: "
+                            + pendingUiProvisioningUsers);
+                    // If the user is not allowed to perform an entitlement check,
+                    // notify the receiver immediately.
+                    // This is necessary because the entitlement check app cannot
+                    // be launched to conduct the check and deliver the results.
+                    receiver.send(TETHER_ERROR_PROVISIONING_FAILED, null);
+                    return null;
+                }
+            }
+
             // Only launch entitlement UI for the current user if it is allowed to
             // change tethering. This usually means the system user or the admin users in HSUM.
             if (SdkLevel.isAtLeastT()) {
                 // Create a user context for the current foreground user as UserManager#isAdmin()
                 // operates on the context user.
-                final int currentUserId = getCurrentUser();
-                final UserHandle currentUser = UserHandle.of(currentUserId);
+
                 final Context userContext;
                 try {
                     // There is no safe way to invoke this method since tethering package
@@ -196,6 +229,18 @@ public class EntitlementManager {
                 mContext.startActivity(intent);
             }
             return intent;
+        }
+
+        /**
+         * Whether to show entitlement UI to requesters.
+         *
+         * @return true if entitlement UI should be shown to requesters, false otherwise.
+         */
+        protected boolean shouldShowEntitlementUiToRequesters() {
+            // Guarded the feature by a platform version to prevent breaking changes
+            // on released platforms via mainline updates and to allow further
+            // OEM/carrier testing.
+            return SdkUtil.isAtLeast26Q2() && Flags.showEntitlementUiToRequesters();
         }
 
         /**
@@ -255,6 +300,7 @@ public class EntitlementManager {
         mPermissionChangeCallback = callback;
         mHandler = h;
         mDeps = deps;
+        mShouldShowEntitlementUiToRequesters = mDeps.shouldShowEntitlementUiToRequesters();
         if (SdkLevel.isAtLeastU()) {
             mContext.registerReceiver(mReceiver, new IntentFilter(ACTION_PROVISIONING_ALARM),
                     null, mHandler, RECEIVER_NOT_EXPORTED);
@@ -336,11 +382,10 @@ public class EntitlementManager {
      * This is called when tethering starts.
      * Launch provisioning app if upstream is cellular.
      *
-     * @param downstreamType tethering type from TetheringManager.TETHERING_{@code *}
-     * @param showProvisioningUi a boolean indicating whether to show the
-     *        provisioning app UI if there is one.
+     * @param request a {@link TetheringRequest} for this tethering request.
      */
-    public void startProvisioningIfNeeded(int downstreamType, boolean showProvisioningUi) {
+    public void startProvisioningIfNeeded(final TetheringRequest request) {
+        final int downstreamType = request.getTetheringType();
         if (!isValidDownstreamType(downstreamType)) return;
 
         mCurrentDownstreams.set(downstreamType, true);
@@ -350,13 +395,17 @@ public class EntitlementManager {
         final TetheringConfiguration config = mFetcher.fetchTetheringConfiguration();
         if (!isTetherProvisioningRequired(config)) return;
 
+        final boolean showProvisioningUi = request.getShouldShowEntitlementUi();
+        final UserHandle user = UserHandle.getUserHandleForUid(request.getUid());
         // If upstream is not cellular, provisioning app would not be launched
         // till upstream change to cellular.
+        if (showProvisioningUi) mPendingUiProvisioningUsers.add(user);
         if (mUsingCellularAsUpstream) {
-            runTetheringProvisioning(showProvisioningUi, downstreamType, config);
-            mNeedReRunProvisioningUi = false;
-        } else {
-            mNeedReRunProvisioningUi |= showProvisioningUi;
+            runTetheringProvisioning(mPendingUiProvisioningUsers, downstreamType, config);
+            // The provisioning check is now being initiated for one of the pending users,
+            // so the list can be cleared, since the provisioning check is per downstream
+            // instead of per user.
+            mPendingUiProvisioningUsers.clear();
         }
     }
 
@@ -385,7 +434,8 @@ public class EntitlementManager {
         if (DBG) {
             mLog.i("notifyUpstream: " + isCellular
                     + ", mLastCellularUpstreamPermitted: " + mLastCellularUpstreamPermitted
-                    + ", mNeedReRunProvisioningUi: " + mNeedReRunProvisioningUi);
+                    + ", mPendingUiProvisioningUsers: "
+                    + mPendingUiProvisioningUsers);
         }
         mUsingCellularAsUpstream = isCellular;
 
@@ -416,8 +466,8 @@ public class EntitlementManager {
             // this means tethering may need to run entitlement check or carrier network
             // is not supported.
             if (mCurrentEntitlementResults.indexOfKey(downstream) < 0) {
-                runTetheringProvisioning(mNeedReRunProvisioningUi, downstream, config);
-                mNeedReRunProvisioningUi = false;
+                runTetheringProvisioning(mPendingUiProvisioningUsers, downstream, config);
+                mPendingUiProvisioningUsers.clear();
             }
         }
     }
@@ -517,7 +567,9 @@ public class EntitlementManager {
     }
 
     private void runTetheringProvisioning(
-            boolean showProvisioningUi, int downstreamType, final TetheringConfiguration config) {
+            @NonNull Set<UserHandle> pendingUiProvisioningUsers,
+            int downstreamType, final TetheringConfiguration config) {
+        final boolean showProvisioningUi = !pendingUiProvisioningUsers.isEmpty();
         if (!config.isCarrierSupportTethering) {
             mListener.onTetherProvisioningFailed(downstreamType, "Carrier does not support.");
             if (showProvisioningUi) {
@@ -529,7 +581,8 @@ public class EntitlementManager {
         ResultReceiver receiver =
                 buildProxyReceiver(downstreamType, showProvisioningUi/* notifyFail */, null);
         if (showProvisioningUi) {
-            mDeps.runUiTetherProvisioning(downstreamType, config, receiver);
+            mDeps.runUiTetherProvisioning(downstreamType, config, receiver,
+                    pendingUiProvisioningUsers, mShouldShowEntitlementUiToRequesters);
         } else {
             mDeps.runSilentTetherProvisioning(downstreamType, config, receiver);
         }
@@ -655,6 +708,8 @@ public class EntitlementManager {
     public void dump(PrintWriter pw) {
         pw.print("isCellularUpstreamPermitted: ");
         pw.println(isCellularUpstreamPermitted());
+        pw.print("shouldShowEntitlementUiToRequesters: ");
+        pw.println(mShouldShowEntitlementUiToRequesters);
         for (int type = mCurrentDownstreams.nextSetBit(0); type >= 0;
                 type = mCurrentDownstreams.nextSetBit(type + 1)) {
             pw.print("Type: ");
@@ -777,7 +832,8 @@ public class EntitlementManager {
             receiver.send(cacheValue, null);
         } else {
             ResultReceiver proxy = buildProxyReceiver(downstream, false/* notifyFail */, receiver);
-            mDeps.runUiTetherProvisioning(downstream, config, proxy);
+            mDeps.runUiTetherProvisioning(downstream, config, proxy,
+                    mPendingUiProvisioningUsers, mShouldShowEntitlementUiToRequesters);
         }
     }
 }

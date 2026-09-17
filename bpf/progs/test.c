@@ -15,7 +15,7 @@
  */
 
 // The resulting .o needs to load on Android S+
-#define BPFLOADER_MIN_VER BPFLOADER_MAINLINE_S_VERSION
+#define NETBPFLOAD_MINAPI_VER NETBPFLOAD_S_VER
 #define BPF_OBJ_NAME "test"
 #define DEFAULT_BPF_PIN_SUBDIR "tethering"
 
@@ -33,6 +33,9 @@ DEFINE_BPF_MAP_GRW(tether2_downstream6_map, HASH, TetherDownstream6Key, Tether6V
                    AID_NETWORK_STACK)
 DEFINE_BPF_MAP_GRW(tether3_downstream6_map, HASH, TetherDownstream6Key, Tether6Value, 16,
                    AID_NETWORK_STACK)
+// ----- Kernel Stats -----
+DEFINE_BPF_MAP_GRW(kernel_stats_map, ARRAY, uint32_t, uint32_t, 2, AID_NETWORK_STACK)
+
 // Used only by BpfBitmapTest, not by production code.
 DEFINE_BPF_MAP_GRW(bitmap, ARRAY, int, uint64_t, 2, AID_NETWORK_STACK)
 

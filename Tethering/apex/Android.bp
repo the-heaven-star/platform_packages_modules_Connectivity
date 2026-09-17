@@ -26,14 +26,6 @@ java_defaults {
     enabled: true,
 }
 
-java_defaults {
-    name: "NetworkStackApiShimSettingsForCurrentBranch",
-    // API shims to include in the networking modules built from the branch. Branches that disable
-    // the "next" targets must use stable shims (latest stable API level) instead of current shims
-    // (X_current API level).
-    static_libs: ["NetworkStackApiCurrentShims"],
-}
-
 apex_defaults {
     name: "ConnectivityApexDefaults",
     // Tethering app to include in the AOSP apex. Branches that disable the "next" targets may use
@@ -70,8 +62,7 @@ apex {
                 "libandroid_net_connectivity_com_android_net_module_util_jni_CommonConnectivityJni",
             ],
             native_shared_libs: [
-                "libcom.android.tethering.dns_helper",
-                "libcom.android.tethering.connectivity_native",
+                "libnetd_resolv",
                 "libnetd_updatable",
             ],
         },
@@ -80,6 +71,9 @@ apex {
                 "libframework-connectivity-jni",
                 "libframework-connectivity-tiramisu-jni",
             ],
+            native_shared_libs: [
+                "libcom.android.tethering.connectivity_native",
+            ],
         },
     },
     binaries: [
@@ -87,12 +81,15 @@ apex {
         "ethtool",
         "netbpfload",
         "ot-daemon",
+        "socketbroker",
     ],
     canned_fs_config: "canned_fs_config",
     bpfs: [
         "clatd.o",
         "dscpPolicy.o",
+        "dscpPolicy@funcs.o",
         "netd.o",
+        "netd@funcs.o",
         "offload.o",
         "test.o",
     ],
@@ -149,18 +146,23 @@ bootclasspath_fragment {
     contents: [
         "framework-connectivity",
         "framework-connectivity-t",
+        "framework-connectivity-b",
         "framework-tethering",
-    ] + select(release_flag("RELEASE_MOVE_VCN_TO_MAINLINE"), {
-        true: ["framework-connectivity-b"],
-        default: [],
-    }),
+    ],
     apex_available: ["com.android.tethering"],
+    dex_preopt: {
+        profile: "packages/modules/Connectivity/Tethering/apex/boot-image-profile.txt",
+    },
 
     // The bootclasspath_fragments that provide APIs on which this depends.
     fragments: [
         {
             apex: "com.android.art",
             module: "art-bootclasspath-fragment",
+        },
+        {
+            apex: "com.android.telephonycore",
+            module: "com.android.telephony-bootclasspath-fragment",
         },
     ],
 
@@ -208,6 +210,7 @@ bootclasspath_fragment {
             "android.remoteauth",
             "android.net.apf",
             "android.net.connectivity",
+            "android.net.dns",
             "android.net.http.apihelpers",
             "android.net.netstats.provider",
             "android.net.nsd",

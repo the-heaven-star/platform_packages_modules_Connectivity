@@ -27,6 +27,7 @@ import static libcore.junit.util.compat.CoreCompatChangeRule.EnableCompatChanges
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.doReturn;
@@ -59,9 +60,9 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
 import java.net.InetAddress;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
-import java.time.Duration;
 
 @DevSdkIgnoreRunner.MonitorThreadLeak
 @RunWith(DevSdkIgnoreRunner.class)
@@ -73,6 +74,9 @@ public class NsdManagerTest {
 
     @Rule
     public TestRule compatChangeRule = new PlatformCompatChangeRule();
+
+    @Rule
+    public TestRule ignoreRule = new DevSdkIgnoreRule();
 
     @Mock Context mContext;
     @Mock INsdManager mService;
@@ -87,11 +91,11 @@ public class NsdManagerTest {
     public void setUp() throws Exception {
         MockitoAnnotations.initMocks(this);
 
-        doReturn(mServiceConn).when(mService).connect(any(), anyBoolean());
+        doReturn(mServiceConn).when(mService).connect(any(), anyBoolean(), any());
         mManager = new NsdManager(mContext, mService);
         final ArgumentCaptor<INsdManagerCallback> cbCaptor = ArgumentCaptor.forClass(
                 INsdManagerCallback.class);
-        verify(mService).connect(cbCaptor.capture(), anyBoolean());
+        verify(mService).connect(cbCaptor.capture(), anyBoolean(), any());
         mCallback = cbCaptor.getValue();
     }
 
@@ -247,6 +251,29 @@ public class NsdManagerTest {
         AdvertisingRequest capturedRequest = getAdvertisingRequest(
                 req -> verify(mServiceConn).registerService(anyInt(), req.capture()));
         assertEquals(request.getTtl(), capturedRequest.getTtl());
+    }
+
+    @Test
+    public void testOffloadSessionRegistration() throws Exception {
+        final NsdManager manager = mManager;
+        String interfaceName = "lo";
+        long offloadType = OffloadEngine.OFFLOAD_TYPE_QUERY;
+        OffloadEngine offloadEngine = mock(OffloadEngine.class);
+
+        manager.registerOffloadEngine(
+                interfaceName,
+                offloadType,
+                0L,
+                Runnable::run,
+                offloadEngine
+        );
+
+        verify(mServiceConn).registerOffloadEngine(
+                eq(interfaceName),
+                any(),
+                eq(0L),
+                eq(offloadType)
+        );
     }
 
     private void doTestRegisterService() throws Exception {
@@ -752,6 +779,14 @@ public class NsdManagerTest {
                         .setNoService()
                         .setDefaultHost()
                         .setNoPublicKey().build()));
+    }
+
+    @Test
+    public void testUnregisterNonRegisteredCallback() {
+        mManager.stopServiceDiscovery(mock(NsdManager.DiscoveryListener.class));
+        mManager.unregisterServiceInfoCallback(mock(NsdManager.ServiceInfoCallback.class));
+        mManager.stopServiceResolution(mock(NsdManager.ResolveListener.class));
+        mManager.unregisterService(mock(NsdManager.RegistrationListener.class));
     }
 
     public void mustFail(Runnable fn) {

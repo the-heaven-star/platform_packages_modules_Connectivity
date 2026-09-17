@@ -35,9 +35,9 @@ java_defaults {
 
     static_libs: [
         "ConnectivityWifiP2pMultiDevicesSnippetLib",
-        "Harrier",
+        "bedstead",
         "TetheringCommonTests",
-        "com.android.net.flags-aconfig-java",
+        "com.android.net.flags-aconfig-java-deprecated",
         "compatibility-device-util-axt",
         "cts-net-utils",
         "net-tests-utils",
@@ -54,7 +54,7 @@ java_defaults {
 
     // Change to system current when TetheringManager move to bootclass path.
     platform_apis: true,
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     host_required: ["net-tests-utils-host-common"],
     host_common_data: [":net-tests-utils-host-common"],
 }
@@ -74,6 +74,9 @@ android_test {
     // Tag this module as a cts test artifact
     test_suites: [
         "cts",
+        // See test/dts/README.md for triage instructions for bugs from the dts suite.
+        // Bugs should not be filed on the core networking team.
+        "dts",
         "mts-tethering",
         "mcts-tethering",
         "general-tests",

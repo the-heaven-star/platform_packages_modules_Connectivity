@@ -23,12 +23,14 @@ import android.os.Process
 import com.android.net.module.util.ArrayTrackRecord
 import com.android.net.module.util.DnsPacket
 import com.android.net.module.util.NetworkStackConstants.ETHER_HEADER_LEN
+import com.android.net.module.util.NetworkStackConstants.IPV4_ADDR_LEN
+import com.android.net.module.util.NetworkStackConstants.IPV4_DST_ADDR_OFFSET
+import com.android.net.module.util.NetworkStackConstants.IPV4_HEADER_MIN_LEN
 import com.android.net.module.util.NetworkStackConstants.IPV6_ADDR_LEN
 import com.android.net.module.util.NetworkStackConstants.IPV6_DST_ADDR_OFFSET
 import com.android.net.module.util.NetworkStackConstants.IPV6_HEADER_LEN
 import com.android.net.module.util.NetworkStackConstants.UDP_HEADER_LEN
 import com.android.net.module.util.TrackRecord
-import java.net.Inet6Address
 import java.net.InetAddress
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -212,9 +214,10 @@ class NsdResolveRecord : NsdManager.ResolveListener,
 class NsdServiceInfoCallbackRecord : NsdManager.ServiceInfoCallback,
     NsdRecord<NsdServiceInfoCallbackRecord.ServiceInfoCallbackEvent>() {
     sealed class ServiceInfoCallbackEvent : NsdEvent {
+        object RegisterCallbackSucceeded : ServiceInfoCallbackEvent()
         data class RegisterCallbackFailed(val errorCode: Int) : ServiceInfoCallbackEvent()
         data class ServiceUpdated(val serviceInfo: NsdServiceInfo) : ServiceInfoCallbackEvent()
-        object ServiceUpdatedLost : ServiceInfoCallbackEvent()
+        data class ServiceUpdatedLost(val serviceInfo: NsdServiceInfo) : ServiceInfoCallbackEvent()
         object UnregisterCallbackSucceeded : ServiceInfoCallbackEvent()
     }
 
@@ -222,12 +225,21 @@ class NsdServiceInfoCallbackRecord : NsdManager.ServiceInfoCallback,
         add(ServiceInfoCallbackEvent.RegisterCallbackFailed(err))
     }
 
+    override fun onServiceInfoCallbackRegistered() {
+        add(ServiceInfoCallbackEvent.RegisterCallbackSucceeded)
+    }
+
     override fun onServiceUpdated(si: NsdServiceInfo) {
         add(ServiceInfoCallbackEvent.ServiceUpdated(si))
     }
 
     override fun onServiceLost() {
-        add(ServiceInfoCallbackEvent.ServiceUpdatedLost)
+        fail("onServiceLost() should not be called when onServiceLost(NsdServiceInfo) is " +
+                "implemented")
+    }
+
+    override fun onServiceLost(si: NsdServiceInfo) {
+        add(ServiceInfoCallbackEvent.ServiceUpdatedLost(si))
     }
 
     override fun onServiceInfoCallbackUnregistered() {
@@ -235,20 +247,32 @@ class NsdServiceInfoCallbackRecord : NsdManager.ServiceInfoCallback,
     }
 }
 
-private fun getMdnsPayload(packet: ByteArray) = packet.copyOfRange(
-    ETHER_HEADER_LEN + IPV6_HEADER_LEN + UDP_HEADER_LEN, packet.size)
+private fun getIpVersion(packet: ByteArray) =
+    (packet[ETHER_HEADER_LEN].toInt() shr 4) and 0xF
 
-private fun getDstAddr(packet: ByteArray): Inet6Address {
-    val v6AddrPos = ETHER_HEADER_LEN + IPV6_DST_ADDR_OFFSET
-    return Inet6Address.getByAddress(packet.copyOfRange(v6AddrPos, v6AddrPos + IPV6_ADDR_LEN))
-            as Inet6Address
+private fun getMdnsPayload(packet: ByteArray): ByteArray {
+    val ipHeaderLen = if (getIpVersion(packet) == 4) IPV4_HEADER_MIN_LEN else IPV6_HEADER_LEN
+    return packet.copyOfRange(ETHER_HEADER_LEN + ipHeaderLen + UDP_HEADER_LEN, packet.size)
+}
+
+private fun getDstAddr(packet: ByteArray): InetAddress {
+    return if (getIpVersion(packet) == 4) {
+        val dstAddrPos = ETHER_HEADER_LEN + IPV4_DST_ADDR_OFFSET
+        InetAddress.getByAddress(
+                packet.copyOfRange(dstAddrPos, dstAddrPos + IPV4_ADDR_LEN))
+    } else { // ipVersion == 6
+        val dstAddrPos = ETHER_HEADER_LEN + IPV6_DST_ADDR_OFFSET
+        InetAddress.getByAddress(
+                packet.copyOfRange(dstAddrPos, dstAddrPos + IPV6_ADDR_LEN))
+    }
 }
 
 fun PollPacketReader.pollForMdnsPacket(
     timeoutMs: Long = MDNS_REGISTRATION_TIMEOUT_MS,
     predicate: (TestDnsPacket) -> Boolean
 ): TestDnsPacket? {
-    val mdnsProbeFilter = IPv6UdpFilter(srcPort = MDNS_PORT, dstPort = MDNS_PORT).and {
+    val mdnsProbeFilter = IPv4UdpFilter(srcPort = MDNS_PORT, dstPort = MDNS_PORT)
+            .or(IPv6UdpFilter(srcPort = MDNS_PORT, dstPort = MDNS_PORT)).and {
         val dst = getDstAddr(it)
         val mdnsPayload = getMdnsPayload(it)
         try {
@@ -261,6 +285,11 @@ fun PollPacketReader.pollForMdnsPacket(
         TestDnsPacket(getMdnsPayload(it), getDstAddr(it))
     }
 }
+
+fun PollPacketReader.backtraceMdnsPackets() = backtrace().filter {
+    IPv4UdpFilter(srcPort = MDNS_PORT, dstPort = MDNS_PORT)
+        .or(IPv6UdpFilter(srcPort = MDNS_PORT, dstPort = MDNS_PORT)).test(it)
+}.map { TestDnsPacket(getMdnsPayload(it), getDstAddr(it)) }
 
 fun PollPacketReader.pollForProbe(
     serviceName: String,
@@ -299,8 +328,6 @@ fun PollPacketReader.pollForReply(
 }
 
 class TestDnsPacket(data: ByteArray, val dstAddr: InetAddress) : DnsPacket(data) {
-    val header: DnsHeader
-        get() = mHeader
     val records: Array<List<DnsRecord>>
         get() = mRecords
     fun isProbeFor(name: String): Boolean = mRecords[QDSECTION].any {

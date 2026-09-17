@@ -71,7 +71,7 @@ java_sdk_library {
         baseline_filename: "lint-baseline.xml",
     },
     aconfig_declarations: [
-        "com.android.net.flags-aconfig",
+        "com.android.net.flags-aconfig-deprecated",
     ],
 }
 
@@ -113,7 +113,7 @@ java_defaults {
     ],
     static_libs: [
         "modules-utils-build",
-        "com.android.net.flags-aconfig-java",
+        "com.android.net.flags-aconfig-java-deprecated",
     ],
     aidl: {
         include_dirs: [
@@ -122,7 +122,7 @@ java_defaults {
         ],
     },
     apex_available: ["com.android.tethering"],
-    min_sdk_version: "30",
+    min_sdk_version: "31",
 }
 
 filegroup {

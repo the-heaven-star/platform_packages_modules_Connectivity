@@ -18,6 +18,7 @@ package com.android.networkstack.tethering.metrics;
 
 import static android.app.usage.NetworkStats.Bucket.STATE_ALL;
 import static android.app.usage.NetworkStats.Bucket.TAG_NONE;
+import static android.app.usage.NetworkStatsManager.FLAG_POLL_ON_OPEN;
 import static android.net.NetworkCapabilities.TRANSPORT_BLUETOOTH;
 import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
 import static android.net.NetworkCapabilities.TRANSPORT_ETHERNET;
@@ -26,6 +27,7 @@ import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
 import static android.net.NetworkCapabilities.TRANSPORT_WIFI_AWARE;
 import static android.net.NetworkStats.DEFAULT_NETWORK_YES;
 import static android.net.NetworkStats.METERED_NO;
+import static android.net.NetworkStats.METERED_YES;
 import static android.net.NetworkStats.ROAMING_NO;
 import static android.net.NetworkStats.SET_DEFAULT;
 import static android.net.NetworkStats.UID_TETHERING;
@@ -68,8 +70,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.verify;
 
 import android.app.usage.NetworkStatsManager;
@@ -88,6 +90,7 @@ import android.util.ArrayMap;
 
 import androidx.test.filters.SmallTest;
 
+import com.android.modules.utils.build.SdkLevel;
 import com.android.networkstack.tethering.UpstreamNetworkState;
 import com.android.networkstack.tethering.metrics.TetheringMetrics.DataUsage;
 import com.android.networkstack.tethering.metrics.TetheringMetrics.Dependencies;
@@ -103,6 +106,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
+import org.mockito.stubbing.Answer;
 
 @DevSdkIgnoreRunner.MonitorThreadLeak
 @RunWith(DevSdkIgnoreRunner.class)
@@ -165,13 +169,21 @@ public final class TetheringMetricsTest {
         mMockUpstreamUsageBaseline.put(UT_WIFI, new DataUsage(400L, 800L));
         mMockUpstreamUsageBaseline.put(UT_BLUETOOTH, new DataUsage(50L, 80L));
         mMockUpstreamUsageBaseline.put(UT_ETHERNET, new DataUsage(0L, 0L));
-        doAnswer(inv -> {
+        final Answer<android.app.usage.NetworkStats> dataUsageAnswer = inv -> {
             final NetworkTemplate template = (NetworkTemplate) inv.getArguments()[0];
             final DataUsage dataUsage = mMockUpstreamUsageBaseline.getOrDefault(
                     matchRuleToUpstreamType(template.getMatchRule()), new DataUsage(0L, 0L));
             return makeNetworkStatsWithTxRxBytes(dataUsage);
-        }).when(mNetworkStatsManager).queryDetailsForUidTagState(any(), eq(Long.MIN_VALUE),
-                eq(Long.MAX_VALUE), eq(UID_TETHERING), eq(TAG_NONE), eq(STATE_ALL));
+        };
+        if (SdkLevel.isAtLeastT()) {
+            doAnswer(dataUsageAnswer).when(mNetworkStatsManager).queryDetailsForUidTagState(any(),
+                    eq(Long.MIN_VALUE), eq(Long.MAX_VALUE), eq(UID_TETHERING), eq(TAG_NONE),
+                    eq(STATE_ALL), eq(FLAG_POLL_ON_OPEN));
+        } else {
+            doAnswer(dataUsageAnswer).when(mNetworkStatsManager).queryDetailsForUidTagState(any(),
+                    eq(Long.MIN_VALUE), eq(Long.MAX_VALUE), eq(UID_TETHERING), eq(TAG_NONE),
+                    eq(STATE_ALL));
+        }
         mTetheringMetrics = new TetheringMetrics(mContext, mDeps);
         mElapsedRealtime = 0L;
     }
@@ -474,26 +486,39 @@ public final class TetheringMetricsTest {
     }
 
     private void runBuildNetworkTemplateForUpstreamType(final UpstreamType upstreamType,
-            final int matchRule)  {
+            final int matchRule, final int meteredness, final int defaultNetworkStatus) {
         final NetworkTemplate template =
                 TetheringMetrics.buildNetworkTemplateForUpstreamType(upstreamType);
         if (matchRule == MATCH_NONE) {
             assertNull(template);
         } else {
             assertEquals(matchRule, template.getMatchRule());
+            assertEquals(meteredness, template.getMeteredness());
+            assertEquals(defaultNetworkStatus, template.getDefaultNetworkStatus());
         }
     }
 
     @Test
     @IgnoreUpTo(Build.VERSION_CODES.S_V2)
     public void testBuildNetworkTemplateForUpstreamType() {
-        runBuildNetworkTemplateForUpstreamType(UT_CELLULAR, MATCH_MOBILE);
-        runBuildNetworkTemplateForUpstreamType(UT_WIFI, MATCH_WIFI);
-        runBuildNetworkTemplateForUpstreamType(UT_BLUETOOTH, MATCH_BLUETOOTH);
-        runBuildNetworkTemplateForUpstreamType(UT_ETHERNET, MATCH_ETHERNET);
-        runBuildNetworkTemplateForUpstreamType(UpstreamType.UT_WIFI_AWARE, MATCH_NONE);
-        runBuildNetworkTemplateForUpstreamType(UpstreamType.UT_LOWPAN, MATCH_NONE);
-        runBuildNetworkTemplateForUpstreamType(UpstreamType.UT_UNKNOWN, MATCH_NONE);
+        // NetworkTemplate.METERED_ANY and NetworkTemplate.DEFAULT_NETWORK_STATUS_ANY are hidden.
+        final int METERED_ANY = -1;
+        final int DEFAULT_NETWORK_ANY = -1;
+
+        runBuildNetworkTemplateForUpstreamType(UT_CELLULAR, MATCH_MOBILE, METERED_YES,
+                DEFAULT_NETWORK_ANY);
+        runBuildNetworkTemplateForUpstreamType(UT_WIFI, MATCH_WIFI, METERED_ANY,
+                DEFAULT_NETWORK_YES);
+        runBuildNetworkTemplateForUpstreamType(UT_BLUETOOTH, MATCH_BLUETOOTH, METERED_ANY,
+                DEFAULT_NETWORK_YES);
+        runBuildNetworkTemplateForUpstreamType(UT_ETHERNET, MATCH_ETHERNET, METERED_ANY,
+                DEFAULT_NETWORK_YES);
+        runBuildNetworkTemplateForUpstreamType(UpstreamType.UT_WIFI_AWARE, MATCH_NONE,
+                METERED_ANY, DEFAULT_NETWORK_ANY);
+        runBuildNetworkTemplateForUpstreamType(UpstreamType.UT_LOWPAN, MATCH_NONE,
+                METERED_ANY, DEFAULT_NETWORK_ANY);
+        runBuildNetworkTemplateForUpstreamType(UpstreamType.UT_UNKNOWN, MATCH_NONE,
+                METERED_ANY, DEFAULT_NETWORK_ANY);
     }
 
     private void verifyEmptyUsageForAllUpstreamTypes() {

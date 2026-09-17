@@ -68,6 +68,13 @@ import static com.android.internal.annotations.VisibleForTesting.Visibility.PRIV
 import static com.android.net.module.util.DeviceConfigUtils.getDeviceConfigPropertyInt;
 import static com.android.net.module.util.NetworkCapabilitiesUtils.getDisplayTransport;
 import static com.android.net.module.util.NetworkStatsUtils.LIMIT_GLOBAL_ALERT;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_COMPARISON_ERROR;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COLLECTION_LOAD_ERROR;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COUNTERS_CREATE_ERROR;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COUNTERS_READ_ERROR;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COUNTERS_UPDATE_ERROR;
+import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_LEGACY_STATS_READ_ERROR;
 import static com.android.server.net.NetworkStatsEventLogger.POLL_REASON_DUMPSYS;
 import static com.android.server.net.NetworkStatsEventLogger.POLL_REASON_FORCE_UPDATE;
 import static com.android.server.net.NetworkStatsEventLogger.POLL_REASON_GLOBAL_ALERT;
@@ -79,6 +86,7 @@ import static com.android.server.net.NetworkStatsEventLogger.POLL_REASON_REG_CAL
 import static com.android.server.net.NetworkStatsEventLogger.POLL_REASON_REMOVE_UIDS;
 import static com.android.server.net.NetworkStatsEventLogger.POLL_REASON_UPSTREAM_CHANGED;
 import static com.android.server.net.NetworkStatsEventLogger.PollEvent;
+import static com.android.tethering.flags.Flags.FLAG_NETSTATS_USE_SINCE_BOOT_COLLECTION;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
@@ -187,13 +195,13 @@ import com.android.net.module.util.Struct;
 import com.android.net.module.util.Struct.S32;
 import com.android.net.module.util.Struct.S64;
 import com.android.net.module.util.Struct.U8;
+import com.android.net.module.util.TerribleErrorLog;
 import com.android.net.module.util.bpf.CookieTagMapValue;
 import com.android.net.module.util.netlink.InetDiagMessage;
 import com.android.net.module.util.netlink.StructInetDiagSockId;
-import com.android.networkstack.apishim.BroadcastOptionsShimImpl;
-import com.android.networkstack.apishim.ConstantsShim;
-import com.android.networkstack.apishim.common.UnsupportedApiLevelException;
+import com.android.server.ConnectivityStatsLog;
 import com.android.server.connectivity.ConnectivityResources;
+import com.android.tethering.flags.Flags;
 
 import java.io.File;
 import java.io.FileDescriptor;
@@ -218,6 +226,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * Collect and persist detailed network statistics, and provide this data to
@@ -606,19 +615,14 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
                     updatedIntent.setFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
                     Bundle opts = null;
                     if (SdkLevel.isAtLeastU()) {
-                        try {
-                            // This allows us to discard older broadcasts still waiting to
-                            // be delivered.
-                            opts = BroadcastOptionsShimImpl.newInstance(
-                                    BroadcastOptions.makeBasic())
-                                    .setDeliveryGroupPolicy(
-                                            ConstantsShim.DELIVERY_GROUP_POLICY_MOST_RECENT)
-                                    .setDeferralPolicy(
-                                            ConstantsShim.DEFERRAL_POLICY_UNTIL_ACTIVE)
-                                    .toBundle();
-                        } catch (UnsupportedApiLevelException e) {
-                            Log.wtf(TAG, "Using unsupported API" + e);
-                        }
+                        final BroadcastOptions bOptions = BroadcastOptions.makeBasic();
+                        // This allows us to discard older broadcasts still waiting to
+                        // be delivered.
+                        bOptions.setDeliveryGroupPolicy(
+                                BroadcastOptions.DELIVERY_GROUP_POLICY_MOST_RECENT);
+                        bOptions.setDeferralPolicy(
+                                BroadcastOptions.DEFERRAL_POLICY_UNTIL_ACTIVE);
+                        opts = bOptions.toBundle();
                     }
                     mContext.sendBroadcastAsUser(updatedIntent, UserHandle.ALL,
                             READ_NETWORK_USAGE_HISTORY, opts);
@@ -959,6 +963,17 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
         }
 
         /**
+         * @see Flags
+         */
+        public boolean isAconfigFlagEnabled(@NonNull String flag) {
+            switch (flag) {
+                case FLAG_NETSTATS_USE_SINCE_BOOT_COLLECTION:
+                    return Flags.netstatsUseSinceBootCollection();
+            }
+            throw new IllegalArgumentException("Unknown flag: " + flag);
+        }
+
+        /**
          * Get client side traffic stats rate-limit cache config.
          *
          * This method should only be called once in the constructor,
@@ -987,6 +1002,18 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
          */
         public boolean isChangeEnabled(final long changeId, final int uid) {
             return CompatChanges.isChangeEnabled(changeId, uid);
+        }
+
+        /**
+         * Create a {@link NetworkStatsRecorder} instance.
+         */
+        public NetworkStatsRecorder makeRecorder(FileRotator fileRotator,
+                NonMonotonicObserver<String> observer, DropBoxManager dropBox, String cookie,
+                long bucketDuration, boolean onlyTags, boolean wipeOnError,
+                boolean useFastDataInput, boolean storeTransportTypes, @Nullable File statsDir) {
+            return new NetworkStatsRecorder(fileRotator,
+                    observer, dropBox, cookie, bucketDuration, onlyTags,
+                    wipeOnError, useFastDataInput, storeTransportTypes, statsDir);
         }
 
         /**
@@ -1117,7 +1144,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
             File baseDir, boolean wipeOnError, boolean useFastDataInput) {
         final DropBoxManager dropBox = (DropBoxManager) mContext.getSystemService(
                 Context.DROPBOX_SERVICE);
-        return new NetworkStatsRecorder(new FileRotator(
+        return mDeps.makeRecorder(new FileRotator(
                 baseDir, prefix, config.rotateAgeMillis, config.deleteAgeMillis),
                 mNonMonotonicObserver, dropBox, prefix, config.bucketDuration, includeTags,
                 wipeOnError, useFastDataInput, mStoreTransportTypes, baseDir);
@@ -1132,7 +1159,10 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
             mFastDataInputFallbacksCounter = mDeps.createPersistentCounter(mStatsDir.toPath(),
                     NETSTATS_FASTDATAINPUT_FALLBACKS_COUNTER_NAME);
         } catch (IOException e) {
-            Log.wtf(TAG, "Failed to create persistent counters, skip.", e);
+            TerribleErrorLog.logTerribleError(ConnectivityStatsLog::write,
+                    "Failed to create persistent counters, skip: " + e,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COUNTERS_CREATE_ERROR);
             useFastDataInput = false;
         }
 
@@ -1145,7 +1175,10 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
             // not successful.
             fallbacks = mFastDataInputFallbacksCounter.get();
         } catch (IOException e) {
-            Log.wtf(TAG, "Failed to read counters, skip.", e);
+            TerribleErrorLog.logTerribleError(ConnectivityStatsLog::write,
+                    "Failed to read counters, skip: " + e,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COUNTERS_READ_ERROR);
             useFastDataInput = false;
         }
 
@@ -1190,7 +1223,10 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
             try {
                 migrations[i].collection = migrations[i].recorder.getOrLoadCompleteLocked();
             } catch (Throwable t) {
-                Log.wtf(TAG, "Failed to load collection, skip.", t);
+                TerribleErrorLog.logTerribleError(ConnectivityStatsLog::write,
+                        "Failed to load collection, skip: " + t,
+                        CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                        CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COLLECTION_LOAD_ERROR);
                 success = false;
                 break;
             }
@@ -1212,7 +1248,10 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
                 mFastDataInputFallbacksCounter.set(fallbacks + 1);
             }
         } catch (IOException e) {
-            Log.wtf(TAG, "Failed to update counters. success = " + success, e);
+            TerribleErrorLog.logTerribleError(ConnectivityStatsLog::write,
+                    "Failed to update counters. success = " + success + ": " + e,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_FAST_DATA_INPUT_COUNTERS_UPDATE_ERROR);
         }
     }
 
@@ -1495,8 +1534,11 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
         try {
             legacyStats = legacyRecorder.getOrLoadCompleteLocked();
         } catch (Throwable e) {
-            Log.wtf(TAG, "Failed to read stats with legacy method for recorder "
-                    + legacyRecorder.getCookie(), e);
+            TerribleErrorLog.logTerribleError(ConnectivityStatsLog::write,
+                    "Failed to read stats with legacy method for recorder "
+                    + legacyRecorder.getCookie() + ": " + e,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_LEGACY_STATS_READ_ERROR);
             // Cannot read data from legacy method, skip comparison.
             return false;
         }
@@ -1506,13 +1548,19 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
             final String error = mDeps.compareStats(migration.collection, legacyStats,
                     allowKeyChange);
             if (error != null) {
-                Log.wtf(TAG, "Unexpected comparison result for recorder "
-                        + legacyRecorder.getCookie() + ": " + error);
+                TerribleErrorLog.logTerribleError(ConnectivityStatsLog::write,
+                        "Unexpected comparison result for recorder "
+                        + legacyRecorder.getCookie() + ": " + error,
+                        CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                        CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_COMPARISON_ERROR);
                 return false;
             }
         } catch (Throwable e) {
-            Log.wtf(TAG, "Failed to compare migrated stats with legacy stats for recorder "
-                    + legacyRecorder.getCookie(), e);
+            TerribleErrorLog.logTerribleError(ConnectivityStatsLog::write,
+                    "Failed to compare migrated stats with legacy stats for recorder "
+                    + legacyRecorder.getCookie() + ": " + e,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_NETWORK_STATS_COMPARISON_ERROR);
             return false;
         }
         return true;
@@ -1637,6 +1685,9 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
             private final String mCallingPackage = callingPackage;
             private final @NetworkStatsAccess.Level int mAccessLevel = checkAccessLevel(
                     callingPackage);
+            // READ_DEVICE_CONFIG is necessary to read flags on T-
+            private final boolean mUseSinceBootCollection = BinderUtils.withCleanCallingIdentity(
+                    () -> mDeps.isAconfigFlagEnabled(FLAG_NETSTATS_USE_SINCE_BOOT_COLLECTION));
 
             private NetworkStatsCollection mUidComplete;
             private NetworkStatsCollection mUidTagComplete;
@@ -1650,6 +1701,24 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
                 }
             }
 
+            private <T> T getFromUidSince(long start, Function<NetworkStatsCollection, T> func) {
+                if (!mUseSinceBootCollection) {
+                    return func.apply(getUidComplete());
+                }
+                final NetworkStatsCollection collection;
+                synchronized (mStatsLock) {
+                    if (mUidComplete != null) {
+                        collection = mUidComplete;
+                    } else if (mUidRecorder.getSinceBoot().getStartMillis() <= start) {
+                        // Need to hold the lock while reading the SinceBoot collection
+                        return func.apply(mUidRecorder.getSinceBoot());
+                    } else {
+                        collection = getUidComplete();
+                    }
+                }
+                return func.apply(collection);
+            }
+
             private NetworkStatsCollection getUidTagComplete() {
                 synchronized (mStatsLock) {
                     if (mUidTagComplete == null) {
@@ -1657,6 +1726,24 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
                     }
                     return mUidTagComplete;
                 }
+            }
+
+            private <T> T getFromUidTagSince(long start, Function<NetworkStatsCollection, T> func) {
+                if (!mUseSinceBootCollection) {
+                    return func.apply(getUidTagComplete());
+                }
+                final NetworkStatsCollection collection;
+                synchronized (mStatsLock) {
+                    if (mUidTagComplete != null) {
+                        collection = mUidTagComplete;
+                    } else if (mUidTagRecorder.getSinceBoot().getStartMillis() <= start) {
+                        // Need to hold the lock while reading the SinceBoot collection
+                        return func.apply(mUidTagRecorder.getSinceBoot());
+                    } else {
+                        collection = getUidTagComplete();
+                    }
+                }
+                return func.apply(collection);
             }
 
             @Override
@@ -1703,11 +1790,11 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
                     NetworkTemplate template, long start, long end, boolean includeTags) {
                 enforceTemplatePermissions(template, callingPackage);
                 try {
-                    final NetworkStats stats = getUidComplete()
-                            .getSummary(template, start, end, mAccessLevel, mCallingUid);
+                    final NetworkStats stats = getFromUidSince(start, s ->
+                            s.getSummary(template, start, end, mAccessLevel, mCallingUid));
                     if (includeTags) {
-                        final NetworkStats tagStats = getUidTagComplete()
-                                .getSummary(template, start, end, mAccessLevel, mCallingUid);
+                        final NetworkStats tagStats = getFromUidTagSince(start, s ->
+                                s.getSummary(template, start, end, mAccessLevel, mCallingUid));
                         stats.combineAllValues(tagStats);
                     }
                     return stats;
@@ -1721,9 +1808,8 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
                     NetworkTemplate template, long start, long end) {
                 enforceTemplatePermissions(template, callingPackage);
                 try {
-                    final NetworkStats tagStats = getUidTagComplete()
-                            .getSummary(template, start, end, mAccessLevel, mCallingUid);
-                    return tagStats;
+                    return getFromUidTagSince(start, s ->
+                            s.getSummary(template, start, end, mAccessLevel, mCallingUid));
                 } catch (NullPointerException e) {
                     throw e;
                 }
@@ -1752,11 +1838,11 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
                 //  sensitive but the caller is not privileged.
                 // NOTE: We don't augment UID-level statistics
                 if (tag == TAG_NONE) {
-                    return getUidComplete().getHistory(template, null, uid, set, tag, fields,
-                            start, end, mAccessLevel, mCallingUid);
+                    return getFromUidSince(start, s -> s.getHistory(template, null, uid, set, tag,
+                            fields, start, end, mAccessLevel, mCallingUid));
                 } else if (uid == Binder.getCallingUid()) {
-                    return getUidTagComplete().getHistory(template, null, uid, set, tag, fields,
-                            start, end, mAccessLevel, mCallingUid);
+                    return getFromUidTagSince(start, s -> s.getHistory(template, null, uid, set,
+                            tag, fields, start, end, mAccessLevel, mCallingUid));
                 } else {
                     throw new SecurityException("Calling package " + mCallingPackage
                             + " cannot access tag information from a different uid");
@@ -1863,17 +1949,6 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
         return internalGetSummaryForNetwork(template,
                 NetworkStatsManager.FLAG_AUGMENT_WITH_SUBSCRIPTION_PLAN, start, end,
                 NetworkStatsAccess.Level.DEVICE, Binder.getCallingUid()).getTotalBytes();
-    }
-
-    private NetworkStats getNetworkUidBytes(NetworkTemplate template, long start, long end) {
-        assertSystemReady();
-
-        final NetworkStatsCollection uidComplete;
-        synchronized (mStatsLock) {
-            uidComplete = mUidRecorder.getOrLoadCompleteLocked();
-        }
-        return uidComplete.getSummary(template, start, end, NetworkStatsAccess.Level.DEVICE,
-                android.os.Process.SYSTEM_UID);
     }
 
     @Override

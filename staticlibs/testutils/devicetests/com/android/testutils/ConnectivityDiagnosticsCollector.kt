@@ -42,17 +42,12 @@ import android.telephony.TelephonyManager.SIM_STATE_UNKNOWN
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.test.platform.app.InstrumentationRegistry
-import com.android.modules.utils.build.SdkLevel.isAtLeastS
 import com.android.testutils.com.android.testutils.getTargetModuleVersion
 import java.io.ByteArrayOutputStream
-import java.io.CharArrayWriter
 import java.io.File
 import java.io.FileReader
 import java.io.InputStream
-import java.io.OutputStream
-import java.io.OutputStreamWriter
 import java.io.PrintWriter
-import java.io.Reader
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.CompletableFuture
@@ -80,6 +75,7 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         private const val ARG_RUN_ON_FAILURE = "connectivity-diagnostics-on-failure"
         private const val COLLECTOR_DIR = "run_listeners/connectivity_diagnostics"
         private const val FILENAME_SUFFIX = "_conndiag.txt"
+        private const val TCPDUMP_FILENAME_SUFFIX = "_tcpdump.pcap"
         private const val MAX_DUMPS = 20
 
         private val TAG = ConnectivityDiagnosticsCollector::class.simpleName
@@ -92,28 +88,7 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
      */
     annotation class CollectTcpdumpOnFailure
 
-    private class DumpThread(
-        // Keep a reference to the ParcelFileDescriptor otherwise GC would close it
-        private val fd: ParcelFileDescriptor,
-        private val reader: Reader
-    ) : Thread() {
-        private val writer = CharArrayWriter()
-        override fun run() {
-            reader.copyTo(writer)
-        }
-
-        fun closeAndWriteTo(output: OutputStream?) {
-            join()
-            fd.close()
-            if (output != null) {
-                val outputWriter = OutputStreamWriter(output)
-                outputWriter.write("--- tcpdump stopped at ${ZonedDateTime.now()} ---\n")
-                writer.writeTo(outputWriter)
-            }
-        }
-    }
-
-    private data class TcpdumpRun(val pid: Int, val reader: DumpThread)
+    private data class TcpdumpRun(val pid: Int, val pcapFile: File, val startSsOutput: ByteArray)
 
     private var failureHeader: String? = null
 
@@ -203,11 +178,11 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         val tcpdumpAnn = description.annotations.firstOrNull { it is CollectTcpdumpOnFailure }
                 as? CollectTcpdumpOnFailure
         if (tcpdumpAnn != null) {
-            startTcpdumpForTestcaseIfSupported()
+            startTcpdumpForTestcaseIfSupported(description)
         }
     }
 
-    private fun startTcpdumpForTestcaseIfSupported() {
+    private fun startTcpdumpForTestcaseIfSupported(description: Description) {
         if (!DeviceInfoUtils.isDebuggable()) {
             Log.d(TAG, "Cannot start tcpdump, build is not debuggable")
             return
@@ -222,25 +197,46 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
 
         val stdout = fds[0]
         val stdin = fds[1]
+        val pcapFile = File(
+                "/data/local/tmp",
+                "${description.className}#${description.methodName}${TCPDUMP_FILENAME_SUFFIX}"
+        )
+        pcapFile.delete()
         ParcelFileDescriptor.AutoCloseOutputStream(stdin).use { writer ->
             // Echo the current pid, and replace it (with exec) with the tcpdump process, so the
             // tcpdump pid is known.
             writer.write(
-                "echo $$; exec su 0 tcpdump -n -i any -l -xx".encodeToByteArray()
+                ("echo $$; exec su 0 tcpdump -U -w ${pcapFile.absolutePath} -n -i any")
+                    .encodeToByteArray()
             )
         }
         val reader = FileReader(stdout.fileDescriptor).buffered()
         val tcpdumpPid = Integer.parseInt(reader.readLine())
-        val dumpThread = DumpThread(stdout, reader)
-        dumpThread.start()
-        tcpdumpRun = TcpdumpRun(tcpdumpPid, dumpThread)
+        reader.close()
+        stdout.close()
+
+        val startSsOutput = captureCommandOutput("su 0 ss -eionptu")
+        tcpdumpRun = TcpdumpRun(tcpdumpPid, pcapFile, startSsOutput)
     }
 
-    private fun stopTcpdumpIfRunning(output: OutputStream?) {
+    private fun stopTcpdumpIfRunning(testData: DataRecord?, baseFilename: String?) {
         val run = tcpdumpRun ?: return
         // Send SIGTERM for graceful shutdown of tcpdump so that it can flush its output
         executeCommandBlocking("su 0 kill ${run.pid}")
-        run.reader.closeAndWriteTo(output)
+        if (testData != null && baseFilename != null) {
+            buffer.write(run.startSsOutput)
+            collectCommandOutput("su 0 ss -eionptu")
+            collectDumpsys("deviceidle")
+            val pcapFile = run.pcapFile
+            if (pcapFile.exists()) {
+                val fileKey =
+                        "${ConnectivityDiagnosticsCollector::class.qualifiedName}" +
+                                "_${baseFilename}${TCPDUMP_FILENAME_SUFFIX}"
+                testData.addFileMetric(fileKey, pcapFile)
+            }
+        } else {
+            run.pcapFile.delete()
+        }
         tcpdumpRun = null
     }
 
@@ -248,7 +244,7 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         // onTestFail is called before onTestEnd, so if the test failed tcpdump would already have
         // been stopped and output dumped. Here this stops tcpdump if the test succeeded, throwing
         // away its output.
-        stopTcpdumpIfRunning(output = null)
+        stopTcpdumpIfRunning(testData = null, baseFilename = null)
 
         // Tests may call methods like collectDumpsysConnectivity to collect diagnostics at any time
         // during the run, for example to observe state at various points to investigate a flake
@@ -280,6 +276,8 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
             filename = baseFilename + "_$i"
             i++
         }
+        stopTcpdumpIfRunning(testData, filename)
+
         val outFile = File(collectorDir, filename + FILENAME_SUFFIX)
         outputFiles.add(filename)
         getOutputStreamViaShell(outFile).use { fos ->
@@ -288,7 +286,6 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
                 fos.write("\n".toByteArray())
             }
             fos.write(buffer.toByteArray())
-            stopTcpdumpIfRunning(fos)
         }
         failureHeader = null
         buffer.reset()
@@ -308,10 +305,8 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         val hasWifi = pm.hasSystemFeature(FEATURE_WIFI)
         val hasMobileData = pm.hasSystemFeature(FEATURE_TELEPHONY)
         val tm = if (hasMobileData) ctx.getSystemService(TelephonyManager::class.java) else null
-        // getAdoptedShellPermissions is S+. Optimistically assume that tests are not holding on
-        // shell permissions during failure/cleanup on R.
-        val canUseShell = !isAtLeastS() ||
-                instr.uiAutomation.getAdoptedShellPermissions().isNullOrEmpty()
+        // getAdoptedShellPermissions is S+.
+        val canUseShell = instr.uiAutomation.getAdoptedShellPermissions().isNullOrEmpty()
         val headerObj = JSONObject()
         failureHeaderExtras.forEach { (k, v) -> headerObj.put(k, v) }
         failureHeaderExtras.clear()
@@ -360,16 +355,10 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         }.toString()
     }
 
-    private class WifiInfoCallback : NetworkCallback {
-        private val network: Network
+    private class WifiInfoCallback(network: Network, flags: Int) : NetworkCallback(flags) {
+        private val network: Network = network
         val wifiInfoFuture = CompletableFuture<WifiInfo?>()
-        constructor(network: Network) : super() {
-            this.network = network
-        }
-        @RequiresApi(Build.VERSION_CODES.S)
-        constructor(network: Network, flags: Int) : super(flags) {
-            this.network = network
-        }
+
         override fun onCapabilitiesChanged(net: Network, nc: NetworkCapabilities) {
             if (network == net) {
                 wifiInfoFuture.complete(nc.transportInfo as? WifiInfo)
@@ -381,11 +370,7 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         // Get the SSID via network callbacks, as the Networks are obtained via callbacks, and
         // synchronous calls (CM#getNetworkCapabilities) and callbacks should not be mixed.
         // A new callback needs to be filed and received while holding NETWORK_SETTINGS permission.
-        val cb = if (isAtLeastS()) {
-            WifiInfoCallback(network, FLAG_INCLUDE_LOCATION_INFO)
-        } else {
-            WifiInfoCallback(network)
-        }
+        val cb = WifiInfoCallback(network, FLAG_INCLUDE_LOCATION_INFO)
         cbHelper.registerNetworkCallback(
             NetworkRequest.Builder()
                 .addTransportType(TRANSPORT_WIFI)
@@ -445,7 +430,6 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
      * @param shell The shell to run the command in, for example "sh".
      * @param exceptionContext An exception to write a stacktrace to the dump for context.
      */
-    @RequiresApi(Build.VERSION_CODES.S)
     fun collectCommandOutput(
         cmd: String,
         shell: String,
@@ -506,5 +490,19 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         if (exceptionContext == null) return
         writer.println("At: ")
         exceptionContext.printStackTrace(writer)
+    }
+
+    private fun captureCommandOutput(cmd: String): ByteArray {
+        val outStream = ByteArrayOutputStream()
+        PrintWriter(outStream).let {
+            it.println("--- $cmd at ${ZonedDateTime.now()} ---")
+            it.flush()
+        }
+        AutoCloseInputStream(
+            InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(cmd)
+        ).use {
+            it.copyTo(outStream)
+        }
+        return outStream.toByteArray()
     }
 }

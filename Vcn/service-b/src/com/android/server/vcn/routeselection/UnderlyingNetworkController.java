@@ -106,20 +106,19 @@ public class UnderlyingNetworkController {
     @Nullable private UnderlyingNetworkRecord mCurrentRecord;
     @Nullable private UnderlyingNetworkRecord.Builder mRecordInProgress;
 
-    private final int mGatewayConnectionId;
     private final VcnMetrics mVcnMetrics;
 
     public UnderlyingNetworkController(
             @NonNull VcnContext vcnContext,
             @NonNull VcnGatewayConnectionConfig connectionConfig,
-            int gatewayConnectionId,
+            @NonNull VcnMetrics vcnMetrics,
             @NonNull ParcelUuid subscriptionGroup,
             @NonNull TelephonySubscriptionSnapshot snapshot,
             @NonNull UnderlyingNetworkControllerCallback cb) {
         this(
                 vcnContext,
                 connectionConfig,
-                gatewayConnectionId,
+                vcnMetrics,
                 subscriptionGroup,
                 snapshot,
                 cb,
@@ -130,7 +129,7 @@ public class UnderlyingNetworkController {
     UnderlyingNetworkController(
             @NonNull VcnContext vcnContext,
             @NonNull VcnGatewayConnectionConfig connectionConfig,
-            int gatewayConnectionId,
+            @NonNull VcnMetrics vcnMetrics,
             @NonNull ParcelUuid subscriptionGroup,
             @NonNull TelephonySubscriptionSnapshot snapshot,
             @NonNull UnderlyingNetworkControllerCallback cb,
@@ -141,8 +140,7 @@ public class UnderlyingNetworkController {
         mLastSnapshot = Objects.requireNonNull(snapshot, "Missing snapshot");
         mCb = Objects.requireNonNull(cb, "Missing cb");
         mDeps = Objects.requireNonNull(deps, "Missing deps");
-        mGatewayConnectionId = gatewayConnectionId;
-        mVcnMetrics = mDeps.newVcnMetrics();
+        mVcnMetrics = Objects.requireNonNull(vcnMetrics, "Missing vcnMetrics");
 
         mHandler = new Handler(mVcnContext.getLooper());
 
@@ -485,7 +483,7 @@ public class UnderlyingNetworkController {
                 .unregisterTelephonyCallback(mActiveDataSubIdListener);
 
         // Log empty validated network count left, as a clean up state.
-        mVcnMetrics.logValidatedUnderlyingNetworkCount(mGatewayConnectionId, 0);
+        mVcnMetrics.logValidatedUnderlyingNetworkCount(0);
     }
 
     private TreeSet<UnderlyingNetworkEvaluator> getSortedUnderlyingNetworks() {
@@ -507,7 +505,7 @@ public class UnderlyingNetworkController {
         }
 
         TreeSet<UnderlyingNetworkEvaluator> sorted = getSortedUnderlyingNetworks();
-        mVcnMetrics.logValidatedUnderlyingNetworkCount(mGatewayConnectionId, sorted.size());
+        mVcnMetrics.logValidatedUnderlyingNetworkCount(sorted.size());
 
         UnderlyingNetworkEvaluator candidateEvaluator = sorted.isEmpty() ? null : sorted.first();
         UnderlyingNetworkRecord candidate =
@@ -521,8 +519,14 @@ public class UnderlyingNetworkController {
             if (!allNetworkPriorities.isEmpty()) {
                 allNetworkPriorities += ", ";
             }
+
+            final String penalizedState = recordEvaluator.isPenalized() ? "|penalized" : "";
             allNetworkPriorities +=
-                    recordEvaluator.getNetwork() + ": " + recordEvaluator.getPriorityClass();
+                    recordEvaluator.getNetwork()
+                            + ": ("
+                            + recordEvaluator.getPriorityClass()
+                            + penalizedState
+                            + ")";
         }
 
         if (!UnderlyingNetworkRecord.isSameNetwork(mCurrentRecord, candidate)) {
@@ -579,6 +583,7 @@ public class UnderlyingNetworkController {
                             mSubscriptionGroup,
                             mLastSnapshot,
                             mCarrierConfig,
+                            mVcnMetrics,
                             new NetworkEvaluatorCallbackImpl()));
         }
 
@@ -763,6 +768,7 @@ public class UnderlyingNetworkController {
                 @NonNull ParcelUuid subscriptionGroup,
                 @NonNull TelephonySubscriptionSnapshot lastSnapshot,
                 @Nullable PersistableBundleWrapper carrierConfig,
+                @NonNull VcnMetrics vcnMetrics,
                 @NonNull NetworkEvaluatorCallback evaluatorCallback) {
             return new UnderlyingNetworkEvaluator(
                     vcnContext,
@@ -771,12 +777,8 @@ public class UnderlyingNetworkController {
                     subscriptionGroup,
                     lastSnapshot,
                     carrierConfig,
+                    vcnMetrics,
                     evaluatorCallback);
-        }
-
-        /** Builds a new VcnMetrics. */
-        public VcnMetrics newVcnMetrics() {
-            return new VcnMetrics();
         }
     }
 }

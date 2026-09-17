@@ -15,7 +15,7 @@
  */
 
 // The resulting .o needs to load on Android S+
-#define BPFLOADER_MIN_VER BPFLOADER_MAINLINE_S_VERSION
+#define NETBPFLOAD_MINAPI_VER NETBPFLOAD_S_VER
 #define BPF_OBJ_NAME "offload"
 #define DEFAULT_BPF_PIN_SUBDIR "tethering"
 
@@ -63,10 +63,10 @@ DEFINE_BPF_MAP_GRW(tether_downstream64_map, HASH, TetherDownstream64Key, TetherD
 DEFINE_BPF_MAP_GRW(tether_upstream6_map, HASH, TetherUpstream6Key, Tether6Value, 64,
                    AID_NETWORK_STACK)
 
-static inline __always_inline int do_forward6(struct __sk_buff* skb,
-                                              const struct rawip_bool rawip,
-                                              const struct stream_bool stream,
-                                              __unused const struct kver_uint kver) {
+function int do_forward6(struct __sk_buff* skb,
+                         const struct rawip_bool rawip,
+                         const struct stream_bool stream,
+                         __unused const struct kver_uint kver) {
     const bool is_ethernet = !rawip.rawip;
 
     // Must be meta-ethernet IPv6 frame
@@ -184,7 +184,7 @@ static inline __always_inline int do_forward6(struct __sk_buff* skb,
         if (gso_hdr_size == sizeof(struct ipv6hdr)) TC_PUNT(UNKNOWN_IPV6_GSO);
         const int mss = v->pmtu - gso_hdr_size;
         const uint64_t payload = L3_bytes - gso_hdr_size;
-        if (KVER_IS_AT_LEAST(kver, 5, 4, 0)) {
+        if (KVER_IS_AT_LEAST(kver, 5, 4)) {
             if (skb->gso_segs <= 1) TC_PUNT(ABOVE_IPV6_PMTU);
             // ?udp gso frags: gso_size is variable (thus 0), could this fail to trigger?
             if (gso_hdr_size + skb->gso_size > v->pmtu) TC_PUNT(ABOVE_IPV6_PMTU_GSO);
@@ -257,23 +257,23 @@ static inline __always_inline int do_forward6(struct __sk_buff* skb,
 }
 
 // implementation for 5.4+ (can use skb->gso_{segs,size})
-DEFINE_BPF_PROG_KVER(schedcls, tether_downstream6_ether, 5_4, AID_NETWORK_STACK, 5_4)
+DEFINE_BPF_PROG_KVER(schedcls, tether_downstream6_ether, AID_NETWORK_STACK, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, ETHER, DOWNSTREAM, KVER_5_4);
 }
 
-DEFINE_BPF_PROG_KVER(schedcls, tether_upstream6_ether, 5_4, AID_NETWORK_STACK, 5_4)
+DEFINE_BPF_PROG_KVER(schedcls, tether_upstream6_ether, AID_NETWORK_STACK, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, ETHER, UPSTREAM, KVER_5_4);
 }
 
 // implementation for 4.9/4.14/4.19
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream6_ether, , AID_NETWORK_STACK, 4_9, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream6_ether, AID_NETWORK_STACK, 4_9, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, ETHER, DOWNSTREAM, KVER_4_9);
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream6_ether, , AID_NETWORK_STACK, 4_9, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream6_ether, AID_NETWORK_STACK, 4_9, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, ETHER, UPSTREAM, KVER_4_9);
 }
@@ -292,34 +292,34 @@ DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream6_ether, , AID_NETWORK_STACK
 // and in system/netd/tests/binder_test.cpp NetdBinderTest TetherOffloadForwarding.
 //
 // Hence, these mandatory (must load successfully) implementations for 5.4+ kernels:
-DEFINE_BPF_PROG_KVER(schedcls, tether_downstream6_rawip, 5_4, AID_NETWORK_STACK, 5_4)
+DEFINE_BPF_PROG_KVER(schedcls, tether_downstream6_rawip, AID_NETWORK_STACK, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, RAWIP, DOWNSTREAM, KVER_5_4);
 }
 
-DEFINE_BPF_PROG_KVER(schedcls, tether_upstream6_rawip, 5_4, AID_NETWORK_STACK, 5_4)
+DEFINE_BPF_PROG_KVER(schedcls, tether_upstream6_rawip, AID_NETWORK_STACK, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, RAWIP, UPSTREAM, KVER_5_4);
 }
 
 // and for 4.14/4.19 kernels
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream6_rawip, 4_14, AID_NETWORK_STACK, 4_14, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream6_rawip, AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, RAWIP, DOWNSTREAM, KVER_4_14);
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream6_rawip, 4_14, AID_NETWORK_STACK, 4_14, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream6_rawip, AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward6(skb, RAWIP, UPSTREAM, KVER_4_14);
 }
 
 // and define no-op stubs for pre-4.14 kernels.
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream6_rawip, stub, AID_NETWORK_STACK, 4_9, 4_14)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream6_rawip, AID_NETWORK_STACK, 4_9, 4_14)
 (__unused struct __sk_buff* skb) {
     return TC_ACT_PIPE;
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream6_rawip, stub, AID_NETWORK_STACK, 4_9, 4_14)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream6_rawip, AID_NETWORK_STACK, 4_9, 4_14)
 (__unused struct __sk_buff* skb) {
     return TC_ACT_PIPE;
 }
@@ -330,11 +330,17 @@ DEFINE_BPF_MAP_GRW(tether_downstream4_map, HASH, Tether4Key, Tether4Value, 1024,
 
 DEFINE_BPF_MAP_GRW(tether_upstream4_map, HASH, Tether4Key, Tether4Value, 1024, AID_NETWORK_STACK)
 
-static inline __always_inline int do_forward4_bottom(struct __sk_buff* skb,
-        const int l2_header_size, void* data, const void* data_end,
-        struct ethhdr* eth, struct iphdr* ip, const struct rawip_bool rawip,
-        const struct stream_bool stream, const struct updatetime_bool updatetime,
-        const bool is_tcp, __unused const struct kver_uint kver) {
+function int do_forward4_bottom(struct __sk_buff* skb,
+                                const int l2_header_size,
+                                void* data,
+                                const void* data_end,
+                                struct ethhdr* eth,
+                                struct iphdr* ip,
+                                const struct rawip_bool rawip,
+                                const struct stream_bool stream,
+                                const struct updatetime_bool updatetime,
+                                const bool is_tcp,
+                                __unused const struct kver_uint kver) {
     const bool is_ethernet = !rawip.rawip;
     struct tcphdr* tcph = is_tcp ? (void*)(ip + 1) : NULL;
     struct udphdr* udph = is_tcp ? NULL : (void*)(ip + 1);
@@ -423,7 +429,7 @@ static inline __always_inline int do_forward4_bottom(struct __sk_buff* skb,
         // we know it is IPv4 without IP options, and either TCP or UDP
         const int hdr_sz = sizeof(struct iphdr) + (is_tcp ? tcph->doff * 4 : sizeof(struct udphdr));
         const uint64_t payload = L3_bytes - hdr_sz;
-        if (KVER_IS_AT_LEAST(kver, 5, 4, 0)) {
+        if (KVER_IS_AT_LEAST(kver, 5, 4)) {
             if (skb->gso_segs <= 1) TC_PUNT(ABOVE_IPV4_PMTU);
             // ?udp gso frags: gso_size is variable (thus 0), could this fail to trigger?
             if (hdr_sz + skb->gso_size > v->pmtu) TC_PUNT(ABOVE_IPV4_PMTU_GSO);
@@ -531,11 +537,11 @@ static inline __always_inline int do_forward4_bottom(struct __sk_buff* skb,
     return bpf_redirect(v->oif, 0 /* this is effectively BPF_F_EGRESS */);
 }
 
-static inline __always_inline int do_forward4(struct __sk_buff* skb,
-                                              const struct rawip_bool rawip,
-                                              const struct stream_bool stream,
-                                              const struct updatetime_bool updatetime,
-                                              const struct kver_uint kver) {
+function int do_forward4(struct __sk_buff* skb,
+                         const struct rawip_bool rawip,
+                         const struct stream_bool stream,
+                         const struct updatetime_bool updatetime,
+                         const struct kver_uint kver) {
     const bool is_ethernet = !rawip.rawip;
 
     // Require ethernet dst mac address to be our unicast address.
@@ -634,22 +640,22 @@ static inline __always_inline int do_forward4(struct __sk_buff* skb,
 
 // Full featured (required) implementations for 5.10+ kernels (these are S+ by definition)
 
-DEFINE_BPF_PROG_KVER(schedcls, tether_downstream4_rawip, 5_10, AID_NETWORK_STACK, 5_10)
+DEFINE_BPF_PROG_KVER(schedcls, tether_downstream4_rawip, AID_NETWORK_STACK, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, DOWNSTREAM, UPDATETIME, KVER_5_10);
 }
 
-DEFINE_BPF_PROG_KVER(schedcls, tether_upstream4_rawip, 5_10, AID_NETWORK_STACK, 5_10)
+DEFINE_BPF_PROG_KVER(schedcls, tether_upstream4_rawip, AID_NETWORK_STACK, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, UPSTREAM, UPDATETIME, KVER_5_10);
 }
 
-DEFINE_BPF_PROG_KVER(schedcls, tether_downstream4_ether, 5_10, AID_NETWORK_STACK, 5_10)
+DEFINE_BPF_PROG_KVER(schedcls, tether_downstream4_ether, AID_NETWORK_STACK, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, DOWNSTREAM, UPDATETIME, KVER_5_10);
 }
 
-DEFINE_BPF_PROG_KVER(schedcls, tether_upstream4_ether, 5_10, AID_NETWORK_STACK, 5_10)
+DEFINE_BPF_PROG_KVER(schedcls, tether_upstream4_ether, AID_NETWORK_STACK, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, UPSTREAM, UPDATETIME, KVER_5_10);
 }
@@ -657,25 +663,25 @@ DEFINE_BPF_PROG_KVER(schedcls, tether_upstream4_ether, 5_10, AID_NETWORK_STACK, 
 // Full featured (optional) implementations for 5.4-S kernels
 // (optional, because we need to be able to fallback for 5.4 pre-S kernels)
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, opt54,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip,
                                     AID_NETWORK_STACK, 5_4, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, DOWNSTREAM, UPDATETIME, KVER_5_4);
 }
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, opt54,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip,
                                     AID_NETWORK_STACK, 5_4, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, UPSTREAM, UPDATETIME, KVER_5_4);
 }
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether, opt54,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether,
                                     AID_NETWORK_STACK, 5_4, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, DOWNSTREAM, UPDATETIME, KVER_5_4);
 }
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, opt54,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether,
                                     AID_NETWORK_STACK, 5_4, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, UPSTREAM, UPDATETIME, KVER_5_4);
@@ -684,25 +690,25 @@ DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, opt54,
 // Full featured (optional) implementations for 4.14-S & 4.19-S kernels
 // (optional, because we need to be able to fallback for 4.14/4.19 pre-S kernels)
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, opt,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip,
                                     AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, DOWNSTREAM, UPDATETIME, KVER_4_14);
 }
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, opt,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip,
                                     AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, UPSTREAM, UPDATETIME, KVER_4_14);
 }
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether, opt,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether,
                                     AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, DOWNSTREAM, UPDATETIME, KVER_4_14);
 }
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, opt,
+DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether,
                                     AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, UPSTREAM, UPDATETIME, KVER_4_14);
@@ -720,67 +726,72 @@ DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, opt,
 // which enforces and documents the required kernel cherrypicks will make it pretty unlikely that
 // many devices upgrading to S will end up relying on these fallback programs.
 
-// RAWIP: Required for 5.4-R kernels -- which always support bpf_skb_change_head().
+// RAWIP: Required for 5.4-R kernels
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, 5_4, AID_NETWORK_STACK, 5_4, 5_10)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, AID_NETWORK_STACK, 5_4, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, DOWNSTREAM, NO_UPDATETIME, KVER_5_4);
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, 5_4, AID_NETWORK_STACK, 5_4, 5_10)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, AID_NETWORK_STACK, 5_4, 5_10)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, UPSTREAM, NO_UPDATETIME, KVER_5_4);
 }
 
-// RAWIP: Optional for 4.14/4.19 (R) kernels -- which support bpf_skb_change_head().
-// [Note: fallback for 4.14/4.19 (P/Q) kernels is below in stub section]
+// RAWIP: Required for 4.14/4.19 pre-S kernels
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, 4_14,
-                                    AID_NETWORK_STACK, 4_14, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, DOWNSTREAM, NO_UPDATETIME, KVER_4_14);
 }
 
-DEFINE_OPTIONAL_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, 4_14,
-                                    AID_NETWORK_STACK, 4_14, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, RAWIP, UPSTREAM, NO_UPDATETIME, KVER_4_14);
 }
 
-// ETHER: Required for 4.14-Q/R, 4.19-Q/R & 5.4-R kernels.
+// ETHER: Required for 5.4-R kernels.
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether, 4_14, AID_NETWORK_STACK, 4_14, 5_10)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether, AID_NETWORK_STACK, 5_4, 5_10)
+(struct __sk_buff* skb) {
+    return do_forward4(skb, ETHER, DOWNSTREAM, NO_UPDATETIME, KVER_5_4);
+}
+
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, AID_NETWORK_STACK, 5_4, 5_10)
+(struct __sk_buff* skb) {
+    return do_forward4(skb, ETHER, UPSTREAM, NO_UPDATETIME, KVER_5_4);
+}
+
+// ETHER: Required for 4.14-Q/R, 4.19-Q/R kernels.
+
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether, AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, DOWNSTREAM, NO_UPDATETIME, KVER_4_14);
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, 4_14, AID_NETWORK_STACK, 4_14, 5_10)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, AID_NETWORK_STACK, 4_14, 5_4)
 (struct __sk_buff* skb) {
     return do_forward4(skb, ETHER, UPSTREAM, NO_UPDATETIME, KVER_4_14);
 }
 
-// Placeholder (no-op) implementations for older Q kernels
+// Placeholder (no-op) implementations for 4.9 kernels
 
-// RAWIP: 4.9-P/Q, 4.14-P/Q & 4.19-Q kernels -- without bpf_skb_change_head() for tc programs
-
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, stub, AID_NETWORK_STACK, 4_9, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_rawip, AID_NETWORK_STACK, 4_9, 4_14)
 (__unused struct __sk_buff* skb) {
     return TC_ACT_PIPE;
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, stub, AID_NETWORK_STACK, 4_9, 5_4)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_rawip, AID_NETWORK_STACK, 4_9, 4_14)
 (__unused struct __sk_buff* skb) {
     return TC_ACT_PIPE;
 }
 
-// ETHER: 4.9-P/Q kernel
-
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether, stub, AID_NETWORK_STACK, 4_9, 4_14)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_downstream4_ether, AID_NETWORK_STACK, 4_9, 4_14)
 (__unused struct __sk_buff* skb) {
     return TC_ACT_PIPE;
 }
 
-DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, stub, AID_NETWORK_STACK, 4_9, 4_14)
+DEFINE_BPF_PROG_KVER_RANGE(schedcls, tether_upstream4_ether, AID_NETWORK_STACK, 4_9, 4_14)
 (__unused struct __sk_buff* skb) {
     return TC_ACT_PIPE;
 }

@@ -23,9 +23,9 @@ import static android.net.ConnectivityManager.TYPE_MOBILE_HIPRI;
 import static android.net.ConnectivityManager.TYPE_WIFI;
 import static android.telephony.CarrierConfigManager.KEY_CARRIER_CONFIG_APPLIED_BOOL;
 import static android.telephony.CarrierConfigManager.KEY_REQUIRE_ENTITLEMENT_CHECKS_BOOL;
+import static android.telephony.CarrierConfigManager.KEY_CARRIER_SUPPORTS_TETHERING_BOOL;
 import static android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID;
 
-import static com.android.networkstack.apishim.ConstantsShim.KEY_CARRIER_SUPPORTS_TETHERING_BOOL;
 import static com.android.networkstack.tethering.TetheringConfiguration.OVERRIDE_TETHER_ENABLE_BPF_OFFLOAD;
 import static com.android.networkstack.tethering.TetheringConfiguration.TETHER_ENABLE_LEGACY_DHCP_SERVER;
 import static com.android.networkstack.tethering.TetheringConfiguration.TETHER_FORCE_USB_FUNCTIONS;
@@ -64,7 +64,6 @@ import com.android.internal.util.test.BroadcastInterceptingContext;
 import com.android.internal.util.test.FakeSettingsProvider;
 import com.android.modules.utils.build.SdkLevel;
 import com.android.net.module.util.DeviceConfigUtils;
-import com.android.net.module.util.SdkUtil;
 import com.android.net.module.util.SharedLog;
 import com.android.testutils.DevSdkIgnoreRule;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreAfter;
@@ -176,12 +175,6 @@ public class TetheringConfigurationTest {
 
             // Use the same mocking strategy as isFeatureEnabled for testing
             return isMockFlagEnabled(name, defaultValue);
-        }
-
-        @Override
-        boolean isTetherForceUpstreamAutomaticFeatureEnabled() {
-            return isMockFlagEnabled(TETHER_FORCE_UPSTREAM_AUTOMATIC_VERSION,
-                    false /* defaultEnabled */);
         }
 
         private boolean isMockFlagEnabled(@NonNull String name, boolean defaultEnabled) {
@@ -599,22 +592,7 @@ public class TetheringConfigurationTest {
         assertChooseUpstreamAutomaticallyIs(true);
     }
 
-    // The flag override only works on R-
-    @Test @IgnoreAfter(Build.VERSION_CODES.R)
-    public void testChooseUpstreamAutomatically_FlagOverride() throws Exception {
-        when(mResources.getBoolean(R.bool.config_tether_upstream_automatic))
-                .thenReturn(false);
-        setTetherForceUpstreamAutomaticFlagEnabled(true);
-        assertChooseUpstreamAutomaticallyIs(true);
-
-        setTetherForceUpstreamAutomaticFlagEnabled(null);
-        assertChooseUpstreamAutomaticallyIs(false);
-
-        setTetherForceUpstreamAutomaticFlagEnabled(false);
-        assertChooseUpstreamAutomaticallyIs(false);
-    }
-
-    @Test @IgnoreUpTo(Build.VERSION_CODES.R) @IgnoreAfter(Build.VERSION_CODES.TIRAMISU)
+    @Test  @IgnoreAfter(Build.VERSION_CODES.TIRAMISU)
     public void testChooseUpstreamAutomatically_FlagOverrideOnSAndT() throws Exception {
         when(mResources.getBoolean(R.bool.config_tether_upstream_automatic))
                 .thenReturn(false);
@@ -759,25 +737,5 @@ public class TetheringConfigurationTest {
         final TetheringConfiguration p2pCfg =
                 new TetheringConfiguration(mMockContext, mLog, INVALID_SUBSCRIPTION_ID, mDeps);
         assertEquals(p2pLeasesSubnetPrefixLength, p2pCfg.getP2pLeasesSubnetPrefixLength());
-    }
-
-    private void setTetherEnableSyncSMFlagEnabled(Boolean enabled) {
-        mDeps.setFeatureEnabled(TetheringFeatureFlags.TETHER_ENABLE_SYNC_SM, enabled);
-        new TetheringConfiguration(
-                mMockContext, mLog, INVALID_SUBSCRIPTION_ID, mDeps).readEnableSyncSM(mMockContext);
-    }
-
-    @Test
-    public void testEnableSyncSMFlag() throws Exception {
-        // Test default enabled
-        setTetherEnableSyncSMFlagEnabled(null);
-        assertEquals(true, TetheringConfiguration.USE_SYNC_SM);
-
-        setTetherEnableSyncSMFlagEnabled(true);
-        assertEquals(true, TetheringConfiguration.USE_SYNC_SM);
-
-        // Feature is enabled forcefully after 25Q2 release.
-        setTetherEnableSyncSMFlagEnabled(false);
-        assertEquals(SdkUtil.isAtLeast25Q2(), TetheringConfiguration.USE_SYNC_SM);
     }
 }

@@ -19,9 +19,11 @@ package com.google.snippet.connectivity
 import android.Manifest.permission.NETWORK_SETTINGS
 import android.Manifest.permission.OVERRIDE_WIFI_CONFIG
 import android.content.pm.PackageManager.FEATURE_AUTOMOTIVE
+import android.content.pm.PackageManager.FEATURE_PC
 import android.content.pm.PackageManager.FEATURE_TELEPHONY
 import android.content.pm.PackageManager.FEATURE_WIFI
 import android.net.ConnectivityManager
+import android.net.InetAddresses
 import android.net.Network
 import android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED
 import android.net.NetworkCapabilities.TRANSPORT_WIFI
@@ -36,6 +38,7 @@ import android.net.wifi.WifiManager
 import android.net.wifi.WifiSsid
 import android.os.Build.VERSION.CODENAME
 import android.os.Build.VERSION.SDK_INT
+import android.util.ArraySet
 import androidx.test.platform.app.InstrumentationRegistry
 import com.android.compatibility.common.util.PropertyUtil
 import com.android.modules.utils.build.SdkLevel
@@ -51,7 +54,11 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
+import kotlin.test.fail
+import org.json.JSONArray
 import org.junit.Rule
+
+private const val MAX_CONNECT_RETRY = 3
 
 class ConnectivityMultiDevicesSnippet : Snippet {
     @get:Rule
@@ -90,6 +97,9 @@ class ConnectivityMultiDevicesSnippet : Snippet {
     @Rpc(description = "Check whether the device has automotive feature.")
     fun hasAutomotiveFeature() = pm.hasSystemFeature(FEATURE_AUTOMOTIVE)
 
+    @Rpc(description = "Check whether the device has PC feature.")
+    fun hasPCFeature() = pm.hasSystemFeature(FEATURE_PC)
+
     @Rpc(description = "Check whether the device supporters AP + STA concurrency.")
     fun isStaApConcurrencySupported() = wifiManager.isStaApConcurrencySupported()
 
@@ -99,10 +109,8 @@ class ConnectivityMultiDevicesSnippet : Snippet {
     @Rpc(description = "Return whether the Sdk level is at least V.")
     fun isAtLeastV() = SdkLevel.isAtLeastV()
 
-    @Rpc(description = "Check whether the device is at least B.")
-    fun isAtLeastB(): Boolean {
-        return SDK_INT >= 36 || (SDK_INT == 35 && isAtLeastPreReleaseCodename("Baklava"))
-    }
+    @Rpc(description = "Check whether the device SDK is at least B.")
+    fun isAtLeastB() = SdkLevel.isAtLeastB()
 
     @Rpc(description = "Return the API level that the VSR requirement must be fulfilled.")
     fun getVsrApiLevel() = PropertyUtil.getVsrApiLevel()
@@ -143,30 +151,44 @@ class ConnectivityMultiDevicesSnippet : Snippet {
         wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP)
         wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP)
 
-        // Add the test configuration and connect to it.
         val connectUtil = ConnectUtil(context)
-        connectUtil.connectToWifiConfig(wifiConfig)
-
-        // Implement manual SSID matching. Specifying the SSID in
-        // NetworkSpecifier is ineffective
-        // (see WifiNetworkAgentSpecifier#canBeSatisfiedBy for details).
-        // Note that holding permission is necessary when waiting for
-        // the callbacks. The handler thread checks permission; if
-        // it's not present, the SSID will be redacted.
-        val networkCallback = TestableNetworkCallback()
         val wifiRequest = NetworkRequest.Builder().addTransportType(TRANSPORT_WIFI).build()
-        return runAsShell(NETWORK_SETTINGS) {
-            // Register the network callback is needed here.
-            // This is to avoid the race condition where callback is fired before
-            // acquiring permission.
-            networkCallbackRule.registerNetworkCallback(wifiRequest, networkCallback)
-            return@runAsShell networkCallback.eventuallyExpect<CapabilitiesChanged> {
-                // Remove double quotes.
-                val ssidFromCaps = (WifiInfo::sanitizeSsid)(it.caps.ssid)
-                ssidFromCaps == ssid && (!requireValidation ||
-                        it.caps.hasCapability(NET_CAPABILITY_VALIDATED))
-            }.network.networkHandle
+        // Retry connecting to the Wi-Fi network. Connection establishment can be flaky
+        // (e.g., SoftAP is not ready or the scan misses the hotspot). Retrying overcomes these
+        // transient issues. See b/448345079 for more context.
+        repeat(MAX_CONNECT_RETRY) {
+            // Add the test configuration and connect to it.
+            // This will throw if the Wi-Fi connection fails.
+            connectUtil.connectToWifiConfig(wifiConfig)
+
+            // Implement manual SSID matching. Specifying the SSID in
+            // NetworkSpecifier is ineffective
+            // (see WifiNetworkAgentSpecifier#canBeSatisfiedBy for details).
+            // Note that holding permission is necessary when waiting for
+            // the callbacks. The handler thread checks permission; if
+            // it's not present, the SSID will be redacted.
+            val networkCallback = TestableNetworkCallback()
+            val network = runAsShell(NETWORK_SETTINGS) {
+                // Register the network callback is needed here.
+                // This is to avoid the race condition where callback is fired before
+                // acquiring permission.
+                networkCallbackRule.registerNetworkCallback(wifiRequest, networkCallback)
+                val event = networkCallback.poll { event ->
+                    if (event !is CapabilitiesChanged) return@poll false
+                    // Remove double quotes.
+                    val ssidFromCaps = (WifiInfo::sanitizeSsid)(event.caps.ssid)
+                    // Check if the SSID matches and the network is validation is required, ensure
+                    // NET_CAPABILITY_VALIDATED is present.
+                    ssidFromCaps == ssid && (!requireValidation ||
+                        event.caps.hasCapability(NET_CAPABILITY_VALIDATED))
+                }
+                (event as? CapabilitiesChanged)?.network
+            }
+            if (network != null) return network.networkHandle
+            // If network is null, it means poll timed out. Retry connecting.
         }
+        fail("Tried connecting to ${wifiConfig.SSID} but could not verify" +
+            " access to the internet after retrying $MAX_CONNECT_RETRY times")
     }
 
     @Rpc(description = "Get interface name from NetworkHandle")
@@ -204,7 +226,6 @@ class ConnectivityMultiDevicesSnippet : Snippet {
         try {
             tetheringCallback.expectNoTetheringActive()
             val iface = ctsTetheringUtils.startWifiTethering(tetheringCallback).getInterface()
-            ctsTetheringUtils.expectSoftApCompleted()
             return iface
         } finally {
             ctsTetheringUtils.unregisterTetheringEventCallback(tetheringCallback)
@@ -267,5 +288,14 @@ class ConnectivityMultiDevicesSnippet : Snippet {
             InetSocketAddress(groupToLeave, 0),
             multicastSocket?.networkInterface
         )
+    }
+
+    @Rpc(description = "Sort multicast addresses")
+    fun sortMulticastAddresses(addresses: JSONArray): List<String> {
+        val addrSet = ArraySet<InetAddress>()
+        for (i in 0 until addresses.length()) {
+            addrSet.add(InetAddresses.parseNumericAddress(addresses.getString(i)))
+        }
+        return addrSet.mapNotNull { it.hostAddress }
     }
 }

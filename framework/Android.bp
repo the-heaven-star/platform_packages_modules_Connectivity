@@ -58,12 +58,11 @@ java_defaults {
     name: "framework-connectivity-defaults",
     defaults: ["framework-module-defaults"],
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     srcs: [
         ":framework-connectivity-sources",
         ":net-utils-framework-common-srcs",
         ":framework-connectivity-api-shared-srcs",
-        ":framework-networksecurity-sources",
         ":statslog-framework-connectivity-java-gen",
     ],
     aidl: {
@@ -80,6 +79,7 @@ java_defaults {
     },
     stub_only_libs: [
         "framework-connectivity-t.stubs.module_lib",
+        "conscrypt.module.public.api.stubs.module_lib",
     ],
     impl_only_libs: [
         // TODO: figure out why just using "framework-tethering" uses the stubs, even though both
@@ -89,8 +89,10 @@ java_defaults {
         "framework-wifi.stubs.module_lib",
     ],
     static_libs: [
-        "com.android.net.flags-aconfig-java",
+        "com.android.net.flags-aconfig-java-deprecated",
+        "com.android.tethering.flags-aconfig-java",
         "android.net.platform.flags-aconfig-java-export",
+        "conscrypt-exported-networksecurity-aconfig-flags-lib",
         // Not using the latest stable version because all functions in the latest version of
         // mdns_aidl_interface are deprecated.
         "mdns_aidl_interface-V1-java",
@@ -108,8 +110,24 @@ java_defaults {
         "app-compat-annotations",
         "framework-connectivity-t.stubs.module_lib",
         "framework-statsd.stubs.module_lib",
+        "framework-telecom.stubs.module_lib",
         "unsupportedappusage",
     ],
+    public: {
+        libs: [
+            "framework-telecom.stubs",
+        ],
+    },
+    system: {
+        libs: [
+            "framework-telecom.stubs.system",
+        ],
+    },
+    module_lib: {
+        libs: [
+            "framework-telecom.stubs.module_lib",
+        ],
+    },
     apex_available: [
         "com.android.tethering",
     ],
@@ -142,15 +160,33 @@ java_library {
     visibility: ["//external/cronet:__subpackages__"],
 }
 
+// This breaks the cyclic dependency by allowing targets that depend on `framework-connectivity`
+// (e.g., service-connectivity) to depend on this target instead, while `framework-connectivity` can
+// trace references from those depending targets to ensure that referenced methods and classes
+// are not stripped during proguarding.
+java_library {
+    name: "framework-connectivity-post-jarjar",
+    defaults: ["framework-module-defaults"],
+    installable: false,
+    min_sdk_version: "apex_inherit",
+    static_libs: [
+        "framework-connectivity-pre-jarjar",
+    ],
+    apex_available: [
+        "com.android.tethering",
+    ],
+    jarjar_rules: ":framework-connectivity-jarjar-rules",
+    visibility: ["//packages/modules/Connectivity:__subpackages__"],
+}
+
 java_library {
     name: "framework-connectivity-pre-jarjar",
     defaults: ["framework-module-defaults"],
     installable: false,
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
     static_libs: [
         "framework-connectivity-pre-jarjar-without-cronet",
-        "httpclient_api",
-        "httpclient_impl",
+        "httpengine",
     ],
     apex_available: [
         "com.android.tethering",
@@ -158,27 +194,36 @@ java_library {
     visibility: ["//packages/modules/Connectivity:__subpackages__"],
 }
 
-java_defaults {
-    name: "CronetJavaDefaults",
-    srcs: [":httpclient_api_sources"],
-    static_libs: [
-        "com.android.net.http.flags-aconfig-java",
-    ],
-    libs: [
-        "androidx.annotation_annotation",
-    ],
-    impl_only_static_libs: [
-        "httpclient_impl",
-    ],
-}
-
 java_sdk_library {
     name: "framework-connectivity",
     defaults: [
         "framework-connectivity-defaults",
-        "CronetJavaDefaults",
+        "httpengine_java_defaults",
     ],
+    optimize: {
+        enabled: true,
+        ignore_warnings: false,
+        shrink: true,
+        trace_references_from: [
+            "service-connectivity",
+            "framework-connectivity-t",
+        ],
+        optimize: false,
+        obfuscate: false,
+        protect_api_surface: true,
+        include: "r8_include_list.txt",
+        proguard_compatibility: false,
+    },
+    // R8 runs in --release mode by default, which strips local variable debug info.
+    // We override this to preserve debugging capabilities, as the impact of
+    // losing this data was not evaluated during the initial R8 integration.
+    // TODO(b/478801159): Investigate whether `--debug` is needed.
+    dxflags: ["--debug"],
     installable: true,
+    // Depending on `framework-connectivity-post-jarjar` directly is complicated because the
+    // sources used to generate the stubs must be propagated correctly to this module. Hence, this
+    // module will avoid depending on `post-jarjar` module to avoid confusion until it's
+    // refactored correctly.
     jarjar_rules: ":framework-connectivity-jarjar-rules",
     permitted_packages: ["android.net"],
     impl_library_visibility: [
@@ -224,7 +269,8 @@ java_sdk_library {
         baseline_filename: "lint-baseline.xml",
     },
     aconfig_declarations: [
-        "com.android.net.flags-aconfig",
+        "com.android.net.flags-aconfig-deprecated",
+        "com.android.tethering.flags-aconfig",
         "com.android.net.http.flags-aconfig",
         "com.android.networksecurity.flags-aconfig",
     ],
@@ -237,7 +283,7 @@ platform_compat_config {
 
 cc_library_shared {
     name: "libframework-connectivity-jni",
-    min_sdk_version: "30",
+    min_sdk_version: "apex_inherit",
     cflags: [
         "-Wall",
         "-Werror",
@@ -283,7 +329,7 @@ java_library {
     srcs: [":framework-connectivity-protos"],
     installable: false,
     sdk_version: "module_current",
-    min_sdk_version: "30",
+    min_sdk_version: "31",
     apex_available: [
         "com.android.tethering",
     ],
